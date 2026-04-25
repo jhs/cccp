@@ -369,13 +369,51 @@ def count_lines(path):
 SLUG_RE = re.compile(r"^[a-z0-9-]+$")
 
 
-def discover_comrades(user_host=None):
-    """Return [(comrade_id, cell_slug)] tuples found on the target host.
+def _is_local_pid_alive(comrade_id):
+    """kill -0 on the PID embedded in a comrade id. Used to filter out
+    stale dirs left behind by Claude sessions that crashed without
+    running `cccp leave` first."""
+    try:
+        pid = int(comrade_id.rsplit(":", 1)[1])
+        os.kill(pid, 0)
+        return True
+    except (ValueError, IndexError, ProcessLookupError, PermissionError):
+        return False
 
-    `user_host` is None or same-userhost: scan local ~/.cccp/. Otherwise
-    SSH and run find. The shape of the tree is depth-2 dirs under .cccp/:
-    `<comrade-id>/<slug>/`. The state/ subtree (depth 3) is skipped by the
-    depth filter, and we sanity-check both names before yielding.
+
+# Shell snippet that lists `<comrade-id>/<slug>` paths on the remote side
+# but only for comrades whose PID is still alive. Run via `ssh <host> sh -c`
+# so we get one fork point and no escaping headaches. The trailing `|| true`
+# absorbs find's exit code when .cccp doesn't exist.
+_REMOTE_LIVE_LISTING = r'''
+find .cccp -mindepth 2 -maxdepth 2 -type d 2>/dev/null | while IFS= read -r p; do
+    comrade=${p#./}
+    comrade=${comrade#.cccp/}
+    comrade=${comrade%%/*}
+    pid=${comrade##*:}
+    case "$pid" in
+        ''|*[!0-9]*) continue ;;
+    esac
+    if kill -0 "$pid" 2>/dev/null; then
+        printf '%s\n' "$p"
+    fi
+done || true
+'''
+
+
+def discover_comrades(user_host=None):
+    """Return [(comrade_id, cell_slug)] tuples for *live* comrades on the
+    target host.
+
+    `user_host` is None or same-userhost: scan local ~/.cccp/ and filter
+    by `kill -0` against each comrade's embedded PID. Otherwise SSH and
+    run a shell snippet that does the same filtering on the remote side
+    (PIDs are only meaningful to the kernel they belong to).
+
+    Why filter: a Claude that crashes without running `cccp leave` leaves
+    its comrade dir behind on disk. From the protocol's view it looks
+    "live" (no `gone.json`), but the underlying process is gone. We hide
+    those zombies from `who` so callers see only reachable peers.
     """
     if user_host is None or is_same_userhost(user_host):
         if not CCCP_HOME.exists():
@@ -389,24 +427,28 @@ def discover_comrades(user_host=None):
         except subprocess.CalledProcessError as e:
             print(f"who: local find failed: {e.stderr.strip()}", file=sys.stderr)
             return []
-        out = r.stdout
-    else:
-        # `find .cccp ... 2>/dev/null || true` so a missing tree on the
-        # remote isn't an error, just an empty result.
-        remote_cmd = ("find .cccp -mindepth 2 -maxdepth 2 -type d "
-                      "2>/dev/null || true")
-        r = subprocess.run(
-            ["ssh", addr_to_ssh(user_host), remote_cmd],
-            capture_output=True, text=True,
-        )
-        if r.returncode != 0:
-            print(f"who: ssh to {user_host} failed: {r.stderr.strip()}",
-                  file=sys.stderr)
-            return []
-        out = r.stdout
+        pairs = []
+        for line in r.stdout.splitlines():
+            parts = line.strip().split("/")
+            if len(parts) < 2:
+                continue
+            comrade, slug = parts[-2], parts[-1]
+            if ADDR_RE.match(comrade) and SLUG_RE.match(slug) \
+                    and _is_local_pid_alive(comrade):
+                pairs.append((comrade, slug))
+        return pairs
 
+    r = subprocess.run(
+        ["ssh", addr_to_ssh(user_host), "sh", "-c", _REMOTE_LIVE_LISTING],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        print(f"who: ssh to {user_host} failed: {r.stderr.strip()}",
+              file=sys.stderr)
+        return []
     pairs = []
-    for line in out.splitlines():
+    for line in r.stdout.splitlines():
+        # Lines look like `.cccp/<id>/<slug>` from the remote find.
         parts = line.strip().split("/")
         if len(parts) < 2:
             continue
