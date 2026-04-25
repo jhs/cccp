@@ -105,7 +105,11 @@ def my_dir(cell):
 
 
 def state_dir(cell):
-    return cell_dir(cell) / "state"
+    # Per-comrade so that same-host comrades don't trample each other's
+    # high-water marks and other private bookkeeping. The whole `state/`
+    # tree is excluded from rsync (Mode B `--exclude=state`), so this
+    # change is invisible to peers.
+    return cell_dir(cell) / "state" / self_id()
 
 
 def hwm_dir(cell):
@@ -259,12 +263,26 @@ def addr_to_ssh(comrade_id):
     head = comrade_id.rsplit(":", 1)[0] if ":" in comrade_id else comrade_id
     if "@" not in head:
         raise ValueError(f"Bad address: {comrade_id!r}")
-    return head
+    user, host = head.split("@", 1)
+    # Bare short hostnames (no dots, not localhost) get .local appended so
+    # mDNS/Bonjour resolution works on LANs without an ssh_config alias.
+    # Already-qualified names (with dots) and `localhost` are passed through.
+    if "." not in host and host != "localhost":
+        host = f"{host}.local"
+    return f"{user}@{host}"
 
 
 def remote_root(cell, comrade_id):
     # Use ~ so SSH expands it under the receiver's HOME, not the sender's.
     return f"~/.cccp/{slugify(cell)}/{comrade_id}"
+
+
+def is_same_userhost(peer_id):
+    # Same OS user on the same host means the cell directory is one and the
+    # same on disk; an rsync push would write the bytes that are already
+    # there. Skipping is purely an optimization (and saves an SSH handshake
+    # for the common case of multiple Claude sessions on one machine).
+    return addr_to_ssh(peer_id) == addr_to_ssh(self_id())
 
 
 def rsync_gazette_to(local_path, peer_id, remote_path):
@@ -295,6 +313,8 @@ def push_dir_to_all(cell, source_comrade, targets):
     src_gazette = src_dir / "gazette.jsonl"
     failures = []
     for peer in targets:
+        if is_same_userhost(peer):
+            continue  # Same disk; the bytes are already there.
         ok = True
         rr = remote_root(cell, source_comrade)
         if src_gazette.exists():
@@ -358,7 +378,11 @@ def cmd_publish(args):
     me = self_id()
     if not my_dir(cell).exists():
         sys.exit(f"error: not in cell {cell!r}; start a watchtower first")
-    src = Path(args.path).resolve()
+    # abspath, not resolve(): preserve the path the user typed, don't follow
+    # symlinks. Resolving leaks platform quirks (macOS /tmp -> /private/tmp)
+    # into the wire path and breaks portability when peers on other OSes
+    # would expect the un-resolved form.
+    src = Path(os.path.abspath(os.path.expanduser(args.path)))
     if not src.is_file():
         sys.exit(f"error: not a regular file: {src}")
     rel = str(src).lstrip("/")
@@ -366,7 +390,7 @@ def cmd_publish(args):
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dst)
     # Push files first so the bytes are in place before the announcement lands.
-    peers = [p for p, _ in live_peers(cell)]
+    peers = [p for p, _ in live_peers(cell) if not is_same_userhost(p)]
     failures = []
     for peer in peers:
         r = rsync_dir_to(my_dir(cell), peer, remote_root(cell, me))
@@ -408,7 +432,7 @@ def cmd_unpublish(args):
     me = self_id()
     if not my_dir(cell).exists():
         sys.exit(f"error: not in cell {cell!r}; start a watchtower first")
-    src = Path(args.path).resolve()
+    src = Path(os.path.abspath(os.path.expanduser(args.path)))
     rel = str(src).lstrip("/")
     local = my_dir(cell) / "files" / rel
     d = {
@@ -503,6 +527,9 @@ class Watchtower:
                     pass
 
     def _bootstrap(self, peer):
+        if is_same_userhost(peer):
+            # The cell directory we'd pull from is literally ours; nothing to do.
+            return
         remote = f"{addr_to_ssh(peer)}:~/.cccp/{slugify(self.cell)}/"
         cmd = ["rsync", "-r", "--exclude=state", remote, f"{self.cd}/"]
         r = subprocess.run(cmd, capture_output=True, text=True)
