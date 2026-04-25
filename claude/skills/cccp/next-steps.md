@@ -73,6 +73,27 @@ Things that might bite under load or weird timing.
   the watchtower notices `gone.json` on its next 250ms poll. Acceptable
   but there's a small window where someone could see the watchtower
   emitting events for a "dead" comrade.
+- **Watchtower auto-cleanup on crash / unclean exit.** Today, a Claude
+  session that dies without running `cccp leave` (kill -9, terminal
+  closed, OOM, segfault) leaves its comrade dir on disk with no
+  `gone.json`. From the protocol's view it looks live; from reality
+  it's a zombie. We patched `cccp who` to filter by `kill -0`, but
+  that's only a viewer-side fix — push targets are still wrong, and
+  any peer that learns of the comrade via gossip will keep trying to
+  reach it. Things to consider:
+    - Trap SIGTERM/SIGHUP/SIGINT in the watchtower and write own
+      `gone.json` (with a "crashed" reason) before exiting. Doesn't
+      help against `kill -9` or process death from above, but covers
+      the common terminal-closed case.
+    - On watchtower startup, scan local `~/.cccp/` for any of *our*
+      user@host's comrade dirs whose PID is no longer alive and write
+      a synthetic `gone.json` for them — a self-housekeeping pass.
+    - Push-side: when a `dispatch`/`publish` push fails, optionally
+      check `kill -0` on the target's PID (if same userhost) or the
+      remote-side liveness via the same SSH snippet `cccp who` uses,
+      and silently `cccp purge` if the comrade is gone. Has a false-
+      positive risk on transient SSH issues — design it as "after N
+      consecutive failures over T seconds," not on the first error.
 
 ## Things to consider in the binary
 
