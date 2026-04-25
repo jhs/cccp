@@ -36,8 +36,20 @@ exercised yet. Roughly in order of "most likely to surface a bug."
 4. **File update (re-publish same path with new contents).** Design doc
    says this just works (Mode A append-verify on gazette + Mode B for
    files). Verify rsync actually transfers only the changed bytes.
-5. **`purge`.** Untested. Need a scenario where one comrade goes
-   unreachable mid-conversation and another comrade purges them.
+5. **`purge`.** Tested in the 4-comrade cross-machine session. Two
+   distinct cases observed:
+   - **Previously-known peer:** the purger's view already contains the
+     target's mirror dir; gone.json is written into it; rsync push
+     propagates; receivers' watchtowers emit a `leave` event with
+     `purged_by=<purger>` and the reason. Works as expected.
+   - **Brand-new gone-on-arrival:** if a peer never had the target's
+     mirror in their tree, the purge arrives as a never-seen comrade
+     dir with gone.json already present. Today's `_poll_once` registers
+     it as `known_peers` with `gone_state=True` but emits no event
+     (neither join nor leave). Silent absorption. Defensible (we don't
+     usually announce departures of strangers) but worth deciding
+     deliberately — could emit a synthetic leave so the purge isn't
+     completely invisible to comrades who never knew the target.
 6. **Rejoin.** Comrade leaves with `cccp leave`, then comes back with
    `cccp watchtower <slug>` (same comrade ID). Per design, the rejoin
    path deletes own `gone.json` and pushes; other comrades' watchtowers
