@@ -96,8 +96,18 @@ def self_id():
     return _self_id_cache
 
 
+def my_root():
+    # Each comrade has its own root tree. Two same-host comrades share
+    # nothing on disk under their respective ~/.cccp/<comrade-id>/ subtrees;
+    # they communicate only via real rsync (over the loopback for same-host,
+    # over SSH for cross-host).
+    return CCCP_HOME / self_id()
+
+
 def cell_dir(cell):
-    return CCCP_HOME / slugify(cell)
+    # MY view of this cell. Inside this dir live my own gazette
+    # subdirectory plus mirrors of every peer's gazette subdirectory.
+    return my_root() / slugify(cell)
 
 
 def my_dir(cell):
@@ -105,11 +115,8 @@ def my_dir(cell):
 
 
 def state_dir(cell):
-    # Per-comrade so that same-host comrades don't trample each other's
-    # high-water marks and other private bookkeeping. The whole `state/`
-    # tree is excluded from rsync (Mode B `--exclude=state`), so this
-    # change is invisible to peers.
-    return cell_dir(cell) / "state" / self_id()
+    # Already inside our per-comrade root, so no further keying needed.
+    return cell_dir(cell) / "state"
 
 
 def hwm_dir(cell):
@@ -272,24 +279,36 @@ def addr_to_ssh(comrade_id):
     return f"{user}@{host}"
 
 
-def remote_root(cell, comrade_id):
-    # Use ~ so SSH expands it under the receiver's HOME, not the sender's.
-    return f"~/.cccp/{slugify(cell)}/{comrade_id}"
+def remote_root(cell, source_id, receiver_id):
+    # Path on the receiver's disk where THIS comrade's gazette dir
+    # (`source_id`) should land within the receiver's per-comrade tree.
+    # Uses ~ so SSH expands it under the receiver's HOME — irrelevant for
+    # the same-userhost case (we expand it ourselves there, see
+    # rsync_target).
+    return f"~/.cccp/{receiver_id}/{slugify(cell)}/{source_id}"
 
 
 def is_same_userhost(peer_id):
-    # Same OS user on the same host means the cell directory is one and the
-    # same on disk; an rsync push would write the bytes that are already
-    # there. Skipping is purely an optimization (and saves an SSH handshake
-    # for the common case of multiple Claude sessions on one machine).
     return addr_to_ssh(peer_id) == addr_to_ssh(self_id())
+
+
+def rsync_target(peer_id, remote_path):
+    """Build the rsync destination string for a given peer.
+
+    Same OS user on the same host: write directly through the local
+    filesystem with no SSH (the bytes still need to physically copy because
+    each comrade owns a distinct on-disk tree). Cross-host: use SSH.
+    """
+    if is_same_userhost(peer_id):
+        return os.path.expanduser(remote_path)
+    return f"{addr_to_ssh(peer_id)}:{remote_path}"
 
 
 def rsync_gazette_to(local_path, peer_id, remote_path):
     # --mkpath so a fresh peer doesn't need its directory pre-created.
     cmd = ["rsync", "--append-verify", "--partial", "--mkpath",
            str(local_path),
-           f"{addr_to_ssh(peer_id)}:{remote_path}"]
+           rsync_target(peer_id, remote_path)]
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
@@ -298,8 +317,7 @@ def rsync_dir_to(local_dir, peer_id, remote_dir):
            "--exclude=gazette.jsonl",
            "--exclude=state",
            f"{str(local_dir).rstrip('/')}/",
-           f"{remote_dir.rstrip('/')}/" if peer_id is None
-           else f"{addr_to_ssh(peer_id)}:{remote_dir.rstrip('/')}/"]
+           f"{rsync_target(peer_id, remote_dir).rstrip('/')}/"]
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
@@ -313,10 +331,8 @@ def push_dir_to_all(cell, source_comrade, targets):
     src_gazette = src_dir / "gazette.jsonl"
     failures = []
     for peer in targets:
-        if is_same_userhost(peer):
-            continue  # Same disk; the bytes are already there.
         ok = True
-        rr = remote_root(cell, source_comrade)
+        rr = remote_root(cell, source_comrade, peer)
         if src_gazette.exists():
             r = rsync_gazette_to(src_gazette, peer, f"{rr}/gazette.jsonl")
             if r.returncode != 0:
@@ -348,6 +364,58 @@ def count_lines(path):
         for _ in f:
             n += 1
     return n
+
+
+# ---------- comrade discovery ----------
+
+SLUG_RE = re.compile(r"^[a-z0-9-]+$")
+
+
+def discover_comrades(user_host=None):
+    """Return [(comrade_id, cell_slug)] tuples found on the target host.
+
+    `user_host` is None or same-userhost: scan local ~/.cccp/. Otherwise
+    SSH and run find. The shape of the tree is depth-2 dirs under .cccp/:
+    `<comrade-id>/<slug>/`. The state/ subtree (depth 3) is skipped by the
+    depth filter, and we sanity-check both names before yielding.
+    """
+    if user_host is None or is_same_userhost(user_host):
+        if not CCCP_HOME.exists():
+            return []
+        try:
+            r = subprocess.run(
+                ["find", str(CCCP_HOME), "-mindepth", "2", "-maxdepth", "2",
+                 "-type", "d"],
+                capture_output=True, text=True, check=True,
+            )
+        except subprocess.CalledProcessError as e:
+            print(f"who: local find failed: {e.stderr.strip()}", file=sys.stderr)
+            return []
+        out = r.stdout
+    else:
+        # `find .cccp ... 2>/dev/null || true` so a missing tree on the
+        # remote isn't an error, just an empty result.
+        remote_cmd = ("find .cccp -mindepth 2 -maxdepth 2 -type d "
+                      "2>/dev/null || true")
+        r = subprocess.run(
+            ["ssh", addr_to_ssh(user_host), remote_cmd],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            print(f"who: ssh to {user_host} failed: {r.stderr.strip()}",
+                  file=sys.stderr)
+            return []
+        out = r.stdout
+
+    pairs = []
+    for line in out.splitlines():
+        parts = line.strip().split("/")
+        if len(parts) < 2:
+            continue
+        comrade, slug = parts[-2], parts[-1]
+        if ADDR_RE.match(comrade) and SLUG_RE.match(slug):
+            pairs.append((comrade, slug))
+    return pairs
 
 
 # ---------- subcommands ----------
@@ -390,10 +458,10 @@ def cmd_publish(args):
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dst)
     # Push files first so the bytes are in place before the announcement lands.
-    peers = [p for p, _ in live_peers(cell) if not is_same_userhost(p)]
+    peers = [p for p, _ in live_peers(cell)]
     failures = []
     for peer in peers:
-        r = rsync_dir_to(my_dir(cell), peer, remote_root(cell, me))
+        r = rsync_dir_to(my_dir(cell), peer, remote_root(cell, me, peer))
         if r.returncode != 0:
             print(f"rsync files to {peer}: {r.stderr.strip()}", file=sys.stderr)
             failures.append(peer)
@@ -417,7 +485,7 @@ def cmd_publish(args):
     for peer in peers:
         r = rsync_gazette_to(
             my_dir(cell) / "gazette.jsonl", peer,
-            f"{remote_root(cell, me)}/gazette.jsonl",
+            f"{remote_root(cell, me, peer)}/gazette.jsonl",
         )
         if r.returncode != 0:
             print(f"rsync gazette to {peer}: {r.stderr.strip()}", file=sys.stderr)
@@ -469,6 +537,29 @@ def cmd_leave(args):
         sys.exit(1)
 
 
+def cmd_who(args):
+    pairs = discover_comrades(args.target)
+    # Hide ourselves when listing the local machine; we already know we're here.
+    if args.target is None or is_same_userhost(args.target):
+        pairs = [(c, s) for c, s in pairs if c != self_id()]
+    if args.cell:
+        wanted = slugify(args.cell)
+        pairs = [(c, s) for c, s in pairs if s == wanted]
+    if not pairs:
+        print("(no comrades)")
+        return
+    by_cell = {}
+    for comrade, slug in pairs:
+        by_cell.setdefault(slug, []).append(comrade)
+    blocks = []
+    for slug in sorted(by_cell):
+        lines = [slug]
+        for c in sorted(by_cell[slug]):
+            lines.append(f"  {c}")
+        blocks.append("\n".join(lines))
+    print("\n\n".join(blocks))
+
+
 def cmd_purge(args):
     cell = args.cell
     target = args.comrade
@@ -504,10 +595,10 @@ class Watchtower:
 
     # setup ----------------------------------------------------------------
 
-    def setup(self, connect=None):
+    def setup(self, bootstrap=None):
         self.cd.mkdir(parents=True, exist_ok=True)
-        if connect:
-            self._bootstrap(connect)
+        if bootstrap:
+            self._bootstrap(bootstrap)
         my_dir(self.cell).mkdir(parents=True, exist_ok=True)
         (my_dir(self.cell) / "files").mkdir(exist_ok=True)
         hwm_dir(self.cell).mkdir(parents=True, exist_ok=True)
@@ -527,11 +618,36 @@ class Watchtower:
                     pass
 
     def _bootstrap(self, peer):
-        if is_same_userhost(peer):
-            # The cell directory we'd pull from is literally ours; nothing to do.
-            return
-        remote = f"{addr_to_ssh(peer)}:~/.cccp/{slugify(self.cell)}/"
-        cmd = ["rsync", "-r", "--exclude=state", remote, f"{self.cd}/"]
+        # `peer` may be a full comrade-id (bob@hostB:51853) or a bare user@host
+        # (bob@hostB). The full form names a specific source subtree on the
+        # peer's disk. The bare form triggers an auto-`who`-and-pick: if
+        # exactly one comrade on that host is in our cell, use them; else
+        # error. This keeps the common 1:1 case ergonomic without burying
+        # discovery inside what should be a transport step.
+        slug = slugify(self.cell)
+        if ":" not in peer:
+            in_cell = [
+                c for c, s in discover_comrades(peer)
+                if s == slug and c != self_id()
+            ]
+            if not in_cell:
+                print(f"bootstrap: no comrade on {peer} has cell {slug}; "
+                      f"try `cccp who {peer}` to see what's there",
+                      file=sys.stderr)
+                return
+            if len(in_cell) > 1:
+                print(f"bootstrap: multiple comrades on {peer} have cell "
+                      f"{slug}: {', '.join(sorted(in_cell))}; "
+                      f"rerun --bootstrap with the specific full comrade id",
+                      file=sys.stderr)
+                return
+            print(f"bootstrap: sole comrade with cell {slug} on {peer} is "
+                  f"{in_cell[0]}", file=sys.stderr)
+            peer = in_cell[0]
+        src = f"~/.cccp/{peer}/{slug}/"
+        source = (os.path.expanduser(src) if is_same_userhost(peer)
+                  else f"{addr_to_ssh(peer)}:{src}")
+        cmd = ["rsync", "-r", "--exclude=state", source, f"{self.cd}/"]
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
             print(f"bootstrap from {peer}: {r.stderr.strip()}", file=sys.stderr)
@@ -553,11 +669,11 @@ class Watchtower:
 
     # main loop ------------------------------------------------------------
 
-    def run(self, connect=None):
-        self.setup(connect)
+    def run(self, bootstrap=None):
+        self.setup(bootstrap)
         self.initial_scan()
         # After bootstrap, push our (possibly-new) directory back to discovered peers.
-        if connect:
+        if bootstrap:
             push_my_state(self.cell)
         intro = f"ready {self.me} slug={slugify(self.cell)}"
         if not self.known_peers:
@@ -663,7 +779,7 @@ class Watchtower:
 
 
 def cmd_watchtower(args):
-    Watchtower(args.cell).run(connect=args.connect)
+    Watchtower(args.cell).run(bootstrap=args.bootstrap)
 
 
 # ---------- argparse ----------
@@ -677,8 +793,11 @@ def build_parser():
 
     w = sub.add_parser("watchtower", help="Run the long-running event listener.")
     w.add_argument("cell")
-    w.add_argument("--connect", metavar="COMRADE",
-                   help="Bootstrap by pulling from this comrade.")
+    w.add_argument("--bootstrap", metavar="COMRADE", dest="bootstrap",
+                   help="One-time pull from a known comrade to populate "
+                        "your view. Pass a full comrade id (bob@hostB:51853) "
+                        "or a bare user@host (which auto-uses the sole "
+                        "comrade in this cell on that host).")
     w.set_defaults(func=cmd_watchtower)
 
     d = sub.add_parser("dispatch", help="Send a chat message.")
@@ -713,6 +832,14 @@ def build_parser():
     pg.add_argument("comrade")
     pg.add_argument("--reason", default=None)
     pg.set_defaults(func=cmd_purge)
+
+    wh = sub.add_parser("who",
+                        help="List comrades and their cells, grouped by cell.")
+    wh.add_argument("target", nargs="?", default=None,
+                    help="user@host to query; omit for local machine")
+    wh.add_argument("--cell", default=None,
+                    help="Topic or slug to filter by (slugified internally)")
+    wh.set_defaults(func=cmd_who)
 
     return p
 

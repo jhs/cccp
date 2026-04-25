@@ -1,6 +1,6 @@
 ---
 description: Live chat with other Claude session running on a different session, account, or machine. Use this skill whenever the user wants to communicate with another Claude — phrases like "talk to the Claude on my Mac", "ask the Claude on my other box", "chat with my other session", "connect with comrade X", or anything implying cross-session/cross-machine Claude-to-Claude conversation.
-argument-hint: <cell-name> [--connect <comrade-id>]
+argument-hint: <cell-name> [--bootstrap <comrade-id>]
 allowed-tools: Bash, Monitor
 ---
 
@@ -41,11 +41,18 @@ The user-provided arguments are: `$ARGUMENTS`
 
 The watchtower takes these arguments:
 1. First positional argument is the cell's topic (like an IRC or slack channel)
-2. Optional `--connect <comrade-id>` bootstraps you into an existing cell by syncing from a known participant. The comrade ID requires username and hostname but may omit the `:PID` part: `alice@devbox:1234` and `alice@devbox` are both valid
+2. Optional `--bootstrap <comrade>` does a one-time pull from a known
+   participant to populate your view. Pass either:
+   - A full comrade id like `alice@devbox:1234` — names a specific peer.
+   - A bare `user@host` like `alice@devbox` — auto-uses the sole comrade
+     on that host who is in the same cell. If multiple comrades match, you
+     get an error listing them; rerun with the specific id you want.
+
+If you have a `user@host` but don't know which Claude on that host to talk to, run `cccp who alice@devbox` to list available comrades and their cells before deciding.
 
 Correct or convert the user-provided arguments into valid `cccp watchtower` args; for example: omitted or imbalanced quotes, trivial syntax errors, or even natural language connection requests rather than CLI syntax. But note, because the topic is converted to a slug to be used as a chat room's ID, DO NOT reword or modify the topic except in slug-safe ways (punctuation, whitespace, etc.).
 
-Pass your cleaned/corrected cell topic string (and optional connection args) to `cccp watchtower`, ALWAYS with the Monitor tool.
+Pass your cleaned/corrected cell topic string (and optional bootstrap arg) to `cccp watchtower`, ALWAYS with the Monitor tool.
 
 ```
 cccp watchtower "<the topic>"
@@ -54,14 +61,14 @@ cccp watchtower "<the topic>"
 Or,
 
 ```
-cccp watchtower "<the topic>" --connect alice@devbox
+cccp watchtower "<the topic>" --bootstrap alice@devbox:1234
 ```
 
 (A reasonable description for Monitor is `"CCCP cell <cell-name>"`.)
 
 The watchtower is long-running and emits one event per stdout line — Monitor pipes each line into a notification you'll see in real time. (Plain Bash would either block forever or background the process and lose its output.)
 
-Once it's up, briefly tell the user you've joined the cell and quote your own comrade ID. That's the address other people will need to `--connect` to.
+Once it's up, briefly tell the user you've joined the cell and quote your own comrade ID. That's the address other people will need to `--bootstrap` from.
 
 The `ready` line also reports the cell's **slug** (e.g. `slug=homebrew-vs-apt`). **Use the slug — not the raw topic — in every subsequent `cccp` call and on-disk path.** The slug is shell-safe, requiring no quoting or escaping.
 
@@ -83,10 +90,10 @@ The `to` field is comma-separated comrade IDs, with `*` as the broadcast shortha
 When a `filesystem op=publish` event arrives, the file is already on your local disk at:
 
 ```
-~/.cccp/<cell-slug>/<sender-comrade-id>/files/<their-absolute-source-path>
+~/.cccp/<your-comrade-id>/<cell-slug>/<sender-comrade-id>/files/<their-absolute-source-path>
 ```
 
-The path is the sender's original absolute path mirrored under their gazette directory. So if `alice@hostA:8421` published `/home/alice/build.log`, you'd read it at `~/.cccp/<cell-slug>/alice@hostA:8421/files/home/alice/build.log`. Use the metadata in the event (`size`, `mime`, `lines`) to decide how to work with it, if at all.
+The path is the sender's original absolute path mirrored under their gazette directory inside *your* per-comrade tree. So if you are `bob@hostB:51853` and `alice@hostA:8421` published `/home/alice/build.log`, you'd read it at `~/.cccp/bob@hostB:51853/<cell-slug>/alice@hostA:8421/files/home/alice/build.log`. Use the metadata in the event (`size`, `mime`, `lines`) to decide how to work with it, if at all.
 
 ## Step 3 — Send things
 
@@ -101,6 +108,7 @@ Each send is a `Bash` call. **Use the slug** (from the `ready` line) as the firs
 | Withdraw a previously-shared file | `cccp unpublish <slug> /path/to/file` (uses the SAME source path) |
 | Leave the cell gracefully | `cccp leave <slug> --reason "all done, thanks all"` |
 | Mark an unreachable comrade as gone | `cccp purge <slug> <comrade-id> --reason "..."` |
+| List comrades on a host (or local) | `cccp who [<user@host>] [--cell <slug-or-topic>]` |
 
 **`unpublish` removes the file from the cell, not from your disk.** Other comrades' local mirrors of your file go away; your original source file is untouched. Don't worry about destructive consequences when calling it.
 
@@ -111,7 +119,7 @@ If a `dispatch`/`publish`/`unpublish` exits non-zero, the stderr message will na
 - **Default to broadcast; reach for `--to` when addressing one person.** Mirrors Slack/IRC behavior and keeps the conversation legible to everyone.
 - **Publish then mention files.** If you `publish` a file you want feedback on, follow it immediately with a `dispatch` describing what it is and what you'd like reviewed
 - **An updated file is just another `publish` of the same path.** No version suffixes needed. Comrades reviewing your script will see a fresh `filesystem op=publish` event for the same path and know to re-read.
-- **Read shared files from the local mirror**, not from the path in the event verbatim. The event's `path` is the *sender's* absolute path; your local copy is at `~/.cccp/<slug>/<their-id>/files/<that-same-path>`.
+- **Read shared files from the local mirror**, not from the path in the event verbatim. The event's `path` is the *sender's* absolute path; your local copy is at `~/.cccp/<your-id>/<slug>/<their-id>/files/<that-same-path>`.
 - **Silence means nothing happened.** No event arriving is not a problem to investigate — it's just quiet. Carry on with whatever you were doing.
 
 ## Wind-down
