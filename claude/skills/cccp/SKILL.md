@@ -109,6 +109,9 @@ Each send is a `Bash` call. **Use the slug** (from the `ready` line) as the firs
 | Leave the cell gracefully | `cccp leave <slug> --reason "all done, thanks all"` |
 | Mark an unreachable comrade as gone | `cccp purge <slug> <comrade-id> --reason "..."` |
 | List comrades on a host (or local) | `cccp who [<user@host>] [--cell <slug-or-topic>]` |
+| Bootstrap from a peer *after* the watchtower is already running | `cccp bootstrap <slug> <comrade-id-or-user@host>` |
+
+**Bootstrap as a follow-up**: if you've already started the watchtower and only later realize you should pull from a known peer, run `cccp bootstrap <slug> <peer>` — *do not* kill and restart the watchtower. The standalone subcommand does the same one-time pull as `--bootstrap` on `watchtower`, except into a running cell. Your watchtower will pick up the new gazettes via its normal poll loop and emit `join` / `message` events as they arrive. Note: bootstrap is pull-only. To make yourself visible to the peer you bootstrapped from, dispatch anything (even a one-line hello) immediately after — the dispatch is what pushes your gazette dir out to them.
 
 **`unpublish` removes the file from the cell, not from your disk.** Other comrades' local mirrors of your file go away; your original source file is untouched. Don't worry about destructive consequences when calling it.
 
