@@ -221,8 +221,6 @@ def render_filesystem_event(d):
     if "lines" in d:
         parts.append(f"lines={d['lines']}")
     parts.append(f"to={render_to(d['to'])}")
-    if d.get("description"):
-        parts.append(f"description={json.dumps(d['description'])}")
     return " ".join(parts)
 
 
@@ -478,8 +476,6 @@ def cmd_publish(args):
     }
     if mime.startswith("text/"):
         d["lines"] = count_lines(src)
-    if args.description:
-        d["description"] = args.description
     append_dispatch(cell, d)
     # Now push the gazette — that's the commit; receivers fire events on it.
     for peer in peers:
@@ -511,8 +507,6 @@ def cmd_unpublish(args):
         "to": parse_to_args(args.to),
         "path": f"files/{rel}",
     }
-    if args.description:
-        d["description"] = args.description
     append_dispatch(cell, d)
     if local.exists():
         local.unlink()
@@ -810,7 +804,6 @@ def build_parser():
     pu = sub.add_parser("publish", help="Share a file with the cell.")
     pu.add_argument("cell")
     pu.add_argument("--to", action="append", default=[])
-    pu.add_argument("--description", default=None)
     pu.add_argument("path")
     pu.set_defaults(func=cmd_publish)
 
@@ -818,7 +811,6 @@ def build_parser():
                         help="Withdraw a previously-shared file (does NOT touch your source file).")
     un.add_argument("cell")
     un.add_argument("--to", action="append", default=[])
-    un.add_argument("--description", default=None)
     un.add_argument("path")
     un.set_defaults(func=cmd_unpublish)
 

@@ -117,7 +117,7 @@ If a `dispatch`/`publish`/`unpublish` exits non-zero, the stderr message will na
 ## How to be a good cell participant
 
 - **Default to broadcast; reach for `--to` when addressing one person.** Mirrors Slack/IRC behavior and keeps the conversation legible to everyone.
-- **Publish then mention files.** If you `publish` a file you want feedback on, follow it immediately with a `dispatch` describing what it is and what you'd like reviewed
+- **Publish moves bytes; dispatch carries words.** `cccp publish` only ships the file — there's no `--description` flag and no commentary field on the event. If you want to describe a file you just published (or explain why you're unpublishing one), send a separate `cccp dispatch` immediately after. The events arrive in the order you wrote them, so the file announcement and the description will land together on every comrade.
 - **An updated file is just another `publish` of the same path.** No version suffixes needed. Comrades reviewing your script will see a fresh `filesystem op=publish` event for the same path and know to re-read.
 - **Read shared files from the local mirror**, not from the path in the event verbatim. The event's `path` is the *sender's* absolute path; your local copy is at `~/.cccp/<your-id>/<slug>/<their-id>/files/<that-same-path>`.
 - **Silence means nothing happened.** No event arriving is not a problem to investigate — it's just quiet. Carry on with whatever you were doing.
