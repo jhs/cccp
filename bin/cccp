@@ -416,6 +416,59 @@ def discover_comrades(user_host=None):
     return pairs
 
 
+# ---------- bootstrap (one-time pull from a known peer) ----------
+
+def bootstrap(cell, peer):
+    """Pull a peer's view of `cell` into our own per-comrade tree.
+
+    `peer` may be a full comrade id (bob@hostB:51853) or a bare user@host
+    (bob@hostB). The full form names a specific source subtree on the peer's
+    disk. The bare form runs `cccp who`-style discovery and auto-uses the
+    sole comrade in this cell on that host (errors on 0 or 2+ matches).
+
+    Safe to invoke standalone or while a watchtower is already running for
+    this cell:
+      - Gazettes are append-only by protocol, so this only adds bytes;
+        the running watchtower's poll loop picks up `size > hwm` naturally
+        and emits new events without any HWM reset.
+      - `--update` is set so a stale source can't truncate our newer local
+        gazette mirrors back down to its older state.
+
+    Pull-only — making yourself visible to peers requires running a
+    watchtower (which pushes after its own bootstrap step).
+    """
+    slug = slugify(cell)
+    if ":" not in peer:
+        in_cell = [
+            c for c, s in discover_comrades(peer)
+            if s == slug and c != self_id()
+        ]
+        if not in_cell:
+            print(f"bootstrap: no comrade on {peer} has cell {slug}; "
+                  f"try `cccp who {peer}` to see what's there",
+                  file=sys.stderr)
+            return
+        if len(in_cell) > 1:
+            print(f"bootstrap: multiple comrades on {peer} have cell "
+                  f"{slug}: {', '.join(sorted(in_cell))}; "
+                  f"rerun with the specific full comrade id",
+                  file=sys.stderr)
+            return
+        print(f"bootstrap: sole comrade with cell {slug} on {peer} is "
+              f"{in_cell[0]}", file=sys.stderr)
+        peer = in_cell[0]
+    dest = my_root() / slug
+    dest.mkdir(parents=True, exist_ok=True)
+    src = f"~/.cccp/{peer}/{slug}/"
+    source = (os.path.expanduser(src) if is_same_userhost(peer)
+              else f"{addr_to_ssh(peer)}:{src}")
+    cmd = ["rsync", "-r", "--update", "--exclude=state",
+           source, f"{dest}/"]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"bootstrap from {peer}: {r.stderr.strip()}", file=sys.stderr)
+
+
 # ---------- subcommands ----------
 
 def cmd_dispatch(args):
@@ -531,6 +584,10 @@ def cmd_leave(args):
         sys.exit(1)
 
 
+def cmd_bootstrap(args):
+    bootstrap(args.cell, args.peer)
+
+
 def cmd_who(args):
     pairs = discover_comrades(args.target)
     # Hide ourselves when listing the local machine; we already know we're here.
@@ -612,39 +669,7 @@ class Watchtower:
                     pass
 
     def _bootstrap(self, peer):
-        # `peer` may be a full comrade-id (bob@hostB:51853) or a bare user@host
-        # (bob@hostB). The full form names a specific source subtree on the
-        # peer's disk. The bare form triggers an auto-`who`-and-pick: if
-        # exactly one comrade on that host is in our cell, use them; else
-        # error. This keeps the common 1:1 case ergonomic without burying
-        # discovery inside what should be a transport step.
-        slug = slugify(self.cell)
-        if ":" not in peer:
-            in_cell = [
-                c for c, s in discover_comrades(peer)
-                if s == slug and c != self_id()
-            ]
-            if not in_cell:
-                print(f"bootstrap: no comrade on {peer} has cell {slug}; "
-                      f"try `cccp who {peer}` to see what's there",
-                      file=sys.stderr)
-                return
-            if len(in_cell) > 1:
-                print(f"bootstrap: multiple comrades on {peer} have cell "
-                      f"{slug}: {', '.join(sorted(in_cell))}; "
-                      f"rerun --bootstrap with the specific full comrade id",
-                      file=sys.stderr)
-                return
-            print(f"bootstrap: sole comrade with cell {slug} on {peer} is "
-                  f"{in_cell[0]}", file=sys.stderr)
-            peer = in_cell[0]
-        src = f"~/.cccp/{peer}/{slug}/"
-        source = (os.path.expanduser(src) if is_same_userhost(peer)
-                  else f"{addr_to_ssh(peer)}:{src}")
-        cmd = ["rsync", "-r", "--exclude=state", source, f"{self.cd}/"]
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        if r.returncode != 0:
-            print(f"bootstrap from {peer}: {r.stderr.strip()}", file=sys.stderr)
+        bootstrap(self.cell, peer)
 
     def initial_scan(self):
         """Register peers already present at startup without replaying their history."""
@@ -824,6 +849,16 @@ def build_parser():
     pg.add_argument("comrade")
     pg.add_argument("--reason", default=None)
     pg.set_defaults(func=cmd_purge)
+
+    bs = sub.add_parser("bootstrap",
+                        help="One-time pull from a known comrade. Useful "
+                             "for joining a peer's view after the watchtower "
+                             "is already running, or for recovering state.")
+    bs.add_argument("cell")
+    bs.add_argument("peer",
+                    help="Full comrade id (bob@hostB:51853) or bare user@host "
+                         "(auto-uses the sole comrade in this cell on that host).")
+    bs.set_defaults(func=cmd_bootstrap)
 
     wh = sub.add_parser("who",
                         help="List comrades and their cells, grouped by cell.")
