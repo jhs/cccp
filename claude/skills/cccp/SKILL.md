@@ -27,9 +27,7 @@ Comrade IDs are `user@host:PID` — so multiple Claude sessions on the same acco
 
 *Your* Comrade ID is shown in the watchtower's `ready` line on startup.
 
-## Step 0 — Make sure cccp is installed
-
-Run `command -v cccp` once. If it's not on `$PATH`, stop and tell the user the situation, and then halt; don't try to fake or kludge things from the shell.
+**If any `cccp` command fails — not found on `$PATH`, non-zero exit, unexpected error — stop and tell the user what happened. Don't try to fake or kludge things from the shell.**
 
 ## Step 1 — Start the watchtower under the Monitor tool
 
