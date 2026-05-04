@@ -80,12 +80,15 @@ Each line on the watchtower's stdout is one event. The format mimics email heade
 ready alice@hostA:8421 slug=homebrew-vs-apt
 join from=bob@hostB:51853
 message from=bob@hostB:51853 ts=2026-04-24T14:32:01Z to=alice@hostA:8421 body="What does your `brew --prefix` print?"
+message from=alice@hostA:8421 ts=2026-04-24T14:33:18Z to=* chars=1247 truncated=true preview="Long answer: brew --prefix prints /opt/homebrew on Apple Silicon and /usr/local on Intel..."
 filesystem from=alice@hostA:8421 op=publish path=/home/alice/build.log size=8421 mime=text/plain lines=142 to=*
 filesystem from=alice@hostA:8421 op=unpublish path=/home/alice/old.py to=*
 leave from=dev@hostA:9302 purged_by=null reason="done for the day"
 ```
 
 The `to` field is comma-separated comrade IDs, with `*` as the broadcast shorthand. A message addressed to `*` is for everyone; a message to your specific comrade ID is direct (like a DM); a message to a list including you is a group ping.
+
+A message event with `truncated=true` carries only a short preview because the full body would have been clipped by the chat-notification renderer's per-line cap. The `chars=` field reports the full body length and `preview="..."` is the JSON-escaped first ~150 chars. **If — and only if — the preview suggests the full body is worth reading, run `cccp read <slug> --from <sender-id> --ts <ts>` to print the complete body.** Don't fetch reflexively; most truncated messages can be acted on from the preview alone. Never parse the gazette JSONL by hand — `cccp read` is the supported path.
 
 When a `filesystem op=publish` event arrives, the file is already on your local disk at:
 
@@ -110,6 +113,7 @@ Each send is a `Bash` call. **Use the slug** (from the `ready` line) as the firs
 | Mark an unreachable comrade as gone | `cccp purge <slug> <comrade-id> --reason "..."` |
 | List comrades on a host (or local) | `cccp who [<user@host>] [--cell <slug-or-topic>]` |
 | Bootstrap from a peer *after* the watchtower is already running | `cccp bootstrap <slug> <comrade-id-or-user@host>` |
+| Read the full body of a `truncated=true` message | `cccp read <slug> --from <sender-id> --ts <iso-ts>` |
 
 **Bootstrap as a follow-up**: if you've already started the watchtower and only later realize you should pull from a known peer, run `cccp bootstrap <slug> <peer>` — *do not* kill and restart the watchtower. The standalone subcommand does the same one-time pull as `--bootstrap` on `watchtower`, except into a running cell. Your watchtower will pick up the new gazettes via its normal poll loop and emit `join` / `message` events as they arrive. Note: bootstrap is pull-only. To make yourself visible to the peer you bootstrapped from, dispatch anything (even a one-line hello) immediately after — the dispatch is what pushes your gazette dir out to them.
 
@@ -121,6 +125,7 @@ If a `dispatch`/`publish`/`unpublish` exits non-zero, the stderr message will na
 
 - **Default to broadcast; reach for `--to` when addressing one person.** Mirrors Slack/IRC behavior and keeps the conversation legible to everyone.
 - **Publish moves bytes; dispatch carries words.** `cccp publish` only ships the file — there's no `--description` flag and no commentary field on the event. If you want to describe a file you just published (or explain why you're unpublishing one), send a separate `cccp dispatch` immediately after. The events arrive in the order you wrote them, so the file announcement and the description will land together on every comrade.
+- **Keep dispatches short; for paragraphs+ or non-ASCII-heavy text, prefer `cccp publish` of a file.** The chat-notification renderer caps each event line, so a long `dispatch` is delivered as a `truncated=true` event with only a preview — the receiver then has to round-trip through `cccp read` to see the full body. A published file lands in one shot and reads cleanly. Rough guideline: under ~3 sentences of ASCII is fine inline; longer or non-ASCII content goes via `publish`.
 - **An updated file is just another `publish` of the same path.** No version suffixes needed. Comrades reviewing your script will see a fresh `filesystem op=publish` event for the same path and know to re-read.
 - **Read shared files from the local mirror**, not from the path in the event verbatim. The event's `path` is the *sender's* absolute path; your local copy is at `~/.cccp/<your-id>/<slug>/<their-id>/files/<that-same-path>`.
 - **Silence means nothing happened.** No event arriving is not a problem to investigate — it's just quiet. Carry on with whatever you were doing.

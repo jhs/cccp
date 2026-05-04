@@ -25,6 +25,14 @@ CCCP_HOME = Path.home() / ".cccp"
 POLL_INTERVAL = 0.25  # seconds between watchtower scans
 ADDR_RE = re.compile(r"^([^\s@]+)@([^\s:]+):([^\s:]+)$")
 
+# Monitor's notification renderer caps each stdout line at ~510 UTF-16 code
+# units, replacing the tail with the literal `...(truncated)`. After cccp's
+# json.dumps(ensure_ascii=True), the rendered line is pure ASCII so chars ≡
+# UTF-16 units. We emit a header-only form below this threshold instead of
+# letting the renderer eat the body.
+TRUNCATE_THRESHOLD = 480
+PREVIEW_BUDGET = 150
+
 
 # ---------- identity & path helpers ----------
 
@@ -207,9 +215,35 @@ def display_path(path):
     return path
 
 
+def safe_preview_inner(body, max_inner_chars=PREVIEW_BUDGET):
+    """Return the JSON-inner (no surrounding quotes) of a body slice that fits
+    within max_inner_chars after JSON escape, without splitting an escape
+    sequence.
+
+    Iterative: extend a body prefix one codepoint at a time; stop when the
+    next codepoint would push the escaped form over budget. O(n²) in the
+    preview length but n is small (~150).
+    """
+    n = 0
+    inner = ""
+    while n < len(body):
+        candidate = json.dumps(body[: n + 1])[1:-1]
+        if len(candidate) > max_inner_chars:
+            break
+        inner = candidate
+        n += 1
+    return inner
+
+
 def render_message_event(d):
+    body = d.get("body", "")
+    full = (f"message from={d['from']} ts={d['ts']} to={render_to(d['to'])} "
+            f"body={json.dumps(body)}")
+    if len(full) <= TRUNCATE_THRESHOLD:
+        return full
+    preview = safe_preview_inner(body)
     return (f"message from={d['from']} ts={d['ts']} to={render_to(d['to'])} "
-            f"body={json.dumps(d.get('body', ''))}")
+            f"chars={len(body)} truncated=true preview=\"{preview}\"")
 
 
 def render_filesystem_event(d):
@@ -653,6 +687,56 @@ def cmd_who(args):
     print("\n\n".join(blocks))
 
 
+def cmd_read(args):
+    """Print the full body of a previously-received message dispatch.
+
+    Reads the local gazette mirror written by rsync from the sender. Use this
+    after seeing a `truncated=true` event in the watchtower stream — the
+    notification only carries a preview, but the gazette has the full body.
+    """
+    cell = args.cell
+    if not my_dir(cell).exists():
+        sys.exit(f"error: not in cell {cell!r}")
+    sender = args.from_
+    if not ADDR_RE.match(sender):
+        sys.exit(f"error: bad comrade ID: {sender!r}")
+    gz = cell_dir(cell) / sender / "gazette.jsonl"
+    if not gz.exists():
+        sys.exit(f"error: no gazette for {sender} in cell {cell}")
+
+    messages = []
+    with open(gz, "rb") as f:
+        for line in f:
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if d.get("type") == "message":
+                messages.append(d)
+
+    if args.ts:
+        match = next((d for d in messages if d.get("ts") == args.ts), None)
+        if not match:
+            sys.exit(f"error: no message with ts={args.ts!r} from {sender}")
+        sys.stdout.write(match.get("body", ""))
+        if not match.get("body", "").endswith("\n"):
+            sys.stdout.write("\n")
+        return
+
+    n = args.last if args.last is not None else 1
+    if n < 1:
+        sys.exit("error: --last must be ≥ 1")
+    selected = messages[-n:]
+    if not selected:
+        sys.exit(f"error: no messages from {sender} in cell {cell}")
+    for i, d in enumerate(selected):
+        if len(selected) > 1:
+            print(f"--- ts={d.get('ts')} ---")
+        sys.stdout.write(d.get("body", ""))
+        if not d.get("body", "").endswith("\n"):
+            sys.stdout.write("\n")
+
+
 def cmd_purge(args):
     cell = args.cell
     target = args.comrade
@@ -901,6 +985,21 @@ def build_parser():
                     help="Full comrade id (bob@hostB:51853) or bare user@host "
                          "(auto-uses the sole comrade in this cell on that host).")
     bs.set_defaults(func=cmd_bootstrap)
+
+    rd = sub.add_parser("read",
+                        help="Print the full body of a previous message "
+                             "dispatch from a comrade. Use after seeing a "
+                             "`truncated=true` event.")
+    rd.add_argument("cell")
+    rd.add_argument("--from", dest="from_", required=True, metavar="COMRADE",
+                    help="Sender's comrade ID (user@host:pid).")
+    group = rd.add_mutually_exclusive_group()
+    group.add_argument("--ts", default=None,
+                       help="Exact ISO timestamp from the truncated event.")
+    group.add_argument("--last", type=int, nargs="?", const=1, default=None,
+                       metavar="N", help="Print the last N messages "
+                                          "(default 1).")
+    rd.set_defaults(func=cmd_read)
 
     wh = sub.add_parser("who",
                         help="List comrades and their cells, grouped by cell.")
