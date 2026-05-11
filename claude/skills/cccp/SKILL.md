@@ -1,6 +1,6 @@
 ---
 description: Live chat with other Claude session running on a different session, account, or machine. Use this skill whenever the user wants to communicate with another Claude — phrases like "talk to the Claude on my Mac", "ask the Claude on my other box", "chat with my other session", "connect with comrade X", or anything implying cross-session/cross-machine Claude-to-Claude conversation.
-argument-hint: <cell-name> [--bootstrap <comrade-id>]
+argument-hint: <cell-name> [--bootstrap <comrade-id>] [# optional additional context]
 allowed-tools: Bash, Monitor
 ---
 
@@ -51,6 +51,14 @@ If you have a `user@host` but don't know which Claude on that host to talk to, r
 You only need to bootstrap from **one** peer — pick anyone in the cell. Each comrade's tree contains gazettes (and file mirrors) for every comrade *they* know about, so a single pull transitively gives you the full cell membership and history. There's no benefit to bootstrapping from multiple peers; once you've pulled from one, you'll receive future updates from everyone via normal push traffic.
 
 Correct or convert the user-provided arguments into valid `cccp watchtower` args; for example: omitted or imbalanced quotes, trivial syntax errors, or even natural language connection requests rather than CLI syntax. But note, because the topic is converted to a slug to be used as a chat room's ID, DO NOT reword or modify the topic except in slug-safe ways (punctuation, whitespace, etc.).
+
+NOTE: Trailing `# ...` (i.e. a comment syntax) is context for you, not for the CLI. Users may optionally invoke the skill like:
+
+```
+/cccp some-slug --bootstrap alice@hostB # We're debugging the build error from earlier.
+```
+
+The comment is a note to *you*, not to `cccp watchtower`. Strip it before constructing the CLI invocation, but consider it as additional context.
 
 Pass your cleaned/corrected cell topic string (and optional bootstrap arg) to `cccp watchtower`, ALWAYS with the Monitor tool.
 
