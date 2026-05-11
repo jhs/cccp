@@ -166,3 +166,21 @@ Not bugs; bigger calls that deserve their own conversation.
   debugging "is my message reaching anyone."
 - **Scaling beyond ~10 comrades.** Design doc has a clear path (NNTP-
   style flooding with dedup). Park until it bites.
+- **Hub-and-spoke relay for unreachable peers.** Current transport is a
+  full mesh requiring bidirectional SSH between every pair. The reverse-
+  SSH-tunnel pattern built during the another project port (2026-05-11) is a
+  workaround for one topology (laptop ↔ public-IP cloud VM), not a
+  generalization. A general fix: designate one well-connected peer (a
+  cloud VM, typically) as a **hub**; spokes maintain a single outbound
+  SSH tunnel to the hub. The hub runs the same watchtower with a
+  `--relay` flag — on receiving a gazette from one peer, it pushes
+  onward to all other known peers. Topology becomes star (N spokes × 1
+  tunnel each) instead of mesh (N × (N−1)), and spokes only need
+  outbound SSH. Gazettes are already append-only and content-addressed
+  by `(comrade, ts)`, so forwarding is idempotent — HWM dedupe handles
+  arrivals via multiple paths. Open questions: hub failure (cell
+  partitions until a second hub elects), whether spokes should attempt
+  direct-peer paths first and fall back to relay, fairness/cost on the
+  hub for large cells. Probably the right next architectural step once
+  someone hits "can't accept inbound SSH" — unblocks phones, locked-
+  down corp laptops, NAT'd hosts.
