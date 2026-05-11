@@ -303,11 +303,9 @@ def addr_to_ssh(comrade_id):
     if "@" not in head:
         raise ValueError(f"Bad address: {comrade_id!r}")
     user, host = head.split("@", 1)
-    # Bare short hostnames (no dots, not localhost) get .local appended so
-    # mDNS/Bonjour resolution works on LANs without an ssh_config alias.
-    # Already-qualified names (with dots) and `localhost` are passed through.
-    if "." not in host and host != "localhost":
-        host = f"{host}.local"
+    # Hostname is passed through verbatim. For LAN-local peers, configure
+    # an ~/.ssh/config alias (e.g. `Host host-b → HostName host-b.example`); for
+    # cloud peers, the alias also encodes a tunnel port.
     return f"{user}@{host}"
 
 
