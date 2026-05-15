@@ -1,76 +1,116 @@
 #!/usr/bin/env python3
-"""cccp - Claude-to-Claude Communication Protocol.
+"""cccp - Claude-to-Claude Communication Protocol (v2 - Azure Blob transport).
 
-Six subcommands: watchtower, dispatch, publish, unpublish, leave, purge.
-See the cccp skill (claude/skills/cccp/SKILL.md) and design doc for protocol
-details. Storage layout is rooted at ~/.cccp/<cell-slug>/.
+v2 replaces the v1 SSH/rsync mesh with a single Azure Blob Storage container as
+a shared rendezvous: every comrade reads and writes one container, and there are
+no peer-to-peer connections. Transport is pure Python stdlib (urllib) against the
+Blob REST API, authenticated by a container-scoped SAS token - no SDK, no binary,
+so it runs anywhere Python 3 does.
+
+Storage layout (a cell is the triple (account, container, prefix) + slug):
+
+    <container>/<prefix>/<slug>/<comrade-id>/gazette.jsonl   append blob
+    <container>/<prefix>/<slug>/<comrade-id>/files/<path>    block blobs
+    <container>/<prefix>/<slug>/<comrade-id>/claim           identity claim
+    <container>/<prefix>/<slug>/<comrade-id>/gone.json       explicit leave
+
+bin/cccp is an executable script, not an importable module. When an ad-hoc
+one-off needs the REST logic (e.g. the large-file staging fallback), read this
+file as a reference implementation rather than importing it.
+
+Subcommands (build in progress):
+    init        Resolve identity + roster for a cell (SKILL.md render-time helper).
+    dispatch    Send a message to a cell.
+    watchtower  Stream live cell events (run under the Monitor tool).
+    leave       Leave a cell (writes gone.json).
+    read        Print cell message history.
+    rm          Delete a cell and all its blobs (user-directed).
+    publish     Share a file with a cell.
+    unpublish   Withdraw a previously-published file.
+    pull        Download published files into the local mirror.
 """
 
 import argparse
 import json
-import mimetypes
 import os
 import pwd
 import re
-import shutil
 import signal
 import socket
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 
-CCCP_HOME = Path.home() / ".cccp"
-POLL_INTERVAL = 0.25  # seconds between watchtower scans
-ADDR_RE = re.compile(r"^([^\s@]+)@([^\s:]+):([^\s:]+)$")
+API_VERSION = "2023-11-03"
+DEFAULT_PREFIX = "__default__"
+CONFIG_PATH = Path.home() / ".config" / "cccp" / "config"
+POLL_INTERVAL = 0.25       # seconds between watchtower scans
+TRUNCATE_THRESHOLD = 480   # render a header-only event above this many chars
+PREVIEW_BUDGET = 150       # preview chars carried on a truncated event
+PUBLISH_MAX = 256 * 1024 * 1024   # single-PUT publish ceiling; larger needs staging
+AUTODOWNLOAD_MAX = 1024 * 1024    # watchtower auto-downloads published files at or
+                                  # under this size; larger ones are only announced
+                                  # (Claude fetches them with `cccp pull`). Bounded
+                                  # by what downloads fast enough not to stall the
+                                  # poll loop - not by "how big a file is".
+LOCAL_MIRROR = Path.home() / ".cccp"   # where pulled / auto-downloaded files land
+TEXT_EXTENSIONS = {
+    ".txt", ".md", ".rst", ".html", ".htm", ".xml", ".csv", ".tsv", ".json",
+    ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".log", ".sh", ".bash",
+    ".zsh", ".py", ".js", ".ts", ".jsx", ".tsx", ".c", ".h", ".cpp", ".hpp",
+    ".cc", ".go", ".rs", ".java", ".rb", ".pl", ".php", ".lua", ".sql", ".css",
+    ".scss", ".vue", ".svelte", ".tf", ".hcl", ".env", ".gitignore",
+}
 
-# Monitor's notification renderer caps each stdout line at ~510 UTF-16 code
-# units, replacing the tail with the literal `...(truncated)`. After cccp's
-# json.dumps(ensure_ascii=True), the rendered line is pure ASCII so chars ≡
-# UTF-16 units. We emit a header-only form below this threshold instead of
-# letting the renderer eat the body.
-TRUNCATE_THRESHOLD = 480
-PREVIEW_BUDGET = 150
 
-
-# ---------- identity & path helpers ----------
+# ---------- identity & misc helpers ----------
 
 def now_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-
-
-def slugify(name):
-    s = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-    if not s:
-        raise ValueError(f"Cell name {name!r} produced empty slug")
-    return s
-
-
-def short_hostname():
-    return socket.gethostname().split(".")[0]
 
 
 def current_user():
     return pwd.getpwuid(os.getuid()).pw_name
 
 
-def find_claude_pid():
-    """Walk parent process chain to find the Claude process; fall back to PPID.
+def short_hostname():
+    return socket.gethostname().split(".")[0]
 
-    Why: comrade IDs use the Claude PID as the session component so multiple
-    Claude sessions on the same user@host stay distinct (e.g. across Ghostty
-    tabs) and so the session is a real, killable process.
+
+def base_comrade_id():
+    """The clean, cell-scoped-unique-by-default comrade id: user@host."""
+    return f"{current_user()}@{short_hostname()}"
+
+
+def slugify(name):
+    s = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    if not s:
+        raise ValueError(f"Cell name {name!r} produced an empty slug")
+    return s
+
+
+def find_claude_pid():
+    """Walk the parent process chain to find the Claude session's pid.
+
+    This is the stable per-session key: every cccp invocation from one Claude
+    session finds the same pid, so identity stays consistent across the separate
+    init / dispatch / watchtower process invocations with no local state file.
+    It is NOT part of the default comrade id (that stays the clean user@host) -
+    only the collision disambiguator and the cross-invocation re-derivation key.
     """
     pid = os.getppid()
     for _ in range(20):
         if pid in (0, 1):
             break
         try:
-            r = subprocess.run(
-                ["ps", "-o", "ppid=,args=", "-p", str(pid)],
-                capture_output=True, text=True, check=True,
-            )
+            r = subprocess.run(["ps", "-o", "ppid=,args=", "-p", str(pid)],
+                               capture_output=True, text=True, check=True)
         except subprocess.CalledProcessError:
             break
         line = r.stdout.strip()
@@ -79,12 +119,11 @@ def find_claude_pid():
         parts = line.split(None, 1)
         if len(parts) < 2:
             break
-        ppid_str, args = parts
-        a_lower = args.lower()
-        if "claude" in os.path.basename(args.split()[0]).lower() \
-                or "/.local/share/claude/" in a_lower \
-                or a_lower.startswith("claude ") \
-                or a_lower == "claude":
+        ppid_str, cmdline = parts
+        low = cmdline.lower()
+        if "claude" in os.path.basename(cmdline.split()[0]).lower() \
+                or "/.local/share/claude/" in low \
+                or low.startswith("claude ") or low == "claude":
             return pid
         try:
             pid = int(ppid_str)
@@ -93,141 +132,252 @@ def find_claude_pid():
     return os.getppid()
 
 
-_self_id_cache = None
+# ---------- config resolution ----------
+
+def _parse_cccp_env(path):
+    """Parse a KEY=value file, returning only its CCCP_* keys."""
+    cfg = {}
+    for line in Path(path).read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        if k.startswith("CCCP_"):
+            cfg[k] = v.strip()
+    return cfg
 
 
-def self_id():
-    global _self_id_cache
-    if _self_id_cache is None:
-        env = os.environ.get("CCCP_COMRADE_ID")
-        _self_id_cache = env or f"{current_user()}@{short_hostname()}:{find_claude_pid()}"
-    return _self_id_cache
+def resolve_config(start=None):
+    """Resolve the CCCP storage config for the current working directory.
 
+    Walk up from CWD for the closest `.env` that carries CCCP_* keys - that one
+    wins entirely (per-project override). Otherwise fall back to the personal
+    default at ~/.config/cccp/config. CCCP_PREFIX is optional and defaults to
+    __default__, so a config only needs ACCOUNT, CONTAINER, and SAS.
 
-def my_root():
-    # Each comrade has its own root tree. Two same-host comrades share
-    # nothing on disk under their respective ~/.cccp/<comrade-id>/ subtrees;
-    # they communicate only via real rsync (over the loopback for same-host,
-    # over SSH for cross-host).
-    return CCCP_HOME / self_id()
-
-
-def cell_dir(cell):
-    # MY view of this cell. Inside this dir live my own gazette
-    # subdirectory plus mirrors of every peer's gazette subdirectory.
-    return my_root() / slugify(cell)
-
-
-def my_dir(cell):
-    return cell_dir(cell) / self_id()
-
-
-def state_dir(cell):
-    # Already inside our per-comrade root, so no further keying needed.
-    return cell_dir(cell) / "state"
-
-
-def hwm_dir(cell):
-    return state_dir(cell) / "high-water-marks"
-
-
-# ---------- atomic writes & gazette append ----------
-
-def atomic_write(path, data):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "wb") as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
-
-
-def append_dispatch(cell, dispatch):
-    """Append one JSON line to my own gazette via temp-rename.
-
-    Why temp-rename rather than O_APPEND: the local watchtower is reading the
-    gazette concurrently; rename(2) gives it a torn-line-free view regardless
-    of dispatch size.
+    Returns a dict with ACCOUNT, CONTAINER, SAS, PREFIX.
     """
-    gazette = my_dir(cell) / "gazette.jsonl"
-    gazette.parent.mkdir(parents=True, exist_ok=True)
-    existing = gazette.read_bytes() if gazette.exists() else b""
-    line = json.dumps(dispatch, separators=(",", ":")).encode("utf-8") + b"\n"
-    atomic_write(gazette, existing + line)
+    start = Path(start or os.getcwd()).resolve()
+    found = None
+    for d in (start, *start.parents):
+        env = d / ".env"
+        if env.is_file():
+            cfg = _parse_cccp_env(env)
+            if cfg:  # only counts as a CCCP config if it has CCCP_* keys
+                found = cfg
+                break
+    if found is None:
+        if not CONFIG_PATH.is_file():
+            sys.exit(f"error: no CCCP config - no .env with CCCP_* keys at or "
+                     f"above {start}, and {CONFIG_PATH} is missing "
+                     f"(run tf/apply.sh, then install.sh)")
+        found = _parse_cccp_env(CONFIG_PATH)
+
+    out = {
+        "ACCOUNT": found.get("CCCP_ACCOUNT"),
+        "CONTAINER": found.get("CCCP_CONTAINER"),
+        "SAS": (found.get("CCCP_SAS") or "").lstrip("?"),
+        "PREFIX": found.get("CCCP_PREFIX") or DEFAULT_PREFIX,
+    }
+    missing = [k for k in ("ACCOUNT", "CONTAINER", "SAS") if not out[k]]
+    if missing:
+        sys.exit(f"error: CCCP config is missing keys: {missing}")
+    return out
 
 
-# ---------- address handling ----------
+# ---------- Azure Blob REST client ----------
 
-def expand_shorthand(addr):
-    return "*@*:*" if addr == "*" else addr
+class BlobError(Exception):
+    def __init__(self, status, body):
+        self.status = status
+        self.body = body
+        super().__init__(f"blob error {status}: {body[:200]!r}")
 
 
-def parse_to_args(to_args):
-    """Normalize zero or more --to flags into the canonical to-array.
+class BlobClient:
+    """Minimal Azure Blob REST client - stdlib urllib plus a container SAS.
 
-    Empty list defaults to broadcast. The CLI is liberal (single `*`, repeated
-    --to); the on-disk form is always a fully-expanded array.
+    Paths are relative to the container; the SAS supplies all authentication.
     """
-    if not to_args:
-        return ["*@*:*"]
-    seen, result = set(), []
-    for a in to_args:
-        a = expand_shorthand(a.strip())
-        if a not in seen:
-            seen.add(a)
-            result.append(a)
-    return result
+
+    RETRYABLE = (500, 502, 503, 504)
+
+    def __init__(self, account, container, sas):
+        self.base = f"https://{account}.blob.core.windows.net/{container}"
+        self.sas = sas.lstrip("?")
+
+    def _url(self, path, query=""):
+        u = f"{self.base}/{path}" if path else self.base
+        return u + "?" + "&".join(p for p in (query, self.sas) if p)
+
+    def request(self, method, path, query="", data=None, headers=None, retries=3):
+        """One REST call. Returns (status, headers_dict, body_bytes).
+
+        Transient 5xx are retried with a short backoff. An HTTPError (4xx) is
+        returned, not raised, so callers can branch on expected statuses such as
+        the 409 from a conditional create or a 416 past end-of-blob.
+        """
+        h = {"x-ms-version": API_VERSION}
+        if headers:
+            h.update(headers)
+        url = self._url(path, query)
+        for attempt in range(retries):
+            req = urllib.request.Request(url, data=data, method=method, headers=h)
+            try:
+                resp = urllib.request.urlopen(req, timeout=30)
+                return resp.status, dict(resp.headers), resp.read()
+            except urllib.error.HTTPError as e:
+                if e.code in self.RETRYABLE and attempt < retries - 1:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                return e.code, dict(e.headers), e.read()
+            except urllib.error.URLError:
+                if attempt < retries - 1:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise
+
+    # -- convenience operations --
+
+    def put_block(self, path, data, if_none_match=False):
+        """PUT a block blob. With if_none_match, creates only if absent (201) and
+        returns 409 if it already exists."""
+        h = {"x-ms-blob-type": "BlockBlob"}
+        if if_none_match:
+            h["If-None-Match"] = "*"
+        return self.request("PUT", path, data=data, headers=h)[0]
+
+    def get(self, path):
+        st, _, body = self.request("GET", path)
+        return st, body
+
+    def get_range(self, path, offset):
+        """GET a blob from byte `offset` to the end. Returns (status, body)."""
+        st, _, body = self.request("GET", path, headers={"Range": f"bytes={offset}-"})
+        return st, body
+
+    def ensure_append_blob(self, path):
+        """Create an append blob if absent. 201 created or 409 exists - both fine."""
+        return self.request("PUT", path, data=b"",
+                            headers={"x-ms-blob-type": "AppendBlob",
+                                     "If-None-Match": "*"})[0]
+
+    def append_block(self, path, data):
+        """Append bytes to the end of an append blob."""
+        return self.request("PUT", path, query="comp=appendblock", data=data)[0]
+
+    def list(self, prefix):
+        """List blobs under a prefix. Returns {name: {"size", "last_modified"}}."""
+        st, _, body = self.request(
+            "GET", "",
+            query=f"restype=container&comp=list&prefix={urllib.parse.quote(prefix)}")
+        if st != 200:
+            raise BlobError(st, body)
+        root = ET.fromstring(body)
+        out = {}
+        for b in root.findall(".//Blob"):
+            name = b.findtext("Name")
+            props = b.find("Properties")
+            size = props.findtext("Content-Length") if props is not None else None
+            lm = props.findtext("Last-Modified") if props is not None else None
+            out[name] = {"size": int(size) if size else 0, "last_modified": lm}
+        return out
 
 
-def addr_components(addr):
-    m = ADDR_RE.match(addr)
-    if not m:
-        raise ValueError(f"Bad address: {addr!r}")
-    return m.group(1), m.group(2), m.group(3)
+# ---------- identity claim & roster ----------
+
+def claim_identity(client, prefix, slug):
+    """Resolve (claiming if needed) this session's comrade id for a cell.
+
+    Idempotent and self-recomputing: every cccp invocation from the same Claude
+    session arrives at the same id, keyed on the Claude process pid. The clean
+    `user@host` is used by default; a sibling session on the same host that
+    finds it already taken falls back to `user@host:<claude-pid>`.
+
+    CCCP_COMRADE_ID in the environment overrides all of this with an explicit id
+    (used for testing and deliberate identity control).
+    """
+    env_id = os.environ.get("CCCP_COMRADE_ID")
+    if env_id:
+        client.put_block(f"{prefix}/{slug}/{env_id}/claim",
+                         json.dumps({"ts": now_iso()}).encode())
+        return env_id
+    base = base_comrade_id()
+    mypid = find_claude_pid()
+    body = json.dumps({"claude_pid": mypid, "ts": now_iso()}).encode()
+    base_claim = f"{prefix}/{slug}/{base}/claim"
+
+    st = client.put_block(base_claim, body, if_none_match=True)
+    if st == 201:
+        return base                       # claimed the clean id
+    if st == 409:
+        # Someone holds the clean id - a prior invocation of mine, or a sibling?
+        gst, gbody = client.get(base_claim)
+        owner_pid = None
+        if gst == 200:
+            try:
+                owner_pid = json.loads(gbody).get("claude_pid")
+            except (ValueError, AttributeError):
+                pass
+        if owner_pid == mypid:
+            return base                   # it is mine - a re-run from this session
+        pid_id = f"{base}:{mypid}"
+        client.put_block(f"{prefix}/{slug}/{pid_id}/claim", body)  # overwrite ok
+        return pid_id
+    raise BlobError(st, b"")
 
 
-def matches(pattern, comrade):
-    pu, ph, ps = addr_components(pattern)
-    cu, ch, cs = addr_components(comrade)
-    return ((pu == "*" or pu == cu)
-            and (ph == "*" or ph == ch)
-            and (ps == "*" or ps == cs))
+def cell_roster(client, prefix, slug):
+    """Return the sorted comrade ids registered in a cell."""
+    head = f"{prefix}/{slug}/"
+    comrades = set()
+    for name in client.list(head):
+        rest = name[len(head):]
+        if "/" in rest:
+            comrades.add(rest.split("/", 1)[0])
+    return sorted(comrades)
 
 
-def addressed_to_me(to_array, me):
-    return any(matches(p, me) for p in to_array)
+# ---------- gazette ----------
+
+def gazette_path(prefix, slug, comrade):
+    return f"{prefix}/{slug}/{comrade}/gazette.jsonl"
 
 
-# ---------- display rendering ----------
+def append_dispatch(client, prefix, slug, me, dispatch):
+    """Append one dispatch (a JSON object) as a line to my gazette append blob."""
+    path = gazette_path(prefix, slug, me)
+    client.ensure_append_blob(path)
+    line = (json.dumps(dispatch, separators=(",", ":")) + "\n").encode("utf-8")
+    st = client.append_block(path, line)
+    if st != 201:
+        raise BlobError(st, b"gazette append failed")
 
-def render_to(to_array):
-    if to_array == ["*@*:*"]:
-        return "*"
-    return ",".join(to_array)
+
+# ---------- event rendering ----------
+
+def display_path(wire_path):
+    """Recover the publisher's original absolute path from the wire path."""
+    if wire_path.startswith("files/"):
+        return "/" + wire_path[len("files/"):]
+    return wire_path
 
 
-def display_path(path):
-    """Strip the on-disk `files/` prefix to recover the sender's absolute path."""
-    if path.startswith("files/"):
-        return "/" + path[len("files/"):]
-    return path
+def render_to(to):
+    return "*" if to == ["*"] else ",".join(to)
+
+
+def addressed_to_me(to, me):
+    return "*" in to or me in to
 
 
 def safe_preview_inner(body, max_inner_chars=PREVIEW_BUDGET):
-    """Return the JSON-inner (no surrounding quotes) of a body slice that fits
-    within max_inner_chars after JSON escape, without splitting an escape
-    sequence.
-
-    Iterative: extend a body prefix one codepoint at a time; stop when the
-    next codepoint would push the escaped form over budget. O(n²) in the
-    preview length but n is small (~150).
-    """
-    n = 0
-    inner = ""
+    """JSON-inner (no surrounding quotes) of a body prefix that fits the preview
+    budget after JSON-escaping, without splitting an escape sequence."""
+    n, inner = 0, ""
     while n < len(body):
-        candidate = json.dumps(body[: n + 1])[1:-1]
+        candidate = json.dumps(body[:n + 1])[1:-1]
         if len(candidate) > max_inner_chars:
             break
         inner = candidate
@@ -237,597 +387,111 @@ def safe_preview_inner(body, max_inner_chars=PREVIEW_BUDGET):
 
 def render_message_event(d):
     body = d.get("body", "")
-    full = (f"message from={d['from']} ts={d['ts']} to={render_to(d['to'])} "
-            f"body={json.dumps(body)}")
+    to = render_to(d.get("to", ["*"]))
+    full = f"message from={d['from']} ts={d['ts']} to={to} body={json.dumps(body)}"
     if len(full) <= TRUNCATE_THRESHOLD:
         return full
     preview = safe_preview_inner(body)
-    return (f"message from={d['from']} ts={d['ts']} to={render_to(d['to'])} "
+    return (f"message from={d['from']} ts={d['ts']} to={to} "
             f"chars={len(body)} truncated=true preview=\"{preview}\"")
 
 
 def render_filesystem_event(d):
-    parts = [f"filesystem from={d['from']} op={d['op']} path={display_path(d['path'])}"]
-    if "size" in d:
-        parts.append(f"size={d['size']}")
-    if "mime" in d:
-        parts.append(f"mime={d['mime']}")
-    if "lines" in d:
-        parts.append(f"lines={d['lines']}")
-    parts.append(f"to={render_to(d['to'])}")
+    parts = [f"filesystem from={d['from']} op={d.get('op')} "
+             f"path={display_path(d.get('path', ''))}"]
+    for k in ("size", "lines", "local"):
+        if k in d:
+            parts.append(f"{k}={d[k]}")
+    parts.append(f"to={render_to(d.get('to', ['*']))}")
     return " ".join(parts)
 
 
-def render_join_event(comrade):
-    return f"join from={comrade}"
+def download_to_mirror(client, prefix, slug, sender, wire_path,
+                       expect_size=None, expect_lines=None):
+    """Download a published blob into the local mirror; return the local Path.
 
+    Mirror layout is deterministic - ~/.cccp/<slug>/<sender>/<wire_path>, e.g.
+    ~/.cccp/work-on-cccp/alice@hostA/files/home/alice/build.log - so any follow-up tool
+    can read the file by its known path.
 
-def render_leave_event(comrade, gone):
-    purged_by = gone.get("purged_by")
-    purged_field = "null" if purged_by is None else purged_by
-    reason = gone.get("reason") or ""
-    return f"leave from={comrade} purged_by={purged_field} reason={json.dumps(reason)}"
-
-
-# ---------- peer enumeration ----------
-
-def list_peers(cell, include_gone=False, include_self=False):
-    cd = cell_dir(cell)
-    if not cd.exists():
-        return
-    me = self_id()
-    for entry in sorted(cd.iterdir()):
-        if not entry.is_dir() or entry.name == "state":
-            continue
-        if not ADDR_RE.match(entry.name):
-            continue
-        if not include_self and entry.name == me:
-            continue
-        if not include_gone and (entry / "gone.json").exists():
-            continue
-        yield entry.name, entry
-
-
-def live_peers(cell):
-    return list(list_peers(cell, include_gone=False, include_self=False))
-
-
-# ---------- rsync ----------
-
-def addr_to_ssh(comrade_id):
-    # Accept either a full comrade ID (user@host:pid) or just user@host.
-    # The :pid is irrelevant for SSH — every Claude on the same user@host
-    # shares the same ~/.cccp/<cell>/ directory, so bootstrap can target
-    # the host without knowing which session is running there.
-    head = comrade_id.rsplit(":", 1)[0] if ":" in comrade_id else comrade_id
-    if "@" not in head:
-        raise ValueError(f"Bad address: {comrade_id!r}")
-    user, host = head.split("@", 1)
-    # Hostname is passed through verbatim. For LAN-local peers, configure
-    # an ~/.ssh/config alias (e.g. `Host host-b → HostName host-b.example`); for
-    # cloud peers, the alias also encodes a tunnel port.
-    return f"{user}@{host}"
-
-
-def remote_root(cell, source_id, receiver_id):
-    # Path on the receiver's disk where THIS comrade's gazette dir
-    # (`source_id`) should land within the receiver's per-comrade tree.
-    # Uses ~ so SSH expands it under the receiver's HOME — irrelevant for
-    # the same-userhost case (we expand it ourselves there, see
-    # rsync_target).
-    return f"~/.cccp/{receiver_id}/{slugify(cell)}/{source_id}"
-
-
-def is_same_userhost(peer_id):
-    return addr_to_ssh(peer_id) == addr_to_ssh(self_id())
-
-
-def rsync_target(peer_id, remote_path):
-    """Build the rsync destination string for a given peer.
-
-    Same OS user on the same host: write directly through the local
-    filesystem with no SSH (the bytes still need to physically copy because
-    each comrade owns a distinct on-disk tree). Cross-host: use SSH.
+    If the publisher's claimed size / line count are given, the downloaded bytes
+    are verified against them and a mismatch raises BlobError. This is an
+    everybody-trusts-everybody environment, so the check surfaces bugs, not
+    attackers.
     """
-    if is_same_userhost(peer_id):
-        return os.path.expanduser(remote_path)
-    return f"{addr_to_ssh(peer_id)}:{remote_path}"
-
-
-def rsync_gazette_to(local_path, peer_id, remote_path):
-    # --mkpath so a fresh peer doesn't need its directory pre-created.
-    cmd = ["rsync", "--append-verify", "--partial", "--mkpath",
-           str(local_path),
-           rsync_target(peer_id, remote_path)]
-    return subprocess.run(cmd, capture_output=True, text=True)
-
-
-def rsync_dir_to(local_dir, peer_id, remote_dir):
-    cmd = ["rsync", "-r", "--delete",
-           "--exclude=gazette.jsonl",
-           "--exclude=state",
-           f"{str(local_dir).rstrip('/')}/",
-           f"{rsync_target(peer_id, remote_dir).rstrip('/')}/"]
-    return subprocess.run(cmd, capture_output=True, text=True)
-
-
-def push_dir_to_all(cell, source_comrade, targets):
-    """Push <local cell>/<source_comrade>/ to each target's same path.
-
-    Used both for self-push (source_comrade == me) and purge-push (source is
-    the target of the purge; we wrote gone.json into our local mirror of them).
-    """
-    src_dir = cell_dir(cell) / source_comrade
-    src_gazette = src_dir / "gazette.jsonl"
-    failures = []
-    for peer in targets:
-        ok = True
-        rr = remote_root(cell, source_comrade, peer)
-        if src_gazette.exists():
-            r = rsync_gazette_to(src_gazette, peer, f"{rr}/gazette.jsonl")
-            if r.returncode != 0:
-                print(f"rsync gazette to {peer}: {r.stderr.strip()}", file=sys.stderr)
-                ok = False
-        r = rsync_dir_to(src_dir, peer, rr)
-        if r.returncode != 0:
-            print(f"rsync dir to {peer}: {r.stderr.strip()}", file=sys.stderr)
-            ok = False
-        if not ok:
-            failures.append(peer)
-    return failures
-
-
-def push_my_state(cell):
-    return push_dir_to_all(cell, self_id(), [p for p, _ in live_peers(cell)])
-
-
-# ---------- file metadata helpers ----------
-
-def guess_mime(path):
-    mt, _ = mimetypes.guess_type(str(path))
-    return mt or "application/octet-stream"
-
-
-def count_lines(path):
-    n = 0
-    with open(path, "rb") as f:
-        for _ in f:
-            n += 1
-    return n
-
-
-# ---------- comrade discovery ----------
-
-SLUG_RE = re.compile(r"^[a-z0-9-]+$")
-
-
-def _is_local_pid_alive(comrade_id):
-    """kill -0 on the PID embedded in a comrade id. Used to filter out
-    stale dirs left behind by Claude sessions that crashed without
-    running `cccp leave` first."""
-    try:
-        pid = int(comrade_id.rsplit(":", 1)[1])
-        os.kill(pid, 0)
-        return True
-    except (ValueError, IndexError, ProcessLookupError, PermissionError):
-        return False
-
-
-# Shell snippet that lists `<comrade-id>/<slug>` paths on the remote side
-# but only for comrades whose PID is still alive. Run via `ssh <host> sh -c`
-# so we get one fork point and no escaping headaches. The trailing `|| true`
-# absorbs find's exit code when .cccp doesn't exist.
-_REMOTE_LIVE_LISTING = r'''
-find .cccp -mindepth 2 -maxdepth 2 -type d 2>/dev/null | while IFS= read -r p; do
-    comrade=${p#./}
-    comrade=${comrade#.cccp/}
-    comrade=${comrade%%/*}
-    pid=${comrade##*:}
-    case "$pid" in
-        ''|*[!0-9]*) continue ;;
-    esac
-    if kill -0 "$pid" 2>/dev/null; then
-        printf '%s\n' "$p"
-    fi
-done || true
-'''
-
-
-def discover_comrades(user_host=None):
-    """Return [(comrade_id, cell_slug)] tuples for *live* comrades on the
-    target host.
-
-    `user_host` is None or same-userhost: scan local ~/.cccp/ and filter
-    by `kill -0` against each comrade's embedded PID. Otherwise SSH and
-    run a shell snippet that does the same filtering on the remote side
-    (PIDs are only meaningful to the kernel they belong to).
-
-    Why filter: a Claude that crashes without running `cccp leave` leaves
-    its comrade dir behind on disk. From the protocol's view it looks
-    "live" (no `gone.json`), but the underlying process is gone. We hide
-    those zombies from `who` so callers see only reachable peers.
-    """
-    if user_host is None or is_same_userhost(user_host):
-        if not CCCP_HOME.exists():
-            return []
-        try:
-            r = subprocess.run(
-                ["find", str(CCCP_HOME), "-mindepth", "2", "-maxdepth", "2",
-                 "-type", "d"],
-                capture_output=True, text=True, check=True,
-            )
-        except subprocess.CalledProcessError as e:
-            print(f"who: local find failed: {e.stderr.strip()}", file=sys.stderr)
-            return []
-        pairs = []
-        for line in r.stdout.splitlines():
-            parts = line.strip().split("/")
-            if len(parts) < 2:
-                continue
-            comrade, slug = parts[-2], parts[-1]
-            if ADDR_RE.match(comrade) and SLUG_RE.match(slug) \
-                    and _is_local_pid_alive(comrade):
-                pairs.append((comrade, slug))
-        return pairs
-
-    r = subprocess.run(
-        ["ssh", addr_to_ssh(user_host), "sh", "-c", _REMOTE_LIVE_LISTING],
-        capture_output=True, text=True,
-    )
-    if r.returncode != 0:
-        print(f"who: ssh to {user_host} failed: {r.stderr.strip()}",
-              file=sys.stderr)
-        return []
-    pairs = []
-    for line in r.stdout.splitlines():
-        # Lines look like `.cccp/<id>/<slug>` from the remote find.
-        parts = line.strip().split("/")
-        if len(parts) < 2:
-            continue
-        comrade, slug = parts[-2], parts[-1]
-        if ADDR_RE.match(comrade) and SLUG_RE.match(slug):
-            pairs.append((comrade, slug))
-    return pairs
-
-
-# ---------- bootstrap (one-time pull from a known peer) ----------
-
-def bootstrap(cell, peer):
-    """Pull a peer's view of `cell` into our own per-comrade tree.
-
-    `peer` may be a full comrade id (bob@hostB:51853) or a bare user@host
-    (bob@hostB). The full form names a specific source subtree on the peer's
-    disk. The bare form runs `cccp who`-style discovery and auto-uses the
-    sole comrade in this cell on that host (errors on 0 or 2+ matches).
-
-    Safe to invoke standalone or while a watchtower is already running for
-    this cell:
-      - Gazettes are append-only by protocol, so this only adds bytes;
-        the running watchtower's poll loop picks up `size > hwm` naturally
-        and emits new events without any HWM reset.
-      - `--update` is set so a stale source can't truncate our newer local
-        gazette mirrors back down to its older state.
-
-    Pull-only — making yourself visible to peers requires running a
-    watchtower (which pushes after its own bootstrap step).
-    """
-    slug = slugify(cell)
-    if ":" not in peer:
-        in_cell = [
-            c for c, s in discover_comrades(peer)
-            if s == slug and c != self_id()
-        ]
-        if not in_cell:
-            print(f"bootstrap: no comrade on {peer} has cell {slug}; "
-                  f"try `cccp who {peer}` to see what's there",
-                  file=sys.stderr)
-            return
-        if len(in_cell) > 1:
-            print(f"bootstrap: multiple comrades on {peer} have cell "
-                  f"{slug}: {', '.join(sorted(in_cell))}; "
-                  f"rerun with the specific full comrade id",
-                  file=sys.stderr)
-            return
-        print(f"bootstrap: sole comrade with cell {slug} on {peer} is "
-              f"{in_cell[0]}", file=sys.stderr)
-        peer = in_cell[0]
-    dest = my_root() / slug
-    dest.mkdir(parents=True, exist_ok=True)
-    src = f"~/.cccp/{peer}/{slug}/"
-    source = (os.path.expanduser(src) if is_same_userhost(peer)
-              else f"{addr_to_ssh(peer)}:{src}")
-    cmd = ["rsync", "-r", "--update", "--exclude=state",
-           source, f"{dest}/"]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0:
-        print(f"bootstrap from {peer}: {r.stderr.strip()}", file=sys.stderr)
-
-
-# ---------- subcommands ----------
-
-def cmd_dispatch(args):
-    cell = args.cell
-    me = self_id()
-    if not my_dir(cell).exists():
-        sys.exit(f"error: not in cell {cell!r}; start a watchtower first")
-    d = {
-        "type": "message",
-        "ts": now_iso(),
-        "from": me,
-        "to": parse_to_args(args.to),
-        "body": args.body,
-    }
-    append_dispatch(cell, d)
-    failures = push_my_state(cell)
-    if failures:
-        for f in failures:
-            print(f"unreachable: {f}", file=sys.stderr)
-        print(f"hint: cccp purge {cell} <comrade-id>", file=sys.stderr)
-        sys.exit(1)
-
-
-def cmd_publish(args):
-    cell = args.cell
-    me = self_id()
-    if not my_dir(cell).exists():
-        sys.exit(f"error: not in cell {cell!r}; start a watchtower first")
-    # abspath, not resolve(): preserve the path the user typed, don't follow
-    # symlinks. Resolving leaks platform quirks (macOS /tmp -> /private/tmp)
-    # into the wire path and breaks portability when peers on other OSes
-    # would expect the un-resolved form.
-    src = Path(os.path.abspath(os.path.expanduser(args.path)))
-    if not src.is_file():
-        sys.exit(f"error: not a regular file: {src}")
-    rel = str(src).lstrip("/")
-    dst = my_dir(cell) / "files" / rel
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dst)
-    # Push files first so the bytes are in place before the announcement lands.
-    peers = [p for p, _ in live_peers(cell)]
-    failures = []
-    for peer in peers:
-        r = rsync_dir_to(my_dir(cell), peer, remote_root(cell, me, peer))
-        if r.returncode != 0:
-            print(f"rsync files to {peer}: {r.stderr.strip()}", file=sys.stderr)
-            failures.append(peer)
-    mime = guess_mime(src)
-    d = {
-        "type": "filesystem",
-        "op": "publish",
-        "ts": now_iso(),
-        "from": me,
-        "to": parse_to_args(args.to),
-        "path": f"files/{rel}",
-        "size": src.stat().st_size,
-        "mime": mime,
-    }
-    if mime.startswith("text/"):
-        d["lines"] = count_lines(src)
-    append_dispatch(cell, d)
-    # Now push the gazette — that's the commit; receivers fire events on it.
-    for peer in peers:
-        r = rsync_gazette_to(
-            my_dir(cell) / "gazette.jsonl", peer,
-            f"{remote_root(cell, me, peer)}/gazette.jsonl",
-        )
-        if r.returncode != 0:
-            print(f"rsync gazette to {peer}: {r.stderr.strip()}", file=sys.stderr)
-            failures.append(peer)
-    if failures:
-        print(f"hint: cccp purge {cell} <comrade-id>", file=sys.stderr)
-        sys.exit(1)
-
-
-def cmd_unpublish(args):
-    cell = args.cell
-    me = self_id()
-    if not my_dir(cell).exists():
-        sys.exit(f"error: not in cell {cell!r}; start a watchtower first")
-    src = Path(os.path.abspath(os.path.expanduser(args.path)))
-    rel = str(src).lstrip("/")
-    local = my_dir(cell) / "files" / rel
-    d = {
-        "type": "filesystem",
-        "op": "unpublish",
-        "ts": now_iso(),
-        "from": me,
-        "to": parse_to_args(args.to),
-        "path": f"files/{rel}",
-    }
-    append_dispatch(cell, d)
-    if local.exists():
-        local.unlink()
-    failures = push_my_state(cell)  # Mode B's --delete propagates the removal.
-    if failures:
-        for f in failures:
-            print(f"unreachable: {f}", file=sys.stderr)
-        sys.exit(1)
-
-
-def cmd_leave(args):
-    cell = args.cell
-    if not my_dir(cell).exists():
-        sys.exit(f"error: not in cell {cell!r}")
-    gone = {"ts": now_iso(), "purged_by": None, "reason": args.reason or ""}
-    atomic_write(my_dir(cell) / "gone.json", json.dumps(gone).encode())
-    failures = push_my_state(cell)
-    # The local watchtower will notice gone.json on its next poll and exit.
-    if failures:
-        for f in failures:
-            print(f"unreachable: {f}", file=sys.stderr)
-        sys.exit(1)
-
-
-def cmd_bootstrap(args):
-    bootstrap(args.cell, args.peer)
-
-
-def cmd_who(args):
-    pairs = discover_comrades(args.target)
-    # Hide ourselves when listing the local machine; we already know we're here.
-    if args.target is None or is_same_userhost(args.target):
-        pairs = [(c, s) for c, s in pairs if c != self_id()]
-    if args.cell:
-        wanted = slugify(args.cell)
-        pairs = [(c, s) for c, s in pairs if s == wanted]
-    if not pairs:
-        print("(no comrades)")
-        return
-    by_cell = {}
-    for comrade, slug in pairs:
-        by_cell.setdefault(slug, []).append(comrade)
-    blocks = []
-    for slug in sorted(by_cell):
-        lines = [slug]
-        for c in sorted(by_cell[slug]):
-            lines.append(f"  {c}")
-        blocks.append("\n".join(lines))
-    print("\n\n".join(blocks))
-
-
-def cmd_read(args):
-    """Print the full body of a previously-received message dispatch.
-
-    Reads the local gazette mirror written by rsync from the sender. Use this
-    after seeing a `truncated=true` event in the watchtower stream — the
-    notification only carries a preview, but the gazette has the full body.
-    """
-    cell = args.cell
-    if not my_dir(cell).exists():
-        sys.exit(f"error: not in cell {cell!r}")
-    sender = args.from_
-    if not ADDR_RE.match(sender):
-        sys.exit(f"error: bad comrade ID: {sender!r}")
-    gz = cell_dir(cell) / sender / "gazette.jsonl"
-    if not gz.exists():
-        sys.exit(f"error: no gazette for {sender} in cell {cell}")
-
-    messages = []
-    with open(gz, "rb") as f:
-        for line in f:
-            try:
-                d = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if d.get("type") == "message":
-                messages.append(d)
-
-    if args.ts:
-        match = next((d for d in messages if d.get("ts") == args.ts), None)
-        if not match:
-            sys.exit(f"error: no message with ts={args.ts!r} from {sender}")
-        sys.stdout.write(match.get("body", ""))
-        if not match.get("body", "").endswith("\n"):
-            sys.stdout.write("\n")
-        return
-
-    n = args.last if args.last is not None else 1
-    if n < 1:
-        sys.exit("error: --last must be ≥ 1")
-    selected = messages[-n:]
-    if not selected:
-        sys.exit(f"error: no messages from {sender} in cell {cell}")
-    for i, d in enumerate(selected):
-        if len(selected) > 1:
-            print(f"--- ts={d.get('ts')} ---")
-        sys.stdout.write(d.get("body", ""))
-        if not d.get("body", "").endswith("\n"):
-            sys.stdout.write("\n")
-
-
-def cmd_purge(args):
-    cell = args.cell
-    target = args.comrade
-    if not ADDR_RE.match(target):
-        sys.exit(f"error: bad comrade ID: {target!r}")
-    me = self_id()
-    if target == me:
-        sys.exit("error: cannot purge yourself; use `cccp leave`")
-    target_dir = cell_dir(cell) / target
-    target_dir.mkdir(parents=True, exist_ok=True)
-    gone = {"ts": now_iso(), "purged_by": me, "reason": args.reason or ""}
-    atomic_write(target_dir / "gone.json", json.dumps(gone).encode())
-    # Push the target's (now-gone) directory state to every OTHER live peer.
-    others = [p for p, _ in live_peers(cell) if p != target]
-    failures = push_dir_to_all(cell, target, others)
-    if failures:
-        for f in failures:
-            print(f"unreachable: {f}", file=sys.stderr)
-        sys.exit(1)
+    st, body = client.get(f"{prefix}/{slug}/{sender}/{wire_path}")
+    if st != 200:
+        raise BlobError(st, b"download failed")
+    if expect_size is not None and len(body) != expect_size:
+        raise BlobError(0, f"{wire_path}: got {len(body)} bytes, "
+                           f"publisher claimed {expect_size}".encode())
+    if expect_lines is not None and body.count(b"\n") != expect_lines:
+        raise BlobError(0, f"{wire_path}: got {body.count(chr(10).encode())} "
+                           f"lines, publisher claimed {expect_lines}".encode())
+    dest = LOCAL_MIRROR / slug / sender / wire_path
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(body)
+    return dest
 
 
 # ---------- watchtower ----------
 
 class Watchtower:
-    def __init__(self, cell):
-        self.cell = cell
-        self.cd = cell_dir(cell)
-        self.me = self_id()
-        self.hwm = {}            # peer_id -> byte offset into their gazette
-        self.gone_state = {}     # peer_id -> bool
-        self.known_peers = set()
+    """Polls the cell prefix and emits one event line per new dispatch, join, or
+    leave. A pure live-event stream: it skips backlog at startup (no replay) and
+    has no local state - identity and history live in the container."""
+
+    def __init__(self, client, prefix, slug, me, idle_interval):
+        self.client = client
+        self.prefix = prefix
+        self.slug = slug
+        self.me = me
+        self.head = f"{prefix}/{slug}/"
+        self.hwm = {}        # comrade -> bytes consumed of their gazette
+        self.known = set()   # comrades already seen (join emitted)
+        self.gone = set()    # comrades whose gone.json we've seen (leave emitted)
         self.stop = False
+        self.idle_interval = idle_interval   # seconds of silence -> `idle`; 0 disables
+        self.last_activity = time.monotonic()
+        self.idle_due = self.last_activity + idle_interval
 
-    # setup ----------------------------------------------------------------
+    def _emit(self, line):
+        print(line, flush=True)
 
-    def setup(self, bootstrap=None):
-        self.cd.mkdir(parents=True, exist_ok=True)
-        if bootstrap:
-            self._bootstrap(bootstrap)
-        my_dir(self.cell).mkdir(parents=True, exist_ok=True)
-        (my_dir(self.cell) / "files").mkdir(exist_ok=True)
-        hwm_dir(self.cell).mkdir(parents=True, exist_ok=True)
-        gz = my_dir(self.cell) / "gazette.jsonl"
-        if not gz.exists():
-            gz.touch()
-        # Rejoin: if we previously left, drop our own gone.json.
-        my_gone = my_dir(self.cell) / "gone.json"
-        if my_gone.exists():
-            my_gone.unlink()
-        # Load any persisted high-water marks from a previous watchtower run.
-        for f in hwm_dir(self.cell).iterdir():
-            if f.suffix == ".json":
-                try:
-                    self.hwm[f.stem] = json.loads(f.read_text()).get("offset", 0)
-                except json.JSONDecodeError:
-                    pass
-
-    def _bootstrap(self, peer):
-        bootstrap(self.cell, peer)
+    def _scan(self):
+        """Group the cell prefix listing into per-comrade state."""
+        gazettes, gone_now, comrades = {}, set(), set()
+        for name, props in self.client.list(self.head).items():
+            rest = name[len(self.head):]
+            if "/" not in rest:
+                continue
+            comrade, leaf = rest.split("/", 1)
+            comrades.add(comrade)
+            if leaf == "gazette.jsonl":
+                gazettes[comrade] = props["size"]
+            elif leaf == "gone.json":
+                gone_now.add(comrade)
+        return comrades, gazettes, gone_now
 
     def initial_scan(self):
-        """Register peers already present at startup without replaying their history."""
-        for peer, pdir in list_peers(self.cell, include_gone=True, include_self=False):
-            self.known_peers.add(peer)
-            self.gone_state[peer] = (pdir / "gone.json").exists()
-            gz = pdir / "gazette.jsonl"
-            if gz.exists() and peer not in self.hwm:
-                # Skip past existing content — these dispatches predate this watchtower.
-                self._save_hwm(peer, gz.stat().st_size)
+        """Register what's already present without replaying it or emitting joins."""
+        comrades, gazettes, gone_now = self._scan()
+        self.known |= comrades
+        self.gone |= gone_now
+        for comrade, size in gazettes.items():
+            self.hwm[comrade] = size   # skip existing backlog
 
-    def _save_hwm(self, peer, offset):
-        self.hwm[peer] = offset
-        atomic_write(hwm_dir(self.cell) / f"{peer}.json",
-                     json.dumps({"offset": offset}).encode())
-
-    # main loop ------------------------------------------------------------
-
-    def run(self, bootstrap=None):
-        self.setup(bootstrap)
+    def run(self):
+        # Rejoin: clear any stale gone.json left by a previous session.
+        self.client.request("DELETE", f"{self.head}{self.me}/gone.json")
         self.initial_scan()
-        # After bootstrap, push our (possibly-new) directory back to discovered peers.
-        if bootstrap:
-            push_my_state(self.cell)
-        intro = f"ready {self.me} slug={slugify(self.cell)}"
-        if not self.known_peers:
-            intro += " (no comrades connected)"
-        self._emit(intro)
+        self._emit(f"ready {self.me} slug={self.slug}")
+        # Start the idle clock from "fully up", after the network-bound startup.
+        self.last_activity = time.monotonic()
+        self.idle_due = self.last_activity + self.idle_interval
         signal.signal(signal.SIGTERM, self._on_signal)
         signal.signal(signal.SIGINT, self._on_signal)
         while not self.stop:
-            if (my_dir(self.cell) / "gone.json").exists():
-                # `cccp leave` was invoked; honor it and exit.
-                break
             try:
                 self._poll_once()
             except Exception as e:
@@ -837,92 +501,348 @@ class Watchtower:
     def _on_signal(self, *_):
         self.stop = True
 
-    def _emit(self, line):
-        print(line, flush=True)
-
     def _poll_once(self):
-        events = []  # (ts, line) tuples — sorted by ts before emission
-        current = {p: pdir for p, pdir in list_peers(self.cell, include_gone=True)}
+        comrades, gazettes, gone_now = self._scan()
+        if self.me in gone_now:
+            self._emit(f"left slug={self.slug}")
+            self.stop = True
+            return
+        # Membership events emit in detection order, before the same poll's
+        # message events (sorted by ts) - so a join always reads before the
+        # joiner's first message, even though its synthetic ts is later.
+        membership = []
+        messages = []   # (ts, line)
 
-        # New peers (join)
-        for peer, pdir in current.items():
-            if peer in self.known_peers:
-                continue
-            self.known_peers.add(peer)
-            gone_now = (pdir / "gone.json").exists()
-            self.gone_state[peer] = gone_now
-            gz = pdir / "gazette.jsonl"
-            # Start fresh at offset 0 for never-seen peers — emit their backlog.
-            if peer not in self.hwm:
-                self._save_hwm(peer, 0)
-            if not gone_now:
-                events.append((now_iso(), render_join_event(peer)))
+        for comrade in comrades - self.known:
+            self.known.add(comrade)
+            if comrade not in gone_now:
+                membership.append(f"join from={comrade}")
 
-        # gone.json transitions on known peers (leave / rejoin)
-        for peer, pdir in current.items():
-            gone_now = (pdir / "gone.json").exists()
-            was_gone = self.gone_state.get(peer, False)
-            if gone_now and not was_gone:
+        for comrade in gone_now - self.gone:
+            self.gone.add(comrade)
+            reason = ""
+            gst, gbody = self.client.get(f"{self.head}{comrade}/gone.json")
+            if gst == 200:
                 try:
-                    g = json.loads((pdir / "gone.json").read_text())
-                except (json.JSONDecodeError, FileNotFoundError):
-                    g = {}
-                events.append((g.get("ts", now_iso()),
-                               render_leave_event(peer, g)))
-                self.gone_state[peer] = True
-            elif not gone_now and was_gone:
-                events.append((now_iso(), render_join_event(peer)))
-                self.gone_state[peer] = False
+                    reason = json.loads(gbody).get("reason", "") or ""
+                except ValueError:
+                    pass
+            membership.append(f"leave from={comrade} reason={json.dumps(reason)}")
 
-        # Tail each peer's gazette past its high-water mark.
-        for peer, pdir in current.items():
-            gz = pdir / "gazette.jsonl"
-            if not gz.exists():
-                continue
-            offset = self.hwm.get(peer, 0)
-            try:
-                size = gz.stat().st_size
-            except FileNotFoundError:
-                continue
+        for comrade, size in gazettes.items():
+            if comrade == self.me:
+                continue  # don't echo my own dispatches back to me
+            offset = self.hwm.get(comrade, 0)
             if size <= offset:
                 continue
-            with open(gz, "rb") as f:
-                f.seek(offset)
-                data = f.read(size - offset)
+            st, data = self.client.get_range(
+                f"{self.head}{comrade}/gazette.jsonl", offset)
+            if st not in (200, 206):
+                continue
             consumed = 0
             for chunk in data.splitlines(keepends=True):
                 if not chunk.endswith(b"\n"):
-                    break  # incomplete trailing line; pick up next poll
+                    break  # partial trailing line; pick it up next poll
                 consumed += len(chunk)
                 try:
                     d = json.loads(chunk)
-                except json.JSONDecodeError:
+                except ValueError:
                     continue
-                rendered = self._render_dispatch(d)
-                if rendered:
-                    events.append((d.get("ts", now_iso()), rendered))
-            if consumed:
-                self._save_hwm(peer, offset + consumed)
+                line = self._render(d)
+                if line:
+                    messages.append((d.get("ts", now_iso()), line))
+            self.hwm[comrade] = offset + consumed
 
-        # Cross-gazette ordering by ts; within a gazette, append order is preserved.
-        events.sort(key=lambda x: x[0])
-        for _, line in events:
+        for line in membership:
+            self._emit(line)
+        messages.sort(key=lambda x: x[0])
+        for _, line in messages:
             self._emit(line)
 
-    def _render_dispatch(self, d):
-        to_arr = d.get("to") or ["*@*:*"]
-        if not addressed_to_me(to_arr, self.me):
+        # Idle heartbeat: reassure Claude that a quiet line is healthy, not dead.
+        now = time.monotonic()
+        if membership or messages:
+            self.last_activity = now
+            self.idle_due = now + self.idle_interval
+        elif self.idle_interval > 0 and now >= self.idle_due:
+            self._emit(f"idle quiet={round((now - self.last_activity) / 60)}m")
+            self.idle_due += self.idle_interval
+
+    def _render(self, d):
+        if not addressed_to_me(d.get("to") or ["*"], self.me):
             return None
         t = d.get("type")
         if t == "message":
             return render_message_event(d)
         if t == "filesystem":
-            return render_filesystem_event(d)
+            return self._render_filesystem(d)
         return None
+
+    def _render_filesystem(self, d):
+        """Hybrid file handling: auto-download a published file small enough not
+        to stall the poll loop and add its local path to the event; just announce
+        larger ones for `cccp pull`. On unpublish, drop the mirror copy."""
+        op, wire_path = d.get("op"), d.get("path", "")
+        if op == "publish" and d.get("size", 0) <= AUTODOWNLOAD_MAX:
+            try:
+                local = download_to_mirror(self.client, self.prefix, self.slug,
+                                           d["from"], wire_path,
+                                           expect_size=d.get("size"),
+                                           expect_lines=d.get("lines"))
+                d = {**d, "local": str(local)}
+            except (BlobError, OSError) as e:
+                print(f"cccp watchtower: auto-download skipped: {e}",
+                      file=sys.stderr)  # announce anyway; Claude can `cccp pull` it
+        elif op == "unpublish":
+            try:
+                (LOCAL_MIRROR / self.slug / d["from"] / wire_path).unlink(
+                    missing_ok=True)
+            except OSError:
+                pass
+        return render_filesystem_event(d)
+
+
+# ---------- subcommands ----------
+
+def cmd_init(args):
+    """Render-time helper: resolve identity + roster, print the block the skill
+    string-substitutes into Claude's view so it starts already oriented.
+
+    Takes just the cell name - the skill passes only the first argument token,
+    never the freeform `# comment` (which must not reach a shell command). The
+    name is slugified, and the slug is the cell's one identity everywhere.
+    """
+    name = args.name.strip()
+    if not name:
+        sys.exit("error: no cell name given")
+    try:
+        slug = slugify(name)
+    except ValueError as e:
+        sys.exit(f"error: {e}")
+    cfg = resolve_config()
+    client = BlobClient(cfg["ACCOUNT"], cfg["CONTAINER"], cfg["SAS"])
+    me = claim_identity(client, cfg["PREFIX"], slug)
+    roster = cell_roster(client, cfg["PREFIX"], slug)
+    others = [c for c in roster if c != me]
+
+    print(f"You are comrade `{me}` in CCCP cell `{slug}`.")
+    print(f"Cell store: {cfg['ACCOUNT']}/{cfg['CONTAINER']}/{cfg['PREFIX']}/{slug}/")
+    if others:
+        print(f"Roster ({len(roster)}): " + ", ".join(roster))
+    else:
+        print("Roster: just you - this cell is empty so far.")
+    print("No history loaded. Introduce yourself to the cell with `cccp dispatch`.")
+
+
+def cmd_dispatch(args):
+    """Append a message to my gazette - the whole of sending, in v2."""
+    cfg = resolve_config()
+    client = BlobClient(cfg["ACCOUNT"], cfg["CONTAINER"], cfg["SAS"])
+    slug = slugify(args.cell)
+    me = claim_identity(client, cfg["PREFIX"], slug)
+    d = {
+        "type": "message",
+        "ts": now_iso(),
+        "from": me,
+        "to": args.to if args.to else ["*"],
+        "body": args.body,
+    }
+    append_dispatch(client, cfg["PREFIX"], slug, me, d)
 
 
 def cmd_watchtower(args):
-    Watchtower(args.cell).run(bootstrap=args.bootstrap)
+    """Run the long-lived live-event stream for a cell (under the Monitor tool)."""
+    cfg = resolve_config()
+    client = BlobClient(cfg["ACCOUNT"], cfg["CONTAINER"], cfg["SAS"])
+    slug = slugify(args.cell)
+    me = claim_identity(client, cfg["PREFIX"], slug)
+    Watchtower(client, cfg["PREFIX"], slug, me, args.idle * 60).run()
+
+
+def cmd_leave(args):
+    """Write gone.json - an intentional departure. A watchtower for this session
+    notices it on the next poll and exits."""
+    cfg = resolve_config()
+    client = BlobClient(cfg["ACCOUNT"], cfg["CONTAINER"], cfg["SAS"])
+    slug = slugify(args.cell)
+    me = claim_identity(client, cfg["PREFIX"], slug)
+    gone = {"ts": now_iso(), "reason": args.reason or ""}
+    client.put_block(f"{cfg['PREFIX']}/{slug}/{me}/gone.json",
+                     json.dumps(gone).encode())
+
+
+def cmd_read(args):
+    """Print cell message history - the on-demand history tool. Filter by sender
+    (--from), recipient (--to), and select with --ts or --last."""
+    cfg = resolve_config()
+    client = BlobClient(cfg["ACCOUNT"], cfg["CONTAINER"], cfg["SAS"])
+    slug = slugify(args.cell)
+    prefix = cfg["PREFIX"]
+
+    senders = [args.from_] if args.from_ else cell_roster(client, prefix, slug)
+    msgs = []
+    for sender in senders:
+        st, body = client.get(gazette_path(prefix, slug, sender))
+        if st != 200:
+            continue
+        for line in body.splitlines():
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if d.get("type") == "message":
+                msgs.append(d)
+
+    if args.to:
+        msgs = [m for m in msgs if addressed_to_me(m.get("to") or ["*"], args.to)]
+    msgs.sort(key=lambda m: m.get("ts", ""))
+
+    if args.ts:
+        m = next((m for m in msgs if m.get("ts") == args.ts), None)
+        if not m:
+            sys.exit(f"error: no message with ts={args.ts!r}")
+        body = m.get("body", "")
+        sys.stdout.write(body if body.endswith("\n") else body + "\n")
+        return
+
+    if args.last is not None:
+        if args.last < 1:
+            sys.exit("error: --last must be >= 1")
+        msgs = msgs[-args.last:]
+
+    if not msgs:
+        print("(no messages)")
+        return
+    for m in msgs:
+        print(f"from={m.get('from')} to={render_to(m.get('to', ['*']))} ts={m.get('ts')}")
+        print(m.get("body", ""))
+        print()
+
+
+def cmd_rm(args):
+    """Delete a cell and all its blobs. Destructive and user-directed: prints a
+    summary first, and only deletes when --yes is given."""
+    cfg = resolve_config()
+    client = BlobClient(cfg["ACCOUNT"], cfg["CONTAINER"], cfg["SAS"])
+    slug = slugify(args.cell)
+    head = f"{cfg['PREFIX']}/{slug}/"
+    blobs = list(client.list(head))
+    if not blobs:
+        print(f"cell {slug!r} is empty or does not exist - nothing to delete")
+        return
+    comrades = sorted({n[len(head):].split("/", 1)[0]
+                       for n in blobs if "/" in n[len(head):]})
+    print(f"cell {slug!r}: {len(blobs)} blobs across {len(comrades)} comrades "
+          f"({', '.join(comrades)})")
+    if not args.yes:
+        print("dry run - pass --yes to actually delete")
+        return
+    for name in blobs:
+        st = client.request("DELETE", name)[0]
+        print(f"deleted {name} -> {st}")
+    print(f"cell {slug!r} removed")
+
+
+def cmd_publish(args):
+    """Upload a file as a block blob under my files/ area and announce it in my
+    gazette. Single-PUT only - files over PUBLISH_MAX need ad-hoc staging."""
+    cfg = resolve_config()
+    client = BlobClient(cfg["ACCOUNT"], cfg["CONTAINER"], cfg["SAS"])
+    slug = slugify(args.cell)
+    me = claim_identity(client, cfg["PREFIX"], slug)
+
+    src = Path(os.path.abspath(os.path.expanduser(args.path)))
+    if not src.is_file():
+        sys.exit(f"error: not a regular file: {src}")
+    size = src.stat().st_size
+    if size > PUBLISH_MAX:
+        sys.exit(
+            f"error: {src} is {size} bytes, over the {PUBLISH_MAX}-byte single-PUT "
+            f"limit. cccp publish does one urllib PUT - it does not stage block "
+            f"lists. To publish a file this large, either:\n"
+            f"  1. ask the user to install azcopy (pip/brew) and upload with it, or\n"
+            f"  2. write an ad-hoc Put Block + Put Block List uploader, reading this "
+            f"script ({__file__}) as a reference for the SAS/REST setup.")
+
+    rel = str(src).lstrip("/")
+    data = src.read_bytes()
+    st = client.put_block(f"{cfg['PREFIX']}/{slug}/{me}/files/{rel}", data)
+    if st != 201:
+        raise BlobError(st, b"publish upload failed")
+
+    d = {"type": "filesystem", "op": "publish", "ts": now_iso(), "from": me,
+         "to": args.to if args.to else ["*"], "path": f"files/{rel}", "size": size}
+    if src.suffix.lower() in TEXT_EXTENSIONS:
+        d["lines"] = data.count(b"\n")
+    append_dispatch(client, cfg["PREFIX"], slug, me, d)
+    print(f"published {rel} ({size} bytes)")
+
+
+def cmd_unpublish(args):
+    """Delete a previously-published file blob and announce the withdrawal.
+    Uses the same path that was given to publish."""
+    cfg = resolve_config()
+    client = BlobClient(cfg["ACCOUNT"], cfg["CONTAINER"], cfg["SAS"])
+    slug = slugify(args.cell)
+    me = claim_identity(client, cfg["PREFIX"], slug)
+
+    src = Path(os.path.abspath(os.path.expanduser(args.path)))
+    rel = str(src).lstrip("/")
+    client.request("DELETE", f"{cfg['PREFIX']}/{slug}/{me}/files/{rel}")  # 404 ok
+    d = {"type": "filesystem", "op": "unpublish", "ts": now_iso(), "from": me,
+         "to": args.to if args.to else ["*"], "path": f"files/{rel}"}
+    append_dispatch(client, cfg["PREFIX"], slug, me, d)
+    print(f"unpublished {rel}")
+
+
+def cmd_pull(args):
+    """Download published files matching the given path expressions into the
+    local mirror. Synchronous; on success it is silent and exits 0, so Claude
+    can chain it: `cccp pull <cell> <paths> && <follow-up>`."""
+    cfg = resolve_config()
+    client = BlobClient(cfg["ACCOUNT"], cfg["CONTAINER"], cfg["SAS"])
+    slug = slugify(args.cell)
+    prefix = cfg["PREFIX"]
+
+    # Catalogue currently-published files across all gazettes; a later unpublish
+    # cancels an earlier publish of the same (sender, path). The value is the
+    # publish dispatch, kept so its claimed size / line count can be verified.
+    catalogue = {}  # (sender, wire_path) -> publish dispatch dict
+    for sender in cell_roster(client, prefix, slug):
+        st, body = client.get(gazette_path(prefix, slug, sender))
+        if st != 200:
+            continue
+        for line in body.splitlines():
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if d.get("type") != "filesystem":
+                continue
+            key = (sender, d.get("path", ""))
+            if d.get("op") == "publish":
+                catalogue[key] = d
+            elif d.get("op") == "unpublish":
+                catalogue.pop(key, None)
+
+    # Match each published file's original path against the expressions: an exact
+    # match, or the expression is a directory prefix of it.
+    exprs = [os.path.abspath(os.path.expanduser(e)) for e in args.expr]
+    wanted = [(sender, wp) for (sender, wp) in catalogue
+              if any(display_path(wp) == e
+                     or display_path(wp).startswith(e.rstrip("/") + "/")
+                     for e in exprs)]
+    if not wanted:
+        sys.exit(f"error: no published files match {args.expr}")
+    for sender, wire_path in wanted:
+        meta = catalogue[(sender, wire_path)]
+        try:
+            download_to_mirror(client, prefix, slug, sender, wire_path,
+                               expect_size=meta.get("size"),
+                               expect_lines=meta.get("lines"))
+        except BlobError as e:
+            sys.exit(f"error: {e}")
+    # success: silent, exit 0
 
 
 # ---------- argparse ----------
@@ -930,89 +850,84 @@ def cmd_watchtower(args):
 def build_parser():
     p = argparse.ArgumentParser(
         prog="cccp",
-        description="Claude-to-Claude Communication Protocol.",
+        description="Claude-to-Claude Communication Protocol (v2, Azure Blob).",
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    w = sub.add_parser("watchtower", help="Run the long-running event listener.")
-    w.add_argument("cell")
-    w.add_argument("--bootstrap", metavar="COMRADE", dest="bootstrap",
-                   help="One-time pull from a known comrade to populate "
-                        "your view. Pass a full comrade id (bob@hostB:51853) "
-                        "or a bare user@host (which auto-uses the sole "
-                        "comrade in this cell on that host).")
-    w.set_defaults(func=cmd_watchtower)
+    init = sub.add_parser("init", help="Resolve identity + roster for a cell "
+                                       "(render-time helper for the skill).")
+    init.add_argument("name", help="Cell name (slugified; the skill passes only "
+                                   "the first argument token).")
+    init.set_defaults(func=cmd_init)
 
-    d = sub.add_parser("dispatch", help="Send a chat message.")
-    d.add_argument("cell")
-    d.add_argument("--to", action="append", default=[],
-                   help="Repeatable. Comrade ID or '*'. Default broadcast.")
-    d.add_argument("body")
-    d.set_defaults(func=cmd_dispatch)
+    disp = sub.add_parser("dispatch", help="Send a message to a cell.")
+    disp.add_argument("cell", help="Cell slug.")
+    disp.add_argument("--to", action="append", default=[], metavar="COMRADE",
+                      help="Repeatable. Comrade id; omit for broadcast.")
+    disp.add_argument("body", help="Message text.")
+    disp.set_defaults(func=cmd_dispatch)
 
-    pu = sub.add_parser("publish", help="Share a file with the cell.")
-    pu.add_argument("cell")
-    pu.add_argument("--to", action="append", default=[])
-    pu.add_argument("path")
-    pu.set_defaults(func=cmd_publish)
+    wt = sub.add_parser("watchtower",
+                        help="Stream live cell events (run under the Monitor tool).")
+    wt.add_argument("cell", help="Cell slug.")
+    wt.add_argument("--idle", type=int, default=30, metavar="MIN",
+                    help="Emit an `idle quiet=Nm` heartbeat after this many "
+                         "minutes of silence (default 30; 0 disables).")
+    wt.set_defaults(func=cmd_watchtower)
 
-    un = sub.add_parser("unpublish",
-                        help="Withdraw a previously-shared file (does NOT touch your source file).")
-    un.add_argument("cell")
-    un.add_argument("--to", action="append", default=[])
-    un.add_argument("path")
-    un.set_defaults(func=cmd_unpublish)
-
-    lv = sub.add_parser("leave", help="Gracefully depart the cell.")
-    lv.add_argument("cell")
-    lv.add_argument("--reason", default=None)
+    lv = sub.add_parser("leave",
+                        help="Leave a cell (writes gone.json; your watchtower exits).")
+    lv.add_argument("cell", help="Cell slug.")
+    lv.add_argument("--reason", default=None, help="Optional departure reason.")
     lv.set_defaults(func=cmd_leave)
 
-    pg = sub.add_parser("purge", help="Mark an unreachable comrade as gone.")
-    pg.add_argument("cell")
-    pg.add_argument("comrade")
-    pg.add_argument("--reason", default=None)
-    pg.set_defaults(func=cmd_purge)
-
-    bs = sub.add_parser("bootstrap",
-                        help="One-time pull from a known comrade. Useful "
-                             "for joining a peer's view after the watchtower "
-                             "is already running, or for recovering state.")
-    bs.add_argument("cell")
-    bs.add_argument("peer",
-                    help="Full comrade id (bob@hostB:51853) or bare user@host "
-                         "(auto-uses the sole comrade in this cell on that host).")
-    bs.set_defaults(func=cmd_bootstrap)
-
-    rd = sub.add_parser("read",
-                        help="Print the full body of a previous message "
-                             "dispatch from a comrade. Use after seeing a "
-                             "`truncated=true` event.")
-    rd.add_argument("cell")
-    rd.add_argument("--from", dest="from_", required=True, metavar="COMRADE",
-                    help="Sender's comrade ID (user@host:pid).")
-    group = rd.add_mutually_exclusive_group()
-    group.add_argument("--ts", default=None,
-                       help="Exact ISO timestamp from the truncated event.")
-    group.add_argument("--last", type=int, nargs="?", const=1, default=None,
-                       metavar="N", help="Print the last N messages "
-                                          "(default 1).")
+    rd = sub.add_parser("read", help="Print cell message history.")
+    rd.add_argument("cell", help="Cell slug.")
+    rd.add_argument("--from", dest="from_", metavar="COMRADE",
+                    help="Only this sender's messages (default: all comrades).")
+    rd.add_argument("--to", metavar="COMRADE",
+                    help="Only messages a given comrade would receive (incl. broadcasts).")
+    g = rd.add_mutually_exclusive_group()
+    g.add_argument("--ts", help="Print only the message with this exact timestamp.")
+    g.add_argument("--last", type=int, metavar="N",
+                   help="Print only the last N messages.")
     rd.set_defaults(func=cmd_read)
 
-    wh = sub.add_parser("who",
-                        help="List comrades and their cells, grouped by cell.")
-    wh.add_argument("target", nargs="?", default=None,
-                    help="user@host to query; omit for local machine")
-    wh.add_argument("--cell", default=None,
-                    help="Topic or slug to filter by (slugified internally)")
-    wh.set_defaults(func=cmd_who)
+    rm = sub.add_parser("rm",
+                        help="Delete a cell and all its blobs (user-directed).")
+    rm.add_argument("cell", help="Cell slug.")
+    rm.add_argument("--yes", action="store_true",
+                    help="Actually delete; without it, this is a dry run.")
+    rm.set_defaults(func=cmd_rm)
+
+    pub = sub.add_parser("publish", help="Share a file with a cell.")
+    pub.add_argument("cell", help="Cell slug.")
+    pub.add_argument("--to", action="append", default=[], metavar="COMRADE",
+                     help="Repeatable. Comrade id; omit for broadcast.")
+    pub.add_argument("path", help="Path of the file to publish.")
+    pub.set_defaults(func=cmd_publish)
+
+    unp = sub.add_parser("unpublish",
+                         help="Withdraw a previously-published file.")
+    unp.add_argument("cell", help="Cell slug.")
+    unp.add_argument("--to", action="append", default=[], metavar="COMRADE",
+                     help="Repeatable. Comrade id; omit for broadcast.")
+    unp.add_argument("path", help="Path of the file to withdraw (as published).")
+    unp.set_defaults(func=cmd_unpublish)
+
+    pl = sub.add_parser("pull",
+                        help="Download published files matching path expressions "
+                             "into the local mirror (silent + exit 0 on success).")
+    pl.add_argument("cell", help="Cell slug.")
+    pl.add_argument("expr", nargs="+", metavar="PATH",
+                    help="File or directory path(s), as originally published.")
+    pl.set_defaults(func=cmd_pull)
 
     return p
 
 
 def main(argv=None):
-    p = build_parser()
-    args = p.parse_args(argv)
+    args = build_parser().parse_args(argv)
     args.func(args)
 
 
