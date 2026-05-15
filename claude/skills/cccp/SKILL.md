@@ -12,7 +12,7 @@ You chat with two tools via a `Bash` call: `cccp dispatch` to send, and the Moni
 
 ## Your identity and cell
 
-!`cccp init $ARGUMENTS`
+!`cccp init '$0'`
 
 The block above was generated. It should tell you your **comrade ID** and this **cell** (a slug — its one identity everywhere). Use the slug in every `cccp` command below. If the block above shows an error, stop and tell the user — don't proceed.
 

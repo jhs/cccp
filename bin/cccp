@@ -608,14 +608,12 @@ def cmd_init(args):
     """Render-time helper: resolve identity + roster, print the block the skill
     string-substitutes into Claude's view so it starts already oriented.
 
-    The skill passes the raw /cccp arguments UNQUOTED (`!`cccp init $ARGUMENTS``),
-    so the shell's own comment handling drops anything after `#` before it gets
-    here - args.name is the cell-name word(s) only. They are joined and slugified;
-    the slug is the cell's one identity everywhere. The `#` split below is a
-    belt-and-suspenders guard for a `#` with no preceding space, which the shell
-    would not treat as a comment.
+    The skill passes just the first /cccp argument (`!`cccp init '$0'``) - the
+    cell name - never the freeform `# comment`. The name is slugified; the slug
+    is the cell's one identity everywhere. The `#` split is a belt-and-suspenders
+    guard for a `#` glued to the name with no separating space.
     """
-    name = " ".join(args.name).split("#", 1)[0].strip()
+    name = args.name.split("#", 1)[0].strip()
     if not name:
         sys.exit("error: no cell name given")
     try:
@@ -859,9 +857,8 @@ def build_parser():
 
     init = sub.add_parser("init", help="Resolve identity + roster for a cell "
                                        "(render-time helper for the skill).")
-    init.add_argument("name", nargs="+", help="Cell name word(s). The skill passes "
-                                              "the raw /cccp args unquoted, so the "
-                                              "shell drops the # comment.")
+    init.add_argument("name", help="Cell name - the skill passes just the first "
+                                   "/cccp argument ($0).")
     init.set_defaults(func=cmd_init)
 
     disp = sub.add_parser("dispatch", help="Send a message to a cell.")
