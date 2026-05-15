@@ -627,7 +627,8 @@ def cmd_init(args):
     others = [c for c in roster if c != me]
 
     print(f"You are comrade `{me}` in CCCP cell `{slug}`.")
-    print(f"Cell store: {cfg['ACCOUNT']}/{cfg['CONTAINER']}/{cfg['PREFIX']}/{slug}/")
+    # Not super useful to Claude
+    #print(f"Cell store: {cfg['ACCOUNT']}/{cfg['CONTAINER']}/{cfg['PREFIX']}/{slug}/")
     if others:
         print(f"Roster ({len(roster)}): " + ", ".join(roster))
     else:
