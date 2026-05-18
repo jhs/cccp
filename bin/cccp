@@ -39,6 +39,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -50,12 +51,15 @@ from pathlib import Path
 API_VERSION = "2023-11-03"
 DEFAULT_PREFIX = "__default__"
 CONFIG_PATH = Path.home() / ".config" / "cccp" / "config"
-POLL_INTERVAL = 2.0        # seconds between watchtower scans. The polling is a
-                           # network LIST call against Azure Blob, not a local
-                           # FS scan: 0.25s here meant ~$1.90/day per always-on
-                           # comrade in LIST ops, and a comrade needs multiple
-                           # seconds just to emit a message anyway, so faster
-                           # than this is pure overhead.
+POLL_LADDER = (            # seconds; the adaptive inter-poll gap. First entry is
+    2, 5, 15, 30, 60,      # the "fast" cadence used right after activity; each
+)                          # no-activity poll advances one rung. Last entry is
+                           # the cap (stays there indefinitely while idle). Any
+                           # real event resets back to entry 0; SIGUSR1 (cccp
+                           # wake) does the same plus polls immediately.
+                           # 2s floor: polling is a network LIST against Azure
+                           # Blob, and a comrade takes multiple seconds just to
+                           # emit a message, so faster is pure overhead.
 TRUNCATE_THRESHOLD = 480   # render a header-only event above this many chars
 PREVIEW_BUDGET = 150       # preview chars carried on a truncated event
 IDLE_MAX_SECONDS = 24 * 3600   # cap for the idle backoff - past this, idles fire
@@ -467,6 +471,15 @@ class Watchtower:
         self.idle_current = idle_initial
         self.last_activity = time.monotonic()
         self.idle_due = self.last_activity + idle_initial
+        # Adaptive poll cadence: ladder_step is the next index into POLL_LADDER;
+        # -1 means "the next poll is the first since reset" so _next_sleep will
+        # pre-increment to 0 and return LADDER[0] (the fast cadence). Any real
+        # event or SIGUSR1 sets ladder_step back to -1. _interrupt breaks the
+        # inter-poll sleep so SIGTERM/SIGINT/SIGUSR1 take effect within ms even
+        # mid-60s gap.
+        self.ladder_step = -1
+        self._interrupt = threading.Event()
+        self.wake_requested = False
 
     def _emit(self, line):
         print(line, flush=True)
@@ -479,6 +492,12 @@ class Watchtower:
         if minutes < 60:
             return f"{minutes}m"
         return f"{round(minutes / 60)}h"
+
+    def _next_sleep(self):
+        """Advance one rung up the ladder (capped) and return the gap before the
+        next poll. Reset (ladder_step = -1) on any activity or SIGUSR1 wake."""
+        self.ladder_step = min(self.ladder_step + 1, len(POLL_LADDER) - 1)
+        return POLL_LADDER[self.ladder_step]
 
     def _scan(self):
         """Group the cell prefix listing into per-comrade state."""
@@ -512,17 +531,33 @@ class Watchtower:
         self.last_activity = time.monotonic()
         self.idle_current = self.idle_initial
         self.idle_due = self.last_activity + self.idle_initial
+        self.ladder_step = -1
         signal.signal(signal.SIGTERM, self._on_signal)
         signal.signal(signal.SIGINT, self._on_signal)
+        signal.signal(signal.SIGUSR1, self._on_wake)
         while not self.stop:
             try:
                 self._poll_once()
             except Exception as e:
                 print(f"watchtower error: {e}", file=sys.stderr)
-            time.sleep(POLL_INTERVAL)
+            if self.stop:
+                break
+            # Event.wait so SIGTERM/SIGINT/SIGUSR1 can break the sleep promptly;
+            # Python 3 time.sleep is not interruptible by signals (PEP 475).
+            if self._interrupt.wait(timeout=self._next_sleep()):
+                self._interrupt.clear()
+                if self.wake_requested:
+                    self.wake_requested = False
+                    self.last_activity = time.monotonic()
+                    self.ladder_step = -1
 
     def _on_signal(self, *_):
         self.stop = True
+        self._interrupt.set()
+
+    def _on_wake(self, *_):
+        self.wake_requested = True
+        self._interrupt.set()
 
     def _poll_once(self):
         comrades, gazettes, gone_now = self._scan()
@@ -590,6 +625,7 @@ class Watchtower:
             self.last_activity = now
             self.idle_current = self.idle_initial
             self.idle_due = now + self.idle_initial
+            self.ladder_step = -1     # back to fast poll on any real event
         elif self.idle_initial > 0 and now >= self.idle_due:
             self._emit(f"idle quiet={self._format_quiet(now - self.last_activity)}")
             self.idle_current = min(self.idle_current * 2, self.idle_max)
@@ -686,6 +722,34 @@ def cmd_watchtower(args):
     slug = slugify(args.cell)
     me = claim_identity(client, cfg["PREFIX"], slug)
     Watchtower(client, cfg["PREFIX"], slug, me, args.idle * 60).run()
+
+
+def cmd_wake(args):
+    """SIGUSR1 any local watchtower for this cell -- reset to fast-poll mode and
+    poll immediately. Use when you know an event is waiting and don't want to
+    wait out the current idle gap.
+
+    Sibling-session caveat: this uses pkill -USR1 against the argv pattern
+    `cccp watchtower <slug>`, which is byte-identical across sibling Claude
+    sessions on the same host+user watching the same cell. All such siblings
+    will be woken. The collateral cost is trivial - the spurious sibling spends
+    a few extra seconds in fast-poll before its ladder reasserts - so this is
+    the documented, accepted side-effect. Surgical per-session signalling via
+    a pidfile keyed on find_claude_pid() is captured in TODO for later.
+    """
+    slug = slugify(args.cell)
+    # Anchored regex: cccp watchtower foo must not match cccp watchtower foo-bar.
+    # Slugs are [a-z0-9-] only (slugify), so re.escape is belt-and-suspenders.
+    # POSIX ERE only (BSD pkill on macOS, procps pkill on Linux): literal space
+    # alternation, not \s. pkill is built-in on both, no homebrew/extra packages.
+    pattern = rf"cccp watchtower {re.escape(slug)}( |$)"
+    r = subprocess.run(["pkill", "-USR1", "-f", pattern], capture_output=True)
+    if r.returncode == 0:
+        print(f"woke watchtower(s) for cell {slug!r}")
+    elif r.returncode == 1:
+        sys.exit(f"no local watchtower found for cell {slug!r}")
+    else:
+        sys.exit(f"pkill failed: {r.stderr.decode().strip() or r.returncode}")
 
 
 def cmd_leave(args):
@@ -905,6 +969,12 @@ def build_parser():
                          "silent interval doubles, capped at 24h, and resets to "
                          "this initial value on any activity.")
     wt.set_defaults(func=cmd_watchtower)
+
+    wk = sub.add_parser("wake",
+                        help="SIGUSR1 the local watchtower for this cell so it "
+                             "polls immediately and resets the cadence ladder.")
+    wk.add_argument("cell", help="Cell slug.")
+    wk.set_defaults(func=cmd_wake)
 
     lv = sub.add_parser("leave",
                         help="Leave a cell (writes gone.json; your watchtower exits).")

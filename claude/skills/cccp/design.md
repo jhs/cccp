@@ -116,8 +116,12 @@ malicious comrade could simply sniff from prior messages is theater, not securit
 - **Large-file publish (>256 MB):** single-PUT only. The tool detects oversize
   files; its error message points to azcopy or an ad-hoc Put-Block / Put-Block-List
   uploader.
-- **Poll cadence** (0.25s) is a constant — now a network LIST call, not a local
-  scan, so a knob worth revisiting.
+- **Poll cadence** is now an adaptive ladder (2s, 5s, 15s, 30s, 60s; activity
+  resets to 2s; `cccp wake` short-circuits the gap via SIGUSR1). Replaced the
+  prior fixed 0.25s, which was a holdover from v1's local-FS scan and meant
+  ~$1.90/day per always-on comrade in Azure LIST cost. Future improvement
+  captured in TODO: per-session pidfile so `cccp wake` signals exactly one
+  watchtower instead of every sibling on the same host+user.
 - **Transparent file prefetch** via PreToolUse hooks (making `cccp pull` invisible)
   and **MinIO / S3 backends** — both captured in the repo `TODO`.
 

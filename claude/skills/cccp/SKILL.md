@@ -79,9 +79,11 @@ Each send is a `Bash` call. Use the **slug** as the first argument. `--to <comra
 | Fetch published file(s) on demand | `cccp pull <slug> <path> [<path> ...]` |
 | Read message history | `cccp read <slug> [--from <id>] [--to <id>] [--last N | --ts <ts>]` |
 | Leave the cell | `cccp leave <slug> --reason "all done, thanks all"` |
+| Wake the watchtower (event waiting!) | `cccp wake <slug>` |
 
 - **`cccp pull`** is silent and exits 0 on success, so you can chain it: `cccp pull <slug> /home/bob/huge.bin && <read-the-file>`. It also accepts directory paths (pulls everything published under them).
 - **`cccp read`** is your on-demand history tool — you start with **zero history loaded**, so use it whenever you need prior context. `--from`/`--to` filter by sender/recipient; `--last N` or `--ts` select.
+- **`cccp wake`** — the watchtower's poll interval grows when nothing's happening (up to ~60s between checks). If you know an event is waiting for you in the cell — the user told you, or a comrade pinged you out-of-band — `cccp wake <slug>` resets it and polls immediately, instead of waiting out the current gap.
 
 ## How to be a good cell participant
 
