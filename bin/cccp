@@ -107,41 +107,24 @@ def slugify(name):
     return s
 
 
-def find_claude_pid():
-    """Walk the parent process chain to find the Claude session's pid.
+def current_session_id():
+    """The Claude Code session UUID, exported as CLAUDE_CODE_SESSION_ID.
 
-    This is the stable per-session key: every cccp invocation from one Claude
-    session finds the same pid, so identity stays consistent across the separate
-    init / dispatch / watchtower process invocations with no local state file.
-    It is NOT part of the default comrade id (that stays the clean user@host) -
-    only the collision disambiguator and the cross-invocation re-derivation key.
+    Stable for the whole conversation, including across `claude --resume`. Every
+    cccp invocation from one Claude session reads the same value, so identity
+    stays consistent across the separate init / dispatch / watchtower processes
+    with no local state file. Used as the cross-invocation re-derivation key
+    and (truncated to 6 chars) as the same-host collision disambiguator; the
+    default comrade id stays the clean user@host.
+
+    Non-Claude callers (manual testing, scripts) should set CCCP_COMRADE_ID to
+    bypass identity claim entirely.
     """
-    pid = os.getppid()
-    for _ in range(20):
-        if pid in (0, 1):
-            break
-        try:
-            r = subprocess.run(["ps", "-o", "ppid=,args=", "-p", str(pid)],
-                               capture_output=True, text=True, check=True)
-        except subprocess.CalledProcessError:
-            break
-        line = r.stdout.strip()
-        if not line:
-            break
-        parts = line.split(None, 1)
-        if len(parts) < 2:
-            break
-        ppid_str, cmdline = parts
-        low = cmdline.lower()
-        if "claude" in os.path.basename(cmdline.split()[0]).lower() \
-                or "/.local/share/claude/" in low \
-                or low.startswith("claude ") or low == "claude":
-            return pid
-        try:
-            pid = int(ppid_str)
-        except ValueError:
-            break
-    return os.getppid()
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if not sid:
+        sys.exit("error: CLAUDE_CODE_SESSION_ID is not set; cccp must run under "
+                 "Claude Code, or set CCCP_COMRADE_ID to bypass identity claim")
+    return sid
 
 
 # ---------- config resolution ----------
@@ -303,9 +286,9 @@ def claim_identity(client, prefix, slug):
     """Resolve (claiming if needed) this session's comrade id for a cell.
 
     Idempotent and self-recomputing: every cccp invocation from the same Claude
-    session arrives at the same id, keyed on the Claude process pid. The clean
+    session arrives at the same id, keyed on the Claude session UUID. The clean
     `user@host` is used by default; a sibling session on the same host that
-    finds it already taken falls back to `user@host:<claude-pid>`.
+    finds it already taken falls back to `user@host:<first-6-of-session-id>`.
 
     CCCP_COMRADE_ID in the environment overrides all of this with an explicit id
     (used for testing and deliberate identity control).
@@ -316,8 +299,8 @@ def claim_identity(client, prefix, slug):
                          json.dumps({"ts": now_iso()}).encode())
         return env_id
     base = base_comrade_id()
-    mypid = find_claude_pid()
-    body = json.dumps({"claude_pid": mypid, "ts": now_iso()}).encode()
+    mysession = current_session_id()
+    body = json.dumps({"session_id": mysession, "ts": now_iso()}).encode()
     base_claim = f"{prefix}/{slug}/{base}/claim"
 
     st = client.put_block(base_claim, body, if_none_match=True)
@@ -326,17 +309,17 @@ def claim_identity(client, prefix, slug):
     if st == 409:
         # Someone holds the clean id - a prior invocation of mine, or a sibling?
         gst, gbody = client.get(base_claim)
-        owner_pid = None
+        owner_session = None
         if gst == 200:
             try:
-                owner_pid = json.loads(gbody).get("claude_pid")
+                owner_session = json.loads(gbody).get("session_id")
             except (ValueError, AttributeError):
                 pass
-        if owner_pid == mypid:
+        if owner_session == mysession:
             return base                   # it is mine - a re-run from this session
-        pid_id = f"{base}:{mypid}"
-        client.put_block(f"{prefix}/{slug}/{pid_id}/claim", body)  # overwrite ok
-        return pid_id
+        suffix_id = f"{base}:{mysession[:6]}"
+        client.put_block(f"{prefix}/{slug}/{suffix_id}/claim", body)  # overwrite ok
+        return suffix_id
     raise BlobError(st, b"")
 
 
@@ -735,7 +718,7 @@ def cmd_wake(args):
     will be woken. The collateral cost is trivial - the spurious sibling spends
     a few extra seconds in fast-poll before its ladder reasserts - so this is
     the documented, accepted side-effect. Surgical per-session signalling via
-    a pidfile keyed on find_claude_pid() is captured in TODO for later.
+    a pidfile keyed on CLAUDE_CODE_SESSION_ID is captured in TODO for later.
     """
     slug = slugify(args.cell)
     # Anchored regex: cccp watchtower foo must not match cccp watchtower foo-bar.
