@@ -53,6 +53,9 @@ CONFIG_PATH = Path.home() / ".config" / "cccp" / "config"
 POLL_INTERVAL = 0.25       # seconds between watchtower scans
 TRUNCATE_THRESHOLD = 480   # render a header-only event above this many chars
 PREVIEW_BUDGET = 150       # preview chars carried on a truncated event
+IDLE_MAX_SECONDS = 24 * 3600   # cap for the idle backoff - past this, idles fire
+                               # at most once a day so a long-silent watchtower
+                               # stops forcing Claude to wake and respond
 PUBLISH_MAX = 256 * 1024 * 1024   # single-PUT publish ceiling; larger needs staging
 AUTODOWNLOAD_MAX = 1024 * 1024    # watchtower auto-downloads published files at or
                                   # under this size; larger ones are only announced
@@ -441,7 +444,7 @@ class Watchtower:
     leave. A pure live-event stream: it skips backlog at startup (no replay) and
     has no local state - identity and history live in the container."""
 
-    def __init__(self, client, prefix, slug, me, idle_interval):
+    def __init__(self, client, prefix, slug, me, idle_initial, idle_max=IDLE_MAX_SECONDS):
         self.client = client
         self.prefix = prefix
         self.slug = slug
@@ -451,12 +454,26 @@ class Watchtower:
         self.known = set()   # comrades already seen (join emitted)
         self.gone = set()    # comrades whose gone.json we've seen (leave emitted)
         self.stop = False
-        self.idle_interval = idle_interval   # seconds of silence -> `idle`; 0 disables
+        # Idle backoff: start at idle_initial, double after each idle emission up
+        # to idle_max, reset to idle_initial on any activity. idle_initial=0
+        # disables idle events entirely.
+        self.idle_initial = idle_initial
+        self.idle_max = idle_max
+        self.idle_current = idle_initial
         self.last_activity = time.monotonic()
-        self.idle_due = self.last_activity + idle_interval
+        self.idle_due = self.last_activity + idle_initial
 
     def _emit(self, line):
         print(line, flush=True)
+
+    @staticmethod
+    def _format_quiet(seconds):
+        """Compact label for the elapsed silence on an idle event - minutes up to
+        the hour, then hours. Keeps `quiet=24h` from rendering as `quiet=1440m`."""
+        minutes = round(seconds / 60)
+        if minutes < 60:
+            return f"{minutes}m"
+        return f"{round(minutes / 60)}h"
 
     def _scan(self):
         """Group the cell prefix listing into per-comrade state."""
@@ -488,7 +505,8 @@ class Watchtower:
         self._emit(f"ready {self.me} slug={self.slug}")
         # Start the idle clock from "fully up", after the network-bound startup.
         self.last_activity = time.monotonic()
-        self.idle_due = self.last_activity + self.idle_interval
+        self.idle_current = self.idle_initial
+        self.idle_due = self.last_activity + self.idle_initial
         signal.signal(signal.SIGTERM, self._on_signal)
         signal.signal(signal.SIGINT, self._on_signal)
         while not self.stop:
@@ -560,13 +578,17 @@ class Watchtower:
             self._emit(line)
 
         # Idle heartbeat: reassure Claude that a quiet line is healthy, not dead.
+        # Backoff: each idle emission doubles the interval (capped at idle_max),
+        # so a long-silent cell stops nagging Claude. Activity resets to initial.
         now = time.monotonic()
         if membership or messages:
             self.last_activity = now
-            self.idle_due = now + self.idle_interval
-        elif self.idle_interval > 0 and now >= self.idle_due:
-            self._emit(f"idle quiet={round((now - self.last_activity) / 60)}m")
-            self.idle_due += self.idle_interval
+            self.idle_current = self.idle_initial
+            self.idle_due = now + self.idle_initial
+        elif self.idle_initial > 0 and now >= self.idle_due:
+            self._emit(f"idle quiet={self._format_quiet(now - self.last_activity)}")
+            self.idle_current = min(self.idle_current * 2, self.idle_max)
+            self.idle_due = now + self.idle_current
 
     def _render(self, d):
         if not addressed_to_me(d.get("to") or ["*"], self.me):
@@ -873,8 +895,10 @@ def build_parser():
                         help="Stream live cell events (run under the Monitor tool).")
     wt.add_argument("cell", help="Cell slug.")
     wt.add_argument("--idle", type=int, default=30, metavar="MIN",
-                    help="Emit an `idle quiet=Nm` heartbeat after this many "
-                         "minutes of silence (default 30; 0 disables).")
+                    help="Initial silence (minutes) before the first `idle` "
+                         "heartbeat (default 30; 0 disables). Each subsequent "
+                         "silent interval doubles, capped at 24h, and resets to "
+                         "this initial value on any activity.")
     wt.set_defaults(func=cmd_watchtower)
 
     lv = sub.add_parser("leave",

@@ -75,7 +75,9 @@ comrade isn't broken, it's quiet; a dispatch to it isn't lost, it waits in the
 container. "Zombie" is not a failure state. Presence questions are pushed up to
 Claude — if it needs to know who's live, it dispatches a roll-call. (The
 watchtower's `--idle` heartbeat is a *different* thing: local, watchtower→Claude,
-just reassurance that a quiet line is healthy. It is not inter-comrade traffic.)
+just reassurance that a quiet line is healthy. It is not inter-comrade traffic.
+Cadence is exponential backoff from `--idle` up to 24h, reset on any real event:
+indefinite idleness is the intended steady state, not a condition to escalate.)
 
 ### Hybrid file receive
 Published files are block blobs under the publisher's `files/`. The watchtower

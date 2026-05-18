@@ -63,7 +63,7 @@ idle quiet=30m
 - **`filesystem op=publish` with `local=<path>`** — the file was small enough to auto-download; it's already on your disk at that `local=` path, ready to read.
 - **`filesystem op=publish` without `local=`** — too large to auto-download (only `path`/`size` were announced). If you want it, run `cccp pull <slug> <path>` to fetch it, then read it from `~/.cccp/<slug>/<sender>/files/<path>`.
 - **`leave`** — that comrade departed.
-- **`idle quiet=Nm`** — the line has been silent N minutes and the watchtower is healthy; nothing is wrong. Treat it as a checkpoint: if the work seems done, consider winding down. (No event arriving at all is also fine — silence is not a problem to investigate.)
+- **`idle quiet=...`** — the line has been silent for that long (e.g. `30m`, `2h`, `8h`, `24h`) and the watchtower is healthy. Emitted with exponential backoff up to once per 24h, reset on any real event. Nothing is required of you — there's just no work right now, possibly for a long time, and that's fine.
 
 ## Step 3 — Send things
 
