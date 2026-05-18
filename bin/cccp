@@ -50,7 +50,12 @@ from pathlib import Path
 API_VERSION = "2023-11-03"
 DEFAULT_PREFIX = "__default__"
 CONFIG_PATH = Path.home() / ".config" / "cccp" / "config"
-POLL_INTERVAL = 0.25       # seconds between watchtower scans
+POLL_INTERVAL = 2.0        # seconds between watchtower scans. The polling is a
+                           # network LIST call against Azure Blob, not a local
+                           # FS scan: 0.25s here meant ~$1.90/day per always-on
+                           # comrade in LIST ops, and a comrade needs multiple
+                           # seconds just to emit a message anyway, so faster
+                           # than this is pure overhead.
 TRUNCATE_THRESHOLD = 480   # render a header-only event above this many chars
 PREVIEW_BUDGET = 150       # preview chars carried on a truncated event
 IDLE_MAX_SECONDS = 24 * 3600   # cap for the idle backoff - past this, idles fire
