@@ -53,13 +53,13 @@ DEFAULT_PREFIX = "__default__"
 CONFIG_PATH = Path.home() / ".config" / "cccp" / "config"
 POLL_LADDER = (            # seconds; the adaptive inter-poll gap. First entry is
     2, 5, 15, 30, 60,      # the "fast" cadence used right after activity; each
-)                          # no-activity poll advances one rung. Last entry is
-                           # the cap (stays there indefinitely while idle). Any
-                           # real event resets back to entry 0; SIGUSR1 (cccp
-                           # wake) does the same plus polls immediately.
-                           # 2s floor: polling is a network LIST against Azure
-                           # Blob, and a comrade takes multiple seconds just to
-                           # emit a message, so faster is pure overhead.
+    120, 180, 300,         # no-activity poll advances one rung. Last entry is
+)                          # the cap (5min), stays there indefinitely while
+                           # idle. Any real event resets back to entry 0;
+                           # SIGUSR1 (cccp wake) does the same plus polls
+                           # immediately. 2s floor because polling is a network
+                           # LIST against Azure Blob and a comrade takes
+                           # multiple seconds just to emit a message anyway.
 TRUNCATE_THRESHOLD = 480   # render a header-only event above this many chars
 PREVIEW_BUDGET = 150       # preview chars carried on a truncated event
 IDLE_MAX_SECONDS = 24 * 3600   # cap for the idle backoff - past this, idles fire
