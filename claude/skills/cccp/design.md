@@ -54,9 +54,9 @@ default id.
 ### Render-time `!cccp init`
 The skill runs `cccp init` at render time (a `!`-bang), so Claude starts already
 oriented — identity, cell, roster — without spending an LLM round-trip on a
-startup handshake. The bang passes only `$1` (the first token = cell name),
-single-quoted: the freeform `# comment` is *never* placed in a shell command (it
-would be a quoting break at best, a command-injection vector at worst).
+startup handshake. The bang passes only `$0` (the first token = cell name),
+single-quoted: the freeform trailing context is *never* placed in a shell command
+(it would be a quoting break at best, a command-injection vector at worst).
 `$ARGUMENTS` is shown to Claude as plain markdown text at the *end* of the skill,
 so a long project-kickoff prompt doesn't disrupt the intro.
 

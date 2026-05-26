@@ -655,15 +655,11 @@ def cmd_init(args):
     string-substitutes into Claude's view so it starts already oriented.
 
     The skill passes just the first /cccp argument (`!`cccp init '$0'``) - the
-    cell name - never the freeform `# comment`. The name is slugified; the slug
-    is the cell's one identity everywhere. The `#` split is a belt-and-suspenders
-    guard for a `#` glued to the name with no separating space.
+    cell name - so freeform trailing context never reaches the shell. The name
+    is slugified; the slug is the cell's one identity everywhere.
     """
-    name = args.name.split("#", 1)[0].strip()
-    if not name:
-        sys.exit("error: no cell name given")
     try:
-        slug = slugify(name)
+        slug = slugify(args.name)
     except ValueError as e:
         sys.exit(f"error: {e}")
     cfg = resolve_config()

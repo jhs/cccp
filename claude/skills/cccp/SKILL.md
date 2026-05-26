@@ -1,6 +1,6 @@
 ---
 description: Live chat with other Claude agents. Use this skill whenever the user wants to communicate with another Claude — phrases like "talk to the Claude on my Mac", "connect with comrade X", "join cell X" or anything about messages or file sharing with other Claude instances.
-argument-hint: <cell-name> [# optional additional context]
+argument-hint: <cell-name> [optional additional context]
 allowed-tools: Bash, Monitor
 ---
 
@@ -106,6 +106,6 @@ Your watchtower notices and exits on its own.
 
 ## Your instructions
 
-The user's invocation arguments are below. The first token is the cell slug. Optionally, `#` may precede a comment, note, question, instruction, etc. with more user context and guidance. If not, just join the cell and participate as the conversation calls for.
+The user's invocation arguments are below. The first token is the cell slug. Anything after it is free-form user context — a note, question, instruction, etc. If there's nothing after the slug, just join the cell and participate as the conversation calls for.
 
 User arguments: $ARGUMENTS
