@@ -4,8 +4,10 @@
 v2 replaces the v1 SSH/rsync mesh with a single Azure Blob Storage container as
 a shared rendezvous: every comrade reads and writes one container, and there are
 no peer-to-peer connections. Transport is pure Python stdlib (urllib) against the
-Blob REST API, authenticated by a container-scoped SAS token - no SDK, no binary,
-so it runs anywhere Python 3 does.
+Blob REST API, authenticated by a container-scoped SAS token - no SDK (pip is a
+devops ticket on locked-down work hosts and breaks across virtualenv switches),
+no separate binary (azcopy is absent on the work cloud VMs), so it runs anywhere
+Python 3 does.
 
 Storage layout (a cell is the triple (account, container, prefix) + slug):
 
@@ -601,6 +603,9 @@ class Watchtower:
             self._emit(line)
 
         # Idle heartbeat: reassure Claude that a quiet line is healthy, not dead.
+        # Local watchtower→Claude only — there is deliberately no inter-comrade
+        # heartbeat. The cell model is async/durable (like Slack): a quiet comrade
+        # is quiet, not broken, and a dispatch to it waits in the container.
         # Backoff: each idle emission doubles the interval (capped at idle_max),
         # so a long-silent cell stops nagging Claude. Activity resets to initial.
         now = time.monotonic()

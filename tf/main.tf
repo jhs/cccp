@@ -57,6 +57,8 @@ resource "azurerm_storage_account" "cccp" {
   # real objects that persist and need depth-first deletion: needless friction
   # for CCCP's tiny chat-sized data. HNS's one upside — per-cell SAS scoping — is
   # handled instead by per-project containers via the .env credential model.
+  # We enabled HNS initially and turned it back off; do not re-enable without
+  # re-litigating the deletion-friction tradeoff.
 
   # CCCP only ever talks HTTPS.
   https_traffic_only_enabled = true
