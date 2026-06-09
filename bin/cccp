@@ -160,7 +160,12 @@ def resolve_config(start=None):
     default at ~/.config/cccp/config. CCCP_PREFIX is optional and defaults to
     __default__, so a config only needs ACCOUNT, CONTAINER, and SAS.
 
-    Returns a dict with ACCOUNT, CONTAINER, SAS, PREFIX.
+    Any CCCP_* key the chosen file doesn't carry falls back to the process
+    environment - so `export CCCP_DEBUG=1` in bashrc.d flips verbose logging
+    on globally without touching the (gitignored, SAS-bearing) generated
+    config file. The file is authoritative when it speaks; env fills gaps.
+
+    Returns a dict with ACCOUNT, CONTAINER, SAS, PREFIX, DEBUG.
     """
     start = Path(start or os.getcwd()).resolve()
     found = None
@@ -177,6 +182,10 @@ def resolve_config(start=None):
                      f"above {start}, and {CONFIG_PATH} is missing "
                      f"(run tf/apply.sh, then install.sh)")
         found = _parse_cccp_env(CONFIG_PATH)
+
+    for k, v in os.environ.items():
+        if k.startswith("CCCP_") and k not in found:
+            found[k] = v
 
     out = {
         "ACCOUNT": found.get("CCCP_ACCOUNT"),
