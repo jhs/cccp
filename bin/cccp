@@ -33,10 +33,15 @@ Subcommands (build in progress):
 """
 
 import argparse
+import contextlib
 import json
+import logging
+import logging.handlers
 import os
+import platform
 import pwd
 import re
+import shlex
 import signal
 import socket
 import subprocess
@@ -74,6 +79,8 @@ AUTODOWNLOAD_MAX = 1024 * 1024    # watchtower auto-downloads published files at
                                   # by what downloads fast enough not to stall the
                                   # poll loop - not by "how big a file is".
 LOCAL_MIRROR = Path.home() / ".cccp"   # where pulled / auto-downloaded files land
+DEBUG_LOG_MAX_BYTES = 10 * 1024 * 1024    # per debug.log; rotates to keep 5 backups
+DEBUG_LOG_BACKUPS = 5                     # so worst case ~60 MB per (cell, comrade)
 TEXT_EXTENSIONS = {
     ".txt", ".md", ".rst", ".html", ".htm", ".xml", ".csv", ".tsv", ".json",
     ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".log", ".sh", ".bash",
@@ -176,11 +183,185 @@ def resolve_config(start=None):
         "CONTAINER": found.get("CCCP_CONTAINER"),
         "SAS": (found.get("CCCP_SAS") or "").lstrip("?"),
         "PREFIX": found.get("CCCP_PREFIX") or DEFAULT_PREFIX,
+        "DEBUG": found.get("CCCP_DEBUG"),
     }
     missing = [k for k in ("ACCOUNT", "CONTAINER", "SAS") if not out[k]]
     if missing:
         sys.exit(f"error: CCCP config is missing keys: {missing}")
     return out
+
+
+# ---------- debug logging ----------
+
+# A pure NullHandler logger that every entry point hands out by default. All
+# `log.debug(...)` and `TimeLogger(...)` sites work against it as a no-op when
+# CCCP_DEBUG is unset or falsy, so the rest of the script never branches on
+# whether debug logging is enabled. Strip every `log.*` call from the source
+# and the SKILL.md-facing contract (stdout protocol stream + the small stderr
+# error prints) is unchanged - debug logging is purely additive.
+_NULL_LOG = logging.getLogger("cccp.null")
+_NULL_LOG.addHandler(logging.NullHandler())
+_NULL_LOG.propagate = False
+_NULL_LOG.setLevel(logging.CRITICAL + 1)
+
+
+def _truthy(v):
+    """CCCP_DEBUG is parsed as a boolean: unset/empty/0/false/no/off -> off."""
+    return v is not None and str(v).strip().lower() not in (
+        "", "0", "false", "no", "off")
+
+
+def _kv(v):
+    """Render a value for a key=val log field. Strings with whitespace or
+    quote/backslash get JSON-quoted so a downstream parser can split on
+    whitespace; everything else is bare."""
+    if v is None:
+        return "None"
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return f"{v}"
+    s = str(v)
+    if not s or any(c.isspace() or c in '"\\' for c in s):
+        return json.dumps(s)
+    return s
+
+
+class _MonoFilter(logging.Filter):
+    """Inject record.mono = time.monotonic() at the log call site (not at format
+    time, which would drift by formatter cost). Wall-clock millis come from the
+    record's own `created`; this is the matched monotonic anchor."""
+
+    def filter(self, record):
+        record.mono = time.monotonic()
+        return True
+
+
+class _KVFormatter(logging.Formatter):
+    """Format: <UTC ISO8601 millis> mono=<sec.ms> pid=<N> <message>.
+
+    Wall-clock is what aligns logs across comrades (anchored on the Azure
+    `Date` header for skew correction); monotonic is what aligns events within
+    one log file regardless of NTP steps. pid is per-line because multiple
+    cccp processes (watchtower, dispatch, init, ...) append to the same file.
+    """
+
+    def format(self, record):
+        ct = time.gmtime(record.created)
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S", ct) + f".{int(record.msecs):03d}Z"
+        return (f"{ts} mono={record.mono:.3f} pid={record.process} "
+                f"{record.getMessage()}")
+
+
+class TimeLogger:
+    """Context manager that times its block and emits one duration line on
+    exit. Inspired by companion/job.py's TimeLogger, pared to the essentials:
+    no Start/Finish lines (the duration is the deliverable), no thread-local
+    indent (single-threaded I/O), and `done(**fields)` for post-hoc metadata
+    only knowable inside the block (HTTP status, bytes, response headers).
+
+    On exception, the duration line still fires with exc=<ExcName>. The
+    exception is not suppressed.
+    """
+
+    def __init__(self, log, ev, **fields):
+        self.log = log
+        self.ev = ev
+        self.fields = fields
+        self.t0 = None
+
+    def __enter__(self):
+        self.t0 = time.monotonic()
+        return self
+
+    def done(self, **fields):
+        """Stash fields to emit on the duration line. Called from inside the
+        block once the values (status, bytes, ...) are known."""
+        self.fields.update(fields)
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        dur_ms = (time.monotonic() - self.t0) * 1000
+        parts = [f"ev={self.ev}", f"duration_ms={dur_ms:.1f}"]
+        for k, v in self.fields.items():
+            parts.append(f"{k}={_kv(v)}")
+        if exc_type is not None:
+            parts.append(f"exc={exc_type.__name__}")
+        self.log.debug(" ".join(parts))
+        return False
+
+
+def _emit_startup_header(log, slug, me, argv):
+    """The first line of each invocation - self-describing provenance so a log
+    file copied out of its directory tree is still analyzable, and so an
+    interleaved file (watchtower + dispatch + ...) is greppable by pid."""
+    log.debug(
+        f"ev=cccp_start session={_kv(os.environ.get('CLAUDE_CODE_SESSION_ID', ''))} "
+        f"comrade={_kv(me)} slug={_kv(slug)} "
+        f"argv={_kv(' '.join(shlex.quote(a) for a in argv))} "
+        f"host={_kv(socket.gethostname())} cwd={_kv(os.getcwd())} "
+        f"python={_kv(platform.python_version())} start={now_iso()}")
+
+
+def setup_logging(cfg, slug, me, argv):
+    """Return a logger. If CCCP_DEBUG is falsy/unset, returns _NULL_LOG and
+    nothing is written. If truthy, installs a RotatingFileHandler at
+    ~/.cccp/<slug>/<me>/cccp-debug.log and emits the startup header.
+
+    Called *after* claim_identity, so the handful of HTTP calls inside identity
+    claim are not logged - a small known gap (plug by buffering through a
+    MemoryHandler and flushing post-claim, if it ever matters). The lag
+    investigation this debug feature exists for happens in the steady-state
+    poll loop, which is fully covered.
+
+    Fails closed: any setup error degrades to the NullHandler logger with a
+    one-line warning on stderr, never breaking the caller.
+    """
+    if not _truthy(cfg.get("DEBUG")):
+        return _NULL_LOG
+    try:
+        path = LOCAL_MIRROR / slug / me / "cccp-debug.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # One logger per process - the pid suffix avoids handler-doubling if
+        # main() is ever entered twice (e.g. in-process tests).
+        log = logging.getLogger(f"cccp.{os.getpid()}")
+        log.setLevel(logging.DEBUG)
+        log.propagate = False
+        log.handlers.clear()
+        log.filters.clear()
+        log.addFilter(_MonoFilter())
+        fh = logging.handlers.RotatingFileHandler(
+            path, maxBytes=DEBUG_LOG_MAX_BYTES, backupCount=DEBUG_LOG_BACKUPS,
+            encoding="utf-8")
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(_KVFormatter())
+        log.addHandler(fh)
+        _emit_startup_header(log, slug, me, argv)
+        return log
+    except OSError as e:
+        print(f"cccp: debug logging setup failed: {e}", file=sys.stderr)
+        return _NULL_LOG
+
+
+@contextlib.contextmanager
+def subcommand_footer(log):
+    """Bracket a short-lived subcommand so the log carries a closing line with
+    its exit code and user-visible duration. Long-lived `cccp watchtower`
+    skips this - its lifecycle is captured by the richer watchtower_stop log
+    line instead."""
+    start_t = time.monotonic()
+    exit_code = 0
+    try:
+        yield
+    except SystemExit as e:
+        c = e.code
+        exit_code = c if isinstance(c, int) else (0 if c is None else 1)
+        raise
+    except BaseException:
+        exit_code = 1
+        raise
+    finally:
+        dur_ms = (time.monotonic() - start_t) * 1000
+        log.debug(f"ev=cccp_end exit={exit_code} duration_ms={dur_ms:.1f}")
 
 
 # ---------- Azure Blob REST client ----------
@@ -200,9 +381,14 @@ class BlobClient:
 
     RETRYABLE = (500, 502, 503, 504)
 
-    def __init__(self, account, container, sas):
+    def __init__(self, account, container, sas, log=None):
         self.base = f"https://{account}.blob.core.windows.net/{container}"
         self.sas = sas.lstrip("?")
+        # The logger is hot-swappable: subcommands construct the client before
+        # claim_identity resolves `me`, then assign `client.log = real_log`
+        # once setup_logging can choose a path. The default no-op keeps every
+        # `self.log.debug(...)` site safe to call unconditionally.
+        self.log = log or _NULL_LOG
 
     def _url(self, path, query=""):
         u = f"{self.base}/{path}" if path else self.base
@@ -219,21 +405,41 @@ class BlobClient:
         if headers:
             h.update(headers)
         url = self._url(path, query)
-        for attempt in range(retries):
-            req = urllib.request.Request(url, data=data, method=method, headers=h)
-            try:
-                resp = urllib.request.urlopen(req, timeout=30)
-                return resp.status, dict(resp.headers), resp.read()
-            except urllib.error.HTTPError as e:
-                if e.code in self.RETRYABLE and attempt < retries - 1:
-                    time.sleep(0.5 * (attempt + 1))
-                    continue
-                return e.code, dict(e.headers), e.read()
-            except urllib.error.URLError:
-                if attempt < retries - 1:
-                    time.sleep(0.5 * (attempt + 1))
-                    continue
-                raise
+        # One TimeLogger spans the whole request (all retries); each individual
+        # retry attempt emits a point event. NEVER log `url` - it carries the
+        # SAS in its query string. `path` is the bare blob path, safe to log.
+        with TimeLogger(self.log, "azure_http", method=method, path=path) as t:
+            for attempt in range(retries):
+                req = urllib.request.Request(url, data=data, method=method, headers=h)
+                try:
+                    resp = urllib.request.urlopen(req, timeout=30)
+                    body = resp.read()
+                    t.done(status=resp.status, bytes=len(body), attempts=attempt + 1,
+                           date=resp.headers.get("Date"),
+                           req_id=resp.headers.get("x-ms-request-id"))
+                    return resp.status, dict(resp.headers), body
+                except urllib.error.HTTPError as e:
+                    if e.code in self.RETRYABLE and attempt < retries - 1:
+                        self.log.debug(
+                            f"ev=azure_retry method={method} path={_kv(path)} "
+                            f"attempt={attempt} status={e.code}")
+                        time.sleep(0.5 * (attempt + 1))
+                        continue
+                    body = e.read()
+                    t.done(status=e.code, bytes=len(body), attempts=attempt + 1,
+                           date=(e.headers.get("Date") if e.headers else None),
+                           req_id=(e.headers.get("x-ms-request-id")
+                                   if e.headers else None))
+                    return e.code, dict(e.headers), body
+                except urllib.error.URLError as e:
+                    if attempt < retries - 1:
+                        self.log.debug(
+                            f"ev=azure_retry method={method} path={_kv(path)} "
+                            f"attempt={attempt} url_error={_kv(str(e))}")
+                        time.sleep(0.5 * (attempt + 1))
+                        continue
+                    t.done(url_error=str(e), attempts=attempt + 1)
+                    raise
 
     # -- convenience operations --
 
@@ -299,6 +505,7 @@ def claim_identity(client, prefix, slug):
     if env_id:
         client.put_block(f"{prefix}/{slug}/{env_id}/claim",
                          json.dumps({"ts": now_iso()}).encode())
+        client.log.debug(f"ev=identity_claim outcome=env_override comrade={_kv(env_id)}")
         return env_id
     base = base_comrade_id()
     mysession = current_session_id()
@@ -307,6 +514,7 @@ def claim_identity(client, prefix, slug):
 
     st = client.put_block(base_claim, body, if_none_match=True)
     if st == 201:
+        client.log.debug(f"ev=identity_claim outcome=fresh comrade={_kv(base)}")
         return base                       # claimed the clean id
     if st == 409:
         # Someone holds the clean id - a prior invocation of mine, or a sibling?
@@ -318,9 +526,11 @@ def claim_identity(client, prefix, slug):
             except (ValueError, AttributeError):
                 pass
         if owner_session == mysession:
+            client.log.debug(f"ev=identity_claim outcome=reused comrade={_kv(base)}")
             return base                   # it is mine - a re-run from this session
         suffix_id = f"{base}:{mysession[:6]}"
         client.put_block(f"{prefix}/{slug}/{suffix_id}/claim", body)  # overwrite ok
+        client.log.debug(f"ev=identity_claim outcome=collision comrade={_kv(suffix_id)}")
         return suffix_id
     raise BlobError(st, b"")
 
@@ -438,7 +648,8 @@ class Watchtower:
     leave. A pure live-event stream: it skips backlog at startup (no replay) and
     has no local state - identity and history live in the container."""
 
-    def __init__(self, client, prefix, slug, me, idle_initial, idle_max=IDLE_MAX_SECONDS):
+    def __init__(self, client, prefix, slug, me, idle_initial,
+                 idle_max=IDLE_MAX_SECONDS, log=None):
         self.client = client
         self.prefix = prefix
         self.slug = slug
@@ -448,6 +659,8 @@ class Watchtower:
         self.known = set()   # comrades already seen (join emitted)
         self.gone = set()    # comrades whose gone.json we've seen (leave emitted)
         self.stop = False
+        self.stop_reason = None
+        self.log = log or _NULL_LOG
         # Idle backoff: start at idle_initial, double after each idle emission up
         # to idle_max, reset to idle_initial on any activity. idle_initial=0
         # disables idle events entirely.
@@ -482,22 +695,27 @@ class Watchtower:
         """Advance one rung up the ladder (capped) and return the gap before the
         next poll. Reset (ladder_step = -1) on any activity or SIGUSR1 wake."""
         self.ladder_step = min(self.ladder_step + 1, len(POLL_LADDER) - 1)
-        return POLL_LADDER[self.ladder_step]
+        gap = POLL_LADDER[self.ladder_step]
+        self.log.debug(f"ev=sleep ladder_step={self.ladder_step} cadence_s={gap}")
+        return gap
 
     def _scan(self):
         """Group the cell prefix listing into per-comrade state."""
-        gazettes, gone_now, comrades = {}, set(), set()
-        for name, props in self.client.list(self.head).items():
-            rest = name[len(self.head):]
-            if "/" not in rest:
-                continue
-            comrade, leaf = rest.split("/", 1)
-            comrades.add(comrade)
-            if leaf == "gazette.jsonl":
-                gazettes[comrade] = props["size"]
-            elif leaf == "gone.json":
-                gone_now.add(comrade)
-        return comrades, gazettes, gone_now
+        with TimeLogger(self.log, "scan") as t:
+            gazettes, gone_now, comrades = {}, set(), set()
+            blobs = self.client.list(self.head)
+            for name, props in blobs.items():
+                rest = name[len(self.head):]
+                if "/" not in rest:
+                    continue
+                comrade, leaf = rest.split("/", 1)
+                comrades.add(comrade)
+                if leaf == "gazette.jsonl":
+                    gazettes[comrade] = props["size"]
+                elif leaf == "gone.json":
+                    gone_now.add(comrade)
+            t.done(blobs=len(blobs), comrades=len(comrades), gone=len(gone_now))
+            return comrades, gazettes, gone_now
 
     def initial_scan(self):
         """Register what's already present without replaying it or emitting joins."""
@@ -510,8 +728,13 @@ class Watchtower:
     def run(self):
         # Rejoin: clear any stale gone.json left by a previous session.
         self.client.request("DELETE", f"{self.head}{self.me}/gone.json")
-        self.initial_scan()
+        with TimeLogger(self.log, "initial_scan"):
+            self.initial_scan()
         self._emit(f"ready {self.me} slug={self.slug}")
+        self.log.debug(
+            f"ev=watchtower_ready comrade={_kv(self.me)} slug={_kv(self.slug)} "
+            f"idle_initial_s={self.idle_initial} idle_max_s={self.idle_max} "
+            f"known_comrades={len(self.known)}")
         # Start the idle clock from "fully up", after the network-bound startup.
         self.last_activity = time.monotonic()
         self.idle_current = self.idle_initial
@@ -522,9 +745,13 @@ class Watchtower:
         signal.signal(signal.SIGUSR1, self._on_wake)
         while not self.stop:
             try:
-                self._poll_once()
+                with TimeLogger(self.log, "poll"):
+                    self._poll_once()
             except Exception as e:
                 print(f"watchtower error: {e}", file=sys.stderr)
+                self.log.debug(
+                    f"ev=watchtower_error exc={type(e).__name__} "
+                    f"msg={_kv(str(e))}")
             if self.stop:
                 break
             # Event.wait so SIGTERM/SIGINT/SIGUSR1 can break the sleep promptly;
@@ -535,9 +762,15 @@ class Watchtower:
                     self.wake_requested = False
                     self.last_activity = time.monotonic()
                     self.ladder_step = -1
+                    # Log in the main loop, not in the signal handler -
+                    # `logging` takes a lock and is not async-signal-safe.
+                    self.log.debug("ev=wake_received")
+        self.log.debug(
+            f"ev=watchtower_stop reason={_kv(self.stop_reason or 'unknown')}")
 
-    def _on_signal(self, *_):
+    def _on_signal(self, signum, _frame):
         self.stop = True
+        self.stop_reason = f"signal_{signum}"
         self._interrupt.set()
 
     def _on_wake(self, *_):
@@ -549,6 +782,7 @@ class Watchtower:
         if self.me in gone_now:
             self._emit(f"left slug={self.slug}")
             self.stop = True
+            self.stop_reason = "left"
             return
         # Membership events emit in detection order, before the same poll's
         # message events (sorted by ts) - so a join always reads before the
@@ -598,9 +832,25 @@ class Watchtower:
 
         for line in membership:
             self._emit(line)
+            self.log.debug(f"ev=event_emitted kind=membership line={_kv(line)}")
         messages.sort(key=lambda x: x[0])
-        for _, line in messages:
+        for ts_str, line in messages:
             self._emit(line)
+            # lag_ms = how far the message's stated `ts` is behind the wall
+            # clock right now - this comrade's local view of end-to-end latency
+            # from sender's gazette append to local detection + emit. Cross-
+            # comrade comparison anchors on the Azure `Date` header logged on
+            # every azure_http line to correct for clock skew.
+            lag_ms = None
+            try:
+                ts_dt = datetime.strptime(
+                    ts_str, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
+                lag_ms = (datetime.now(timezone.utc) - ts_dt).total_seconds() * 1000
+            except (ValueError, TypeError):
+                pass
+            self.log.debug(
+                f"ev=event_emitted kind=message ts={ts_str} "
+                f"lag_ms={lag_ms if lag_ms is None else f'{lag_ms:.1f}'}")
 
         # Idle heartbeat: reassure Claude that a quiet line is healthy, not dead.
         # Local watchtower→Claude only — there is deliberately no inter-comrade
@@ -615,8 +865,13 @@ class Watchtower:
             self.idle_due = now + self.idle_initial
             self.ladder_step = -1     # back to fast poll on any real event
         elif self.idle_initial > 0 and now >= self.idle_due:
-            self._emit(f"idle quiet={self._format_quiet(now - self.last_activity)}")
-            self.idle_current = min(self.idle_current * 2, self.idle_max)
+            quiet_label = self._format_quiet(now - self.last_activity)
+            self._emit(f"idle quiet={quiet_label}")
+            next_idle = min(self.idle_current * 2, self.idle_max)
+            self.log.debug(
+                f"ev=idle_emitted quiet={quiet_label} "
+                f"idle_current_s={self.idle_current} next_idle_s={next_idle}")
+            self.idle_current = next_idle
             self.idle_due = now + self.idle_current
 
     def _render(self, d):
@@ -636,14 +891,19 @@ class Watchtower:
         op, wire_path = d.get("op"), d.get("path", "")
         if op == "publish" and d.get("size", 0) <= AUTODOWNLOAD_MAX:
             try:
-                local = download_to_mirror(self.client, self.prefix, self.slug,
-                                           d["from"], wire_path,
-                                           expect_size=d.get("size"),
-                                           expect_lines=d.get("lines"))
+                with TimeLogger(self.log, "auto_download", path=wire_path,
+                                size=d.get("size", 0)):
+                    local = download_to_mirror(self.client, self.prefix, self.slug,
+                                               d["from"], wire_path,
+                                               expect_size=d.get("size"),
+                                               expect_lines=d.get("lines"))
                 d = {**d, "local": str(local)}
             except (BlobError, OSError) as e:
                 print(f"cccp watchtower: auto-download skipped: {e}",
                       file=sys.stderr)  # announce anyway; Claude can `cccp pull` it
+                self.log.debug(
+                    f"ev=auto_download_skip path={_kv(wire_path)} "
+                    f"exc={type(e).__name__} msg={_kv(str(e))}")
         elif op == "unpublish":
             try:
                 (LOCAL_MIRROR / self.slug / d["from"] / wire_path).unlink(
@@ -670,17 +930,20 @@ def cmd_init(args):
     cfg = resolve_config()
     client = BlobClient(cfg["ACCOUNT"], cfg["CONTAINER"], cfg["SAS"])
     me = claim_identity(client, cfg["PREFIX"], slug)
-    roster = cell_roster(client, cfg["PREFIX"], slug)
-    others = [c for c in roster if c != me]
+    log = setup_logging(cfg, slug, me, sys.argv)
+    client.log = log
+    with subcommand_footer(log):
+        roster = cell_roster(client, cfg["PREFIX"], slug)
+        others = [c for c in roster if c != me]
 
-    print(f"You are comrade `{me}` in CCCP cell `{slug}`.")
-    # Not super useful to Claude
-    #print(f"Cell store: {cfg['ACCOUNT']}/{cfg['CONTAINER']}/{cfg['PREFIX']}/{slug}/")
-    if others:
-        print(f"Roster ({len(roster)}): " + ", ".join(roster))
-    else:
-        print("Roster: just you - this cell is empty so far.")
-    print("No history loaded. Introduce yourself to the cell with `cccp dispatch`.")
+        print(f"You are comrade `{me}` in CCCP cell `{slug}`.")
+        # Not super useful to Claude
+        #print(f"Cell store: {cfg['ACCOUNT']}/{cfg['CONTAINER']}/{cfg['PREFIX']}/{slug}/")
+        if others:
+            print(f"Roster ({len(roster)}): " + ", ".join(roster))
+        else:
+            print("Roster: just you - this cell is empty so far.")
+        print("No history loaded. Introduce yourself to the cell with `cccp dispatch`.")
 
 
 def cmd_dispatch(args):
@@ -689,14 +952,19 @@ def cmd_dispatch(args):
     client = BlobClient(cfg["ACCOUNT"], cfg["CONTAINER"], cfg["SAS"])
     slug = slugify(args.cell)
     me = claim_identity(client, cfg["PREFIX"], slug)
-    d = {
-        "type": "message",
-        "ts": now_iso(),
-        "from": me,
-        "to": args.to if args.to else ["*"],
-        "body": args.body,
-    }
-    append_dispatch(client, cfg["PREFIX"], slug, me, d)
+    log = setup_logging(cfg, slug, me, sys.argv)
+    client.log = log
+    with subcommand_footer(log):
+        d = {
+            "type": "message",
+            "ts": now_iso(),
+            "from": me,
+            "to": args.to if args.to else ["*"],
+            "body": args.body,
+        }
+        with TimeLogger(log, "dispatch_append", body_chars=len(args.body),
+                        to_count=len(args.to) if args.to else 0):
+            append_dispatch(client, cfg["PREFIX"], slug, me, d)
 
 
 def cmd_watchtower(args):
@@ -705,7 +973,12 @@ def cmd_watchtower(args):
     client = BlobClient(cfg["ACCOUNT"], cfg["CONTAINER"], cfg["SAS"])
     slug = slugify(args.cell)
     me = claim_identity(client, cfg["PREFIX"], slug)
-    Watchtower(client, cfg["PREFIX"], slug, me, args.idle * 60).run()
+    log = setup_logging(cfg, slug, me, sys.argv)
+    client.log = log
+    # No subcommand_footer here - the Watchtower emits its own ev=watchtower_stop
+    # with a reason, which is the richer lifecycle record for a long-lived
+    # process.
+    Watchtower(client, cfg["PREFIX"], slug, me, args.idle * 60, log=log).run()
 
 
 def cmd_wake(args):
@@ -722,18 +995,27 @@ def cmd_wake(args):
     a pidfile keyed on CLAUDE_CODE_SESSION_ID is captured in TODO for later.
     """
     slug = slugify(args.cell)
-    # Anchored regex: cccp watchtower foo must not match cccp watchtower foo-bar.
-    # Slugs are [a-z0-9-] only (slugify), so re.escape is belt-and-suspenders.
-    # POSIX ERE only (BSD pkill on macOS, procps pkill on Linux): literal space
-    # alternation, not \s. pkill is built-in on both, no homebrew/extra packages.
-    pattern = rf"cccp watchtower {re.escape(slug)}( |$)"
-    r = subprocess.run(["pkill", "-USR1", "-f", pattern], capture_output=True)
-    if r.returncode == 0:
-        print(f"woke watchtower(s) for cell {slug!r}")
-    elif r.returncode == 1:
-        sys.exit(f"no local watchtower found for cell {slug!r}")
-    else:
-        sys.exit(f"pkill failed: {r.stderr.decode().strip() or r.returncode}")
+    # cmd_wake makes no network call, so it doesn't claim_identity. Use the
+    # default comrade id for the log path - on this same host+user the wake
+    # is host-local anyway, and any collision-suffixed sibling watchtower is
+    # logging at its own suffixed path independently.
+    cfg = resolve_config()
+    me = base_comrade_id()
+    log = setup_logging(cfg, slug, me, sys.argv)
+    with subcommand_footer(log):
+        # Anchored regex: cccp watchtower foo must not match cccp watchtower foo-bar.
+        # Slugs are [a-z0-9-] only (slugify), so re.escape is belt-and-suspenders.
+        # POSIX ERE only (BSD pkill on macOS, procps pkill on Linux): literal space
+        # alternation, not \s. pkill is built-in on both, no homebrew/extra packages.
+        pattern = rf"cccp watchtower {re.escape(slug)}( |$)"
+        r = subprocess.run(["pkill", "-USR1", "-f", pattern], capture_output=True)
+        log.debug(f"ev=wake_sent slug={_kv(slug)} pkill_rc={r.returncode}")
+        if r.returncode == 0:
+            print(f"woke watchtower(s) for cell {slug!r}")
+        elif r.returncode == 1:
+            sys.exit(f"no local watchtower found for cell {slug!r}")
+        else:
+            sys.exit(f"pkill failed: {r.stderr.decode().strip() or r.returncode}")
 
 
 def cmd_leave(args):
@@ -743,81 +1025,91 @@ def cmd_leave(args):
     client = BlobClient(cfg["ACCOUNT"], cfg["CONTAINER"], cfg["SAS"])
     slug = slugify(args.cell)
     me = claim_identity(client, cfg["PREFIX"], slug)
-    gone = {"ts": now_iso(), "reason": args.reason or ""}
-    client.put_block(f"{cfg['PREFIX']}/{slug}/{me}/gone.json",
-                     json.dumps(gone).encode())
+    log = setup_logging(cfg, slug, me, sys.argv)
+    client.log = log
+    with subcommand_footer(log):
+        gone = {"ts": now_iso(), "reason": args.reason or ""}
+        client.put_block(f"{cfg['PREFIX']}/{slug}/{me}/gone.json",
+                         json.dumps(gone).encode())
 
 
 def cmd_read(args):
     """Print cell message history - the on-demand history tool. Filter by sender
     (--from), recipient (--to), and select with --ts or --last."""
     cfg = resolve_config()
-    client = BlobClient(cfg["ACCOUNT"], cfg["CONTAINER"], cfg["SAS"])
     slug = slugify(args.cell)
+    # cmd_read doesn't claim identity (read-only) so we don't know the actual
+    # `me` here. Use base_comrade_id() for the log path - close enough for the
+    # rare case of a sibling-session collision.
+    log = setup_logging(cfg, slug, base_comrade_id(), sys.argv)
+    client = BlobClient(cfg["ACCOUNT"], cfg["CONTAINER"], cfg["SAS"], log=log)
     prefix = cfg["PREFIX"]
 
-    senders = [args.from_] if args.from_ else cell_roster(client, prefix, slug)
-    msgs = []
-    for sender in senders:
-        st, body = client.get(gazette_path(prefix, slug, sender))
-        if st != 200:
-            continue
-        for line in body.splitlines():
-            try:
-                d = json.loads(line)
-            except ValueError:
+    with subcommand_footer(log):
+        senders = [args.from_] if args.from_ else cell_roster(client, prefix, slug)
+        msgs = []
+        for sender in senders:
+            st, body = client.get(gazette_path(prefix, slug, sender))
+            if st != 200:
                 continue
-            if d.get("type") == "message":
-                msgs.append(d)
+            for line in body.splitlines():
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if d.get("type") == "message":
+                    msgs.append(d)
 
-    if args.to:
-        msgs = [m for m in msgs if addressed_to_me(m.get("to") or ["*"], args.to)]
-    msgs.sort(key=lambda m: m.get("ts", ""))
+        if args.to:
+            msgs = [m for m in msgs if addressed_to_me(m.get("to") or ["*"], args.to)]
+        msgs.sort(key=lambda m: m.get("ts", ""))
 
-    if args.ts:
-        m = next((m for m in msgs if m.get("ts") == args.ts), None)
-        if not m:
-            sys.exit(f"error: no message with ts={args.ts!r}")
-        body = m.get("body", "")
-        sys.stdout.write(body if body.endswith("\n") else body + "\n")
-        return
+        if args.ts:
+            m = next((m for m in msgs if m.get("ts") == args.ts), None)
+            if not m:
+                sys.exit(f"error: no message with ts={args.ts!r}")
+            body = m.get("body", "")
+            sys.stdout.write(body if body.endswith("\n") else body + "\n")
+            return
 
-    if args.last is not None:
-        if args.last < 1:
-            sys.exit("error: --last must be >= 1")
-        msgs = msgs[-args.last:]
+        if args.last is not None:
+            if args.last < 1:
+                sys.exit("error: --last must be >= 1")
+            msgs = msgs[-args.last:]
 
-    if not msgs:
-        print("(no messages)")
-        return
-    for m in msgs:
-        print(f"from={m.get('from')} to={render_to(m.get('to', ['*']))} ts={m.get('ts')}")
-        print(m.get("body", ""))
-        print()
+        if not msgs:
+            print("(no messages)")
+            return
+        for m in msgs:
+            print(f"from={m.get('from')} to={render_to(m.get('to', ['*']))} ts={m.get('ts')}")
+            print(m.get("body", ""))
+            print()
 
 
 def cmd_rm(args):
     """Delete a cell and all its blobs. Destructive and user-directed: prints a
     summary first, and only deletes when --yes is given."""
     cfg = resolve_config()
-    client = BlobClient(cfg["ACCOUNT"], cfg["CONTAINER"], cfg["SAS"])
     slug = slugify(args.cell)
-    head = f"{cfg['PREFIX']}/{slug}/"
-    blobs = list(client.list(head))
-    if not blobs:
-        print(f"cell {slug!r} is empty or does not exist - nothing to delete")
-        return
-    comrades = sorted({n[len(head):].split("/", 1)[0]
-                       for n in blobs if "/" in n[len(head):]})
-    print(f"cell {slug!r}: {len(blobs)} blobs across {len(comrades)} comrades "
-          f"({', '.join(comrades)})")
-    if not args.yes:
-        print("dry run - pass --yes to actually delete")
-        return
-    for name in blobs:
-        st = client.request("DELETE", name)[0]
-        print(f"deleted {name} -> {st}")
-    print(f"cell {slug!r} removed")
+    log = setup_logging(cfg, slug, base_comrade_id(), sys.argv)
+    client = BlobClient(cfg["ACCOUNT"], cfg["CONTAINER"], cfg["SAS"], log=log)
+    with subcommand_footer(log):
+        head = f"{cfg['PREFIX']}/{slug}/"
+        blobs = list(client.list(head))
+        if not blobs:
+            print(f"cell {slug!r} is empty or does not exist - nothing to delete")
+            return
+        comrades = sorted({n[len(head):].split("/", 1)[0]
+                           for n in blobs if "/" in n[len(head):]})
+        print(f"cell {slug!r}: {len(blobs)} blobs across {len(comrades)} comrades "
+              f"({', '.join(comrades)})")
+        if not args.yes:
+            print("dry run - pass --yes to actually delete")
+            return
+        for name in blobs:
+            st = client.request("DELETE", name)[0]
+            print(f"deleted {name} -> {st}")
+        print(f"cell {slug!r} removed")
 
 
 def cmd_publish(args):
@@ -827,32 +1119,36 @@ def cmd_publish(args):
     client = BlobClient(cfg["ACCOUNT"], cfg["CONTAINER"], cfg["SAS"])
     slug = slugify(args.cell)
     me = claim_identity(client, cfg["PREFIX"], slug)
+    log = setup_logging(cfg, slug, me, sys.argv)
+    client.log = log
+    with subcommand_footer(log):
+        src = Path(os.path.abspath(os.path.expanduser(args.path)))
+        if not src.is_file():
+            sys.exit(f"error: not a regular file: {src}")
+        size = src.stat().st_size
+        if size > PUBLISH_MAX:
+            sys.exit(
+                f"error: {src} is {size} bytes, over the {PUBLISH_MAX}-byte single-PUT "
+                f"limit. cccp publish does one urllib PUT - it does not stage block "
+                f"lists. To publish a file this large, either:\n"
+                f"  1. ask the user to install azcopy (pip/brew) and upload with it, or\n"
+                f"  2. write an ad-hoc Put Block + Put Block List uploader, reading this "
+                f"script ({__file__}) as a reference for the SAS/REST setup.")
 
-    src = Path(os.path.abspath(os.path.expanduser(args.path)))
-    if not src.is_file():
-        sys.exit(f"error: not a regular file: {src}")
-    size = src.stat().st_size
-    if size > PUBLISH_MAX:
-        sys.exit(
-            f"error: {src} is {size} bytes, over the {PUBLISH_MAX}-byte single-PUT "
-            f"limit. cccp publish does one urllib PUT - it does not stage block "
-            f"lists. To publish a file this large, either:\n"
-            f"  1. ask the user to install azcopy (pip/brew) and upload with it, or\n"
-            f"  2. write an ad-hoc Put Block + Put Block List uploader, reading this "
-            f"script ({__file__}) as a reference for the SAS/REST setup.")
+        rel = str(src).lstrip("/")
+        data = src.read_bytes()
+        with TimeLogger(log, "publish_upload", path=rel, size=size):
+            st = client.put_block(f"{cfg['PREFIX']}/{slug}/{me}/files/{rel}", data)
+        if st != 201:
+            raise BlobError(st, b"publish upload failed")
 
-    rel = str(src).lstrip("/")
-    data = src.read_bytes()
-    st = client.put_block(f"{cfg['PREFIX']}/{slug}/{me}/files/{rel}", data)
-    if st != 201:
-        raise BlobError(st, b"publish upload failed")
-
-    d = {"type": "filesystem", "op": "publish", "ts": now_iso(), "from": me,
-         "to": args.to if args.to else ["*"], "path": f"files/{rel}", "size": size}
-    if src.suffix.lower() in TEXT_EXTENSIONS:
-        d["lines"] = data.count(b"\n")
-    append_dispatch(client, cfg["PREFIX"], slug, me, d)
-    print(f"published {rel} ({size} bytes)")
+        d = {"type": "filesystem", "op": "publish", "ts": now_iso(), "from": me,
+             "to": args.to if args.to else ["*"], "path": f"files/{rel}", "size": size}
+        if src.suffix.lower() in TEXT_EXTENSIONS:
+            d["lines"] = data.count(b"\n")
+        with TimeLogger(log, "publish_announce", path=rel):
+            append_dispatch(client, cfg["PREFIX"], slug, me, d)
+        print(f"published {rel} ({size} bytes)")
 
 
 def cmd_unpublish(args):
@@ -862,14 +1158,16 @@ def cmd_unpublish(args):
     client = BlobClient(cfg["ACCOUNT"], cfg["CONTAINER"], cfg["SAS"])
     slug = slugify(args.cell)
     me = claim_identity(client, cfg["PREFIX"], slug)
-
-    src = Path(os.path.abspath(os.path.expanduser(args.path)))
-    rel = str(src).lstrip("/")
-    client.request("DELETE", f"{cfg['PREFIX']}/{slug}/{me}/files/{rel}")  # 404 ok
-    d = {"type": "filesystem", "op": "unpublish", "ts": now_iso(), "from": me,
-         "to": args.to if args.to else ["*"], "path": f"files/{rel}"}
-    append_dispatch(client, cfg["PREFIX"], slug, me, d)
-    print(f"unpublished {rel}")
+    log = setup_logging(cfg, slug, me, sys.argv)
+    client.log = log
+    with subcommand_footer(log):
+        src = Path(os.path.abspath(os.path.expanduser(args.path)))
+        rel = str(src).lstrip("/")
+        client.request("DELETE", f"{cfg['PREFIX']}/{slug}/{me}/files/{rel}")  # 404 ok
+        d = {"type": "filesystem", "op": "unpublish", "ts": now_iso(), "from": me,
+             "to": args.to if args.to else ["*"], "path": f"files/{rel}"}
+        append_dispatch(client, cfg["PREFIX"], slug, me, d)
+        print(f"unpublished {rel}")
 
 
 def cmd_pull(args):
@@ -877,49 +1175,55 @@ def cmd_pull(args):
     local mirror. Synchronous; on success it is silent and exits 0, so Claude
     can chain it: `cccp pull <cell> <paths> && <follow-up>`."""
     cfg = resolve_config()
-    client = BlobClient(cfg["ACCOUNT"], cfg["CONTAINER"], cfg["SAS"])
     slug = slugify(args.cell)
+    # cmd_pull doesn't claim identity (it's a fetch, not a participation
+    # event); use base_comrade_id() for the log path.
+    log = setup_logging(cfg, slug, base_comrade_id(), sys.argv)
+    client = BlobClient(cfg["ACCOUNT"], cfg["CONTAINER"], cfg["SAS"], log=log)
     prefix = cfg["PREFIX"]
 
-    # Catalogue currently-published files across all gazettes; a later unpublish
-    # cancels an earlier publish of the same (sender, path). The value is the
-    # publish dispatch, kept so its claimed size / line count can be verified.
-    catalogue = {}  # (sender, wire_path) -> publish dispatch dict
-    for sender in cell_roster(client, prefix, slug):
-        st, body = client.get(gazette_path(prefix, slug, sender))
-        if st != 200:
-            continue
-        for line in body.splitlines():
-            try:
-                d = json.loads(line)
-            except ValueError:
+    with subcommand_footer(log):
+        # Catalogue currently-published files across all gazettes; a later unpublish
+        # cancels an earlier publish of the same (sender, path). The value is the
+        # publish dispatch, kept so its claimed size / line count can be verified.
+        catalogue = {}  # (sender, wire_path) -> publish dispatch dict
+        for sender in cell_roster(client, prefix, slug):
+            st, body = client.get(gazette_path(prefix, slug, sender))
+            if st != 200:
                 continue
-            if d.get("type") != "filesystem":
-                continue
-            key = (sender, d.get("path", ""))
-            if d.get("op") == "publish":
-                catalogue[key] = d
-            elif d.get("op") == "unpublish":
-                catalogue.pop(key, None)
+            for line in body.splitlines():
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if d.get("type") != "filesystem":
+                    continue
+                key = (sender, d.get("path", ""))
+                if d.get("op") == "publish":
+                    catalogue[key] = d
+                elif d.get("op") == "unpublish":
+                    catalogue.pop(key, None)
 
-    # Match each published file's original path against the expressions: an exact
-    # match, or the expression is a directory prefix of it.
-    exprs = [os.path.abspath(os.path.expanduser(e)) for e in args.expr]
-    wanted = [(sender, wp) for (sender, wp) in catalogue
-              if any(display_path(wp) == e
-                     or display_path(wp).startswith(e.rstrip("/") + "/")
-                     for e in exprs)]
-    if not wanted:
-        sys.exit(f"error: no published files match {args.expr}")
-    for sender, wire_path in wanted:
-        meta = catalogue[(sender, wire_path)]
-        try:
-            download_to_mirror(client, prefix, slug, sender, wire_path,
-                               expect_size=meta.get("size"),
-                               expect_lines=meta.get("lines"))
-        except BlobError as e:
-            sys.exit(f"error: {e}")
-    # success: silent, exit 0
+        # Match each published file's original path against the expressions: an exact
+        # match, or the expression is a directory prefix of it.
+        exprs = [os.path.abspath(os.path.expanduser(e)) for e in args.expr]
+        wanted = [(sender, wp) for (sender, wp) in catalogue
+                  if any(display_path(wp) == e
+                         or display_path(wp).startswith(e.rstrip("/") + "/")
+                         for e in exprs)]
+        if not wanted:
+            sys.exit(f"error: no published files match {args.expr}")
+        for sender, wire_path in wanted:
+            meta = catalogue[(sender, wire_path)]
+            try:
+                with TimeLogger(log, "pull_download", path=wire_path,
+                                size=meta.get("size", 0)):
+                    download_to_mirror(client, prefix, slug, sender, wire_path,
+                                       expect_size=meta.get("size"),
+                                       expect_lines=meta.get("lines"))
+            except BlobError as e:
+                sys.exit(f"error: {e}")
+        # success: silent, exit 0
 
 
 # ---------- argparse ----------
