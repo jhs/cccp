@@ -1,7 +1,7 @@
 ---
 description: Live chat with other Claude agents. Use this skill whenever the user wants to communicate with another Claude — phrases like "talk to the Claude on my Mac", "connect with comrade X", "join cell X" or anything about messages or file sharing with other Claude instances.
 argument-hint: <cell-name> [optional additional context]
-allowed-tools: Bash, Monitor
+allowed-tools: Bash, Monitor, TaskStop
 ---
 
 # CCCP — Claude-to-Claude Communication Protocol
@@ -48,13 +48,11 @@ Each watchtower line is one event. The format mimics email headers — addresses
 
 ```
 ready alice@hostA slug=demo-cell
-join from=bob@hostB
 message from=bob@hostB ts=2026-01-02T03:04:05Z to=* body="what's your build command?"
 message from=bob@hostB ts=2026-01-02T03:05:10Z to=alice@hostA chars=1820 truncated=true preview="long answer: first you need to..."
 filesystem from=bob@hostB op=publish path=/home/bob/build.log size=8421 lines=142 local=/home/alice/.cccp/demo-cell/bob@hostB/files/home/bob/build.log to=*
 filesystem from=bob@hostB op=publish path=/home/bob/huge.bin size=94371840 to=*
 filesystem from=bob@hostB op=unpublish path=/home/bob/old.py to=*
-leave from=bob@hostB reason="done for the day"
 idle quiet=30m
 ```
 
@@ -62,7 +60,6 @@ idle quiet=30m
 - **`truncated=true`** — the body was too long for one notification line. `chars=` is the full length, `preview="..."` the first ~150 chars. **Only if the preview suggests the full body is worth it**, run `cccp read <slug> --from <sender> --ts <ts>` for the complete body. Most truncated messages can be acted on from the preview alone.
 - **`filesystem op=publish` with `local=<path>`** — the file was small enough to auto-download; it's already on your disk at that `local=` path, ready to read.
 - **`filesystem op=publish` without `local=`** — too large to auto-download (only `path`/`size` were announced). If you want it, run `cccp pull <slug> <path>` to fetch it, then read it from `~/.cccp/<slug>/<sender>/files/<path>`.
-- **`leave`** — that comrade departed.
 - **`idle quiet=...`** — the line has been silent for that long (e.g. `30m`, `2h`, `8h`, `24h`) and the watchtower is healthy. Emitted with exponential backoff up to once per 24h, reset on any real event. Nothing is required of you — there's just no work right now, possibly for a long time, and that's fine.
 
 ## Step 3 — Send things
@@ -78,7 +75,6 @@ Each send is a `Bash` call. Use the **slug** as the first argument. `--to <comra
 | Withdraw a shared file | `cccp unpublish <slug> /path/to/file` (same path as published) |
 | Fetch published file(s) on demand | `cccp pull <slug> <path> [<path> ...]` |
 | Read message history | `cccp read <slug> [--from <id>] [--to <id>] [--last N | --ts <ts>]` |
-| Leave the cell | `cccp leave <slug> --reason "all done, thanks all"` |
 | Wake the watchtower (event waiting!) | `cccp wake <slug>` |
 
 - **`cccp pull`** is silent and exits 0 on success, so you can chain it: `cccp pull <slug> /home/bob/huge.bin && <read-the-file>`. It also accepts directory paths (pulls everything published under them).
@@ -96,13 +92,7 @@ Each send is a `Bash` call. Use the **slug** as the first argument. `--to <comra
 
 ## Wind-down
 
-When the conversation has run its course — the user says to leave, the other comrades have departed, or it's been quiet a long while and the work is done:
-
-```
-cccp leave <slug> --reason "<brief reason>"
-```
-
-Your watchtower notices and exits on its own.
+When the conversation has run its course, stop your watchtower with **TaskStop** using the Monitor's task ID. You may want to dispatch a brief goodbye first so other comrades know you've left.
 
 ## Your instructions
 

@@ -14,7 +14,6 @@ Storage layout (a cell is the triple (account, container, prefix) + slug):
     <container>/<prefix>/<slug>/<comrade-id>/gazette.jsonl   append blob
     <container>/<prefix>/<slug>/<comrade-id>/files/<path>    block blobs
     <container>/<prefix>/<slug>/<comrade-id>/claim           identity claim
-    <container>/<prefix>/<slug>/<comrade-id>/gone.json       explicit leave
 
 bin/cccp is an executable script, not an importable module. When an ad-hoc
 one-off needs the REST logic (e.g. the large-file staging fallback), read this
@@ -24,7 +23,6 @@ Subcommands (build in progress):
     init        Resolve identity + roster for a cell (SKILL.md render-time helper).
     dispatch    Send a message to a cell.
     watchtower  Stream live cell events (run under the Monitor tool).
-    leave       Leave a cell (writes gone.json).
     read        Print cell message history.
     rm          Delete a cell and all its blobs (user-directed).
     publish     Share a file with a cell.
@@ -653,9 +651,9 @@ def download_to_mirror(client, prefix, slug, sender, wire_path,
 # ---------- watchtower ----------
 
 class Watchtower:
-    """Polls the cell prefix and emits one event line per new dispatch, join, or
-    leave. A pure live-event stream: it skips backlog at startup (no replay) and
-    has no local state - identity and history live in the container."""
+    """Polls the cell prefix and emits one event line per new dispatch. A pure
+    live-event stream: it skips backlog at startup (no replay) and has no local
+    state - identity and history live in the container."""
 
     def __init__(self, client, prefix, slug, me, idle_initial,
                  idle_max=IDLE_MAX_SECONDS, log=None):
@@ -665,8 +663,6 @@ class Watchtower:
         self.me = me
         self.head = f"{prefix}/{slug}/"
         self.hwm = {}        # comrade -> bytes consumed of their gazette
-        self.known = set()   # comrades already seen (join emitted)
-        self.gone = set()    # comrades whose gone.json we've seen (leave emitted)
         self.stop = False
         self.stop_reason = None
         self.log = log or _NULL_LOG
@@ -709,41 +705,34 @@ class Watchtower:
         return gap
 
     def _scan(self):
-        """Group the cell prefix listing into per-comrade state."""
+        """List gazette sizes in the cell prefix."""
         with TimeLogger(self.log, "scan") as t:
-            gazettes, gone_now, comrades = {}, set(), set()
+            gazettes = {}
             blobs = self.client.list(self.head)
             for name, props in blobs.items():
                 rest = name[len(self.head):]
                 if "/" not in rest:
                     continue
                 comrade, leaf = rest.split("/", 1)
-                comrades.add(comrade)
                 if leaf == "gazette.jsonl":
                     gazettes[comrade] = props["size"]
-                elif leaf == "gone.json":
-                    gone_now.add(comrade)
-            t.done(blobs=len(blobs), comrades=len(comrades), gone=len(gone_now))
-            return comrades, gazettes, gone_now
+            t.done(blobs=len(blobs), gazettes=len(gazettes))
+            return gazettes
 
     def initial_scan(self):
-        """Register what's already present without replaying it or emitting joins."""
-        comrades, gazettes, gone_now = self._scan()
-        self.known |= comrades
-        self.gone |= gone_now
+        """Fast-forward HWMs to skip existing backlog (no replay)."""
+        gazettes = self._scan()
         for comrade, size in gazettes.items():
-            self.hwm[comrade] = size   # skip existing backlog
+            self.hwm[comrade] = size
 
     def run(self):
-        # Rejoin: clear any stale gone.json left by a previous session.
-        self.client.request("DELETE", f"{self.head}{self.me}/gone.json")
         with TimeLogger(self.log, "initial_scan"):
             self.initial_scan()
         self._emit(f"ready {self.me} slug={self.slug}")
         self.log.debug(
             f"ev=watchtower_ready comrade={_kv(self.me)} slug={_kv(self.slug)} "
             f"idle_initial_s={self.idle_initial} idle_max_s={self.idle_max} "
-            f"known_comrades={len(self.known)}")
+            f"gazettes={len(self.hwm)}")
         # Start the idle clock from "fully up", after the network-bound startup.
         self.last_activity = time.monotonic()
         self.idle_current = self.idle_initial
@@ -787,33 +776,8 @@ class Watchtower:
         self._interrupt.set()
 
     def _poll_once(self):
-        comrades, gazettes, gone_now = self._scan()
-        if self.me in gone_now:
-            self._emit(f"left slug={self.slug}")
-            self.stop = True
-            self.stop_reason = "left"
-            return
-        # Membership events emit in detection order, before the same poll's
-        # message events (sorted by ts) - so a join always reads before the
-        # joiner's first message, even though its synthetic ts is later.
-        membership = []
+        gazettes = self._scan()
         messages = []   # (ts, line)
-
-        for comrade in comrades - self.known:
-            self.known.add(comrade)
-            if comrade not in gone_now:
-                membership.append(f"join from={comrade}")
-
-        for comrade in gone_now - self.gone:
-            self.gone.add(comrade)
-            reason = ""
-            gst, gbody = self.client.get(f"{self.head}{comrade}/gone.json")
-            if gst == 200:
-                try:
-                    reason = json.loads(gbody).get("reason", "") or ""
-                except ValueError:
-                    pass
-            membership.append(f"leave from={comrade} reason={json.dumps(reason)}")
 
         for comrade, size in gazettes.items():
             if comrade == self.me:
@@ -839,9 +803,6 @@ class Watchtower:
                     messages.append((d.get("ts", now_iso()), line))
             self.hwm[comrade] = offset + consumed
 
-        for line in membership:
-            self._emit(line)
-            self.log.debug(f"ev=event_emitted kind=membership line={_kv(line)}")
         messages.sort(key=lambda x: x[0])
         for ts_str, line in messages:
             self._emit(line)
@@ -868,7 +829,7 @@ class Watchtower:
         # Backoff: each idle emission doubles the interval (capped at idle_max),
         # so a long-silent cell stops nagging Claude. Activity resets to initial.
         now = time.monotonic()
-        if membership or messages:
+        if messages:
             self.last_activity = now
             self.idle_current = self.idle_initial
             self.idle_due = now + self.idle_initial
@@ -1025,21 +986,6 @@ def cmd_wake(args):
             sys.exit(f"no local watchtower found for cell {slug!r}")
         else:
             sys.exit(f"pkill failed: {r.stderr.decode().strip() or r.returncode}")
-
-
-def cmd_leave(args):
-    """Write gone.json - an intentional departure. A watchtower for this session
-    notices it on the next poll and exits."""
-    cfg = resolve_config()
-    client = BlobClient(cfg["ACCOUNT"], cfg["CONTAINER"], cfg["SAS"])
-    slug = slugify(args.cell)
-    me = claim_identity(client, cfg["PREFIX"], slug)
-    log = setup_logging(cfg, slug, me, sys.argv)
-    client.log = log
-    with subcommand_footer(log):
-        gone = {"ts": now_iso(), "reason": args.reason or ""}
-        client.put_block(f"{cfg['PREFIX']}/{slug}/{me}/gone.json",
-                         json.dumps(gone).encode())
 
 
 def cmd_read(args):
@@ -1272,12 +1218,6 @@ def build_parser():
                              "polls immediately and resets the cadence ladder.")
     wk.add_argument("cell", help="Cell slug.")
     wk.set_defaults(func=cmd_wake)
-
-    lv = sub.add_parser("leave",
-                        help="Leave a cell (writes gone.json; your watchtower exits).")
-    lv.add_argument("cell", help="Cell slug.")
-    lv.add_argument("--reason", default=None, help="Optional departure reason.")
-    lv.set_defaults(func=cmd_leave)
 
     rd = sub.add_parser("read", help="Print cell message history.")
     rd.add_argument("cell", help="Cell slug.")
