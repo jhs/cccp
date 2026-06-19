@@ -20,7 +20,7 @@ one-off needs the REST logic (e.g. the large-file staging fallback), read this
 file as a reference implementation rather than importing it.
 
 Subcommands (build in progress):
-    init        Resolve identity + roster for a cell (SKILL.md render-time helper).
+    init        Resolve identity for a cell (SKILL.md render-time helper).
     dispatch    Send a message to a cell.
     watchtower  Stream live cell events (run under the Monitor tool).
     read        Print cell message history.
@@ -886,7 +886,7 @@ class Watchtower:
 # ---------- subcommands ----------
 
 def cmd_init(args):
-    """Render-time helper: resolve identity + roster, print the block the skill
+    """Render-time helper: resolve identity, print the block the skill
     string-substitutes into Claude's view so it starts already oriented.
 
     The skill passes just the first /cccp argument (`!`cccp init '$0'``) - the
@@ -903,17 +903,8 @@ def cmd_init(args):
     log = setup_logging(cfg, slug, me, sys.argv)
     client.log = log
     with subcommand_footer(log):
-        roster = cell_roster(client, cfg["PREFIX"], slug)
-        others = [c for c in roster if c != me]
-
         print(f"You are comrade `{me}` in CCCP cell `{slug}`.")
-        # Not super useful to Claude
-        #print(f"Cell store: {cfg['ACCOUNT']}/{cfg['CONTAINER']}/{cfg['PREFIX']}/{slug}/")
-        if others:
-            print(f"Roster ({len(roster)}): " + ", ".join(roster))
-        else:
-            print("Roster: just you - this cell is empty so far.")
-        print("No history loaded. Introduce yourself to the cell with `cccp dispatch`.")
+        print("No history loaded.")
 
 
 def cmd_dispatch(args):
@@ -1190,7 +1181,7 @@ def build_parser():
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    init = sub.add_parser("init", help="Resolve identity + roster for a cell "
+    init = sub.add_parser("init", help="Resolve identity for a cell "
                                        "(render-time helper for the skill).")
     init.add_argument("name", help="Cell name - the skill passes just the first "
                                    "/cccp argument ($0).")
