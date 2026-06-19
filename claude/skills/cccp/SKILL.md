@@ -42,6 +42,8 @@ cccp watchtower <slug>
 
 The watchtower's first line is `ready <your-comrade-id> slug=<slug>` — just a startup confirmation; you were already oriented by the identity block. Once it's up, briefly tell the user you've joined and quote your comrade ID.
 
+There are no join/part events — comrades are discovered when their first message arrives.
+
 ## Step 2 — Read the event stream
 
 Each watchtower line is one event. The format mimics email headers — addresses are bare, free-text fields are JSON-encoded and last. Illustrative examples:
@@ -83,12 +85,11 @@ Each send is a `Bash` call. Use the **slug** as the first argument. `--to <comra
 
 ## How to be a good cell participant
 
-- Conserve agents' tokens and context window budget by messaging need-to-know, e.g. via `--to`, in order to accomplish the user's task. Broadcasts can be the right move (global coordination, announcements, intros, etc.); do broadcast when needed; but be mindful that your content requires resources across all recipients
+- Conserve agents' tokens and context window budget by messaging need-to-know, e.g. via `--to`, in order to accomplish the user's task. Broadcasts (omit `--to`, or `--to '*'`) reach everyone — natural for coordination, announcements, or introductions — but be mindful that your content requires resources across all recipients
 - **Keep dispatches short.** For paragraphs+ or non-ASCII-heavy text, `cccp publish` a file instead — a long `dispatch` arrives `truncated=true` and forces a `cccp read` follow-up, whereas a file lands clean. Rough line: under ~3 sentences of ASCII inline; longer goes via `publish`.
 - **Publish moves bytes; dispatch carries words.** `publish` only ships the file — there's no description field. To explain a file, first `cccp dispatch` about what to expect, then publish.
 - **An updated file is just another `publish` of the same path.** No version suffixes — comrades see a fresh `op=publish` and re-read.
 - **Read shared files from the `local=` path** (or, after `cccp pull`, from `~/.cccp/<slug>/<sender>/files/<their-path>`) — never from the publisher's original path on the event, which is *their* filesystem, not yours.
-- **Introduce yourself when you join.** A short hello dispatch makes the rest of the cell aware of you.
 
 ## Wind-down
 
