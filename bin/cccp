@@ -46,6 +46,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -725,8 +726,28 @@ class Watchtower:
         self._interrupt = threading.Event()
         self.wake_requested = False
 
+    def _log(self, msg):
+        """Append timestamped diagnostics to a per-cell watchtower log. MUST NEVER
+        raise -- it is the last-resort record for when stdout/stderr are themselves
+        broken (#503 instrumentation): a captured traceback here turns the next
+        crash from inference into proof. This is distinct from self.log (the opt-in
+        CCCP_DEBUG logger); _log is always on and never depends on config."""
+        try:
+            path = LOCAL_MIRROR / self.slug / "watchtower.log"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a") as f:
+                f.write(f"{now_iso()} {msg}\n")
+        except Exception:
+            pass
+
     def _emit(self, line):
-        print(line, flush=True)
+        # Guard the stdout write: a harness/Monitor pipe disruption (BrokenPipe)
+        # must NOT kill the watchtower -- log it and skip; the next write succeeds
+        # once the pipe recovers (#503 guard).
+        try:
+            print(line, flush=True)
+        except (BrokenPipeError, OSError) as e:
+            self._log(f"_emit failed ({type(e).__name__}: {e}); line skipped: {line[:120]!r}")
 
     @staticmethod
     def _format_quiet(seconds):
@@ -791,19 +812,29 @@ class Watchtower:
                 self.log.debug(
                     f"ev=watchtower_error exc={type(e).__name__} "
                     f"msg={_kv(str(e))}")
+                # Last-resort always-on record (#503): a poll fault must not kill
+                # the loop. Capture the traceback so the next crash is proof.
+                self._log("poll_once exception (survived):\n" + traceback.format_exc())
             if self.stop:
                 break
             # Event.wait so SIGTERM/SIGINT/SIGUSR1 can break the sleep promptly;
             # Python 3 time.sleep is not interruptible by signals (PEP 475).
-            if self._interrupt.wait(timeout=self._next_sleep()):
-                self._interrupt.clear()
-                if self.wake_requested:
-                    self.wake_requested = False
-                    self.last_activity = time.monotonic()
-                    self.ladder_step = -1
-                    # Log in the main loop, not in the signal handler -
-                    # `logging` takes a lock and is not async-signal-safe.
-                    self.log.debug("ev=wake_received")
+            # Wrapped so a fault in the sleep/wake path can't silently kill the
+            # loop either (#503 belt), with a fallback sleep so a raising
+            # _next_sleep/wait can never spin a busy-loop.
+            try:
+                if self._interrupt.wait(timeout=self._next_sleep()):
+                    self._interrupt.clear()
+                    if self.wake_requested:
+                        self.wake_requested = False
+                        self.last_activity = time.monotonic()
+                        self.ladder_step = -1
+                        # Log in the main loop, not in the signal handler -
+                        # `logging` takes a lock and is not async-signal-safe.
+                        self.log.debug("ev=wake_received")
+            except Exception:
+                self._log("sleep/wake exception (survived):\n" + traceback.format_exc())
+                time.sleep(POLL_LADDER[-1])
         self.log.debug(
             f"ev=watchtower_stop reason={_kv(self.stop_reason or 'unknown')}")
 
