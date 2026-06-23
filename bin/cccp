@@ -55,6 +55,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 API_VERSION = "2023-11-03"
+CCCP_VERSION = "2.1.0"     # protocol/skill version, stamped on the watchtower
+                           # `ready` line so fleet skew is visible. Bump when the
+                           # wire/read semantics change (2.1.0 = dynamic preview-
+                           # widening + continuation read).
 DEFAULT_PREFIX = "__default__"
 CONFIG_PATH = Path.home() / ".config" / "cccp" / "config"
 POLL_LADDER = (            # seconds; the adaptive inter-poll gap. First entry is
@@ -790,7 +794,7 @@ class Watchtower:
     def run(self):
         with TimeLogger(self.log, "initial_scan"):
             self.initial_scan()
-        self._emit(f"ready {self.me} slug={self.slug}")
+        self._emit(f"ready {self.me} slug={self.slug} v={CCCP_VERSION}")
         self.log.debug(
             f"ev=watchtower_ready comrade={_kv(self.me)} slug={_kv(self.slug)} "
             f"idle_initial_s={self.idle_initial} idle_max_s={self.idle_max} "
