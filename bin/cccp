@@ -694,12 +694,15 @@ class Watchtower:
     state - identity and history live in the container."""
 
     def __init__(self, client, prefix, slug, me, idle_initial,
-                 idle_max=IDLE_MAX_SECONDS, log=None):
+                 idle_max=IDLE_MAX_SECONDS, log=None, quiet=()):
         self.client = client
         self.prefix = prefix
         self.slug = slug
         self.me = me
         self.head = f"{prefix}/{slug}/"
+        self.quiet = set(quiet)   # event types to handle but not emit (e.g. a
+                                  # coordination hub suppresses 'filesystem' - the
+                                  # file still auto-downloads, just no notify turn)
         self.hwm = {}        # comrade -> bytes consumed of their gazette
         self.stop = False
         self.stop_reason = None
@@ -889,7 +892,10 @@ class Watchtower:
         if t == "message":
             return render_message_event(d)
         if t == "filesystem":
-            return self._render_filesystem(d)
+            line = self._render_filesystem(d)   # keep the download/unpublish side
+            if t in self.quiet:                 # effect; suppress only the notification
+                return None
+            return line
         return None
 
     def _render_filesystem(self, d):
@@ -977,7 +983,8 @@ def cmd_watchtower(args):
     # No subcommand_footer here - the Watchtower emits its own ev=watchtower_stop
     # with a reason, which is the richer lifecycle record for a long-lived
     # process.
-    Watchtower(client, cfg["PREFIX"], slug, me, args.idle * 60, log=log).run()
+    Watchtower(client, cfg["PREFIX"], slug, me, args.idle * 60, log=log,
+               quiet=args.quiet).run()
 
 
 def cmd_wake(args):
@@ -1240,6 +1247,13 @@ def build_parser():
                          "heartbeat (default 30; 0 disables). Each subsequent "
                          "silent interval doubles, capped at 24h, and resets to "
                          "this initial value on any activity.")
+    wt.add_argument("--quiet", action="append", default=[], choices=["filesystem"],
+                    metavar="EVENT",
+                    help="Repeatable. Handle but don't emit this event type (the "
+                         "file still auto-downloads; only the notification is "
+                         "suppressed). A coordination hub passes `--quiet filesystem` "
+                         "to drop redundant publish pings when a pointer dispatch "
+                         "already announced the file.")
     wt.set_defaults(func=cmd_watchtower)
 
     wk = sub.add_parser("wake",
