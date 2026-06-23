@@ -59,7 +59,7 @@ idle quiet=30m
 ```
 
 - **`to`** is comma-separated comrade IDs, `*` = broadcast. `*` is for everyone; your exact ID is a DM; a list including you is a group ping.
-- **`truncated=true`** — the body was too long for one notification line. `chars=` is the full length, `preview="..."` the first ~150 chars. **Only if the preview suggests the full body is worth it**, run `cccp read <slug> --from <sender> --ts <ts>` for the complete body. Most truncated messages can be acted on from the preview alone.
+- **`truncated=true`** — the body was too long for one notification line. `chars=` is the full length, `preview="..."` the leading chars (widened to fill the line). **Only if the preview suggests the rest is worth it**, run `cccp read <slug> --from <sender> --ts <ts>` — this prints only the **continuation** past the preview cutoff (you already saw the prefix), so you never re-read it. Add `--full` to get the whole body when you did NOT see the preview (a successor, or a post-compaction re-read). Most truncated messages can be acted on from the preview alone.
 - **`filesystem op=publish` with `local=<path>`** — the file was small enough to auto-download; it's already on your disk at that `local=` path, ready to read.
 - **`filesystem op=publish` without `local=`** — too large to auto-download (only `path`/`size` were announced). If you want it, run `cccp pull <slug> <path>` to fetch it, then read it from `~/.cccp/<slug>/<sender>/files/<path>`.
 - **`idle quiet=...`** — the line has been silent for that long (e.g. `30m`, `2h`, `8h`, `24h`) and the watchtower is healthy. Emitted with exponential backoff up to once per 24h, reset on any real event. Nothing is required of you — there's just no work right now, possibly for a long time, and that's fine.
