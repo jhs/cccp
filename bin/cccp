@@ -66,7 +66,10 @@ POLL_LADDER = (            # seconds; the adaptive inter-poll gap. First entry i
                            # LIST against Azure Blob and a comrade takes
                            # multiple seconds just to emit a message anyway.
 TRUNCATE_THRESHOLD = 480   # render a header-only event above this many chars
-PREVIEW_BUDGET = 150       # preview chars carried on a truncated event
+PREVIEW_BUDGET = 150       # MINIMUM preview chars on a truncated event. The actual
+                           # budget is computed per-message to fill the truncated
+                           # line up to TRUNCATE_THRESHOLD (the Monitor envelope we
+                           # already pay for) - see preview_budget().
 IDLE_MAX_SECONDS = 24 * 3600   # cap for the idle backoff - past this, idles fire
                                # at most once a day so a long-silent watchtower
                                # stops forcing Claude to wake and respond
@@ -586,17 +589,29 @@ def addressed_to_me(to, me):
     return "*" in to or me in to
 
 
-def safe_preview_inner(body, max_inner_chars=PREVIEW_BUDGET):
-    """JSON-inner (no surrounding quotes) of a body prefix that fits the preview
-    budget after JSON-escaping, without splitting an escape sequence."""
+def preview_split(body, budget):
+    """Longest body prefix whose JSON-escaped inner (no surrounding quotes) fits
+    `budget`, without splitting an escape sequence. Returns (inner, n) where inner
+    is the escaped preview and n is how many BODY chars it consumed - so the reader
+    can be handed exactly body[n:] as the continuation."""
     n, inner = 0, ""
     while n < len(body):
         candidate = json.dumps(body[:n + 1])[1:-1]
-        if len(candidate) > max_inner_chars:
+        if len(candidate) > budget:
             break
         inner = candidate
         n += 1
-    return inner
+    return inner, n
+
+
+def preview_budget(frm, ts, to, nchars):
+    """Per-message preview budget: fill the truncated line up to TRUNCATE_THRESHOLD
+    (the Monitor envelope) rather than a fixed 150, so we use the ~200 chars of
+    envelope the header leaves on the table. Floored at PREVIEW_BUDGET so a
+    many-recipient header still yields a usable preview."""
+    fixed = (f"message from={frm} ts={ts} to={to} "
+             f"chars={nchars} truncated=true preview=\"\"")
+    return max(PREVIEW_BUDGET, TRUNCATE_THRESHOLD - len(fixed))
 
 
 def render_message_event(d):
@@ -605,7 +620,8 @@ def render_message_event(d):
     full = f"message from={d['from']} ts={d['ts']} to={to} body={json.dumps(body)}"
     if len(full) <= TRUNCATE_THRESHOLD:
         return full
-    preview = safe_preview_inner(body)
+    budget = preview_budget(d["from"], d["ts"], to, len(body))
+    preview, _ = preview_split(body, budget)
     return (f"message from={d['from']} ts={d['ts']} to={to} "
             f"chars={len(body)} truncated=true preview=\"{preview}\"")
 
