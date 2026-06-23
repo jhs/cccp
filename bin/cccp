@@ -69,7 +69,10 @@ TRUNCATE_THRESHOLD = 480   # render a header-only event above this many chars
 PREVIEW_BUDGET = 150       # MINIMUM preview chars on a truncated event. The actual
                            # budget is computed per-message to fill the truncated
                            # line up to TRUNCATE_THRESHOLD (the Monitor envelope we
-                           # already pay for) - see preview_budget().
+                           # already pay for) - see preview_budget(). The reader
+                           # gets the body remainder PAST this cutoff via
+                           # `cccp read --ts` (continuation), so a wider preview
+                           # here shrinks every follow-up read.
 IDLE_MAX_SECONDS = 24 * 3600   # cap for the idle backoff - past this, idles fire
                                # at most once a day so a long-silent watchtower
                                # stops forcing Claude to wake and respond
@@ -626,6 +629,25 @@ def render_message_event(d):
             f"chars={len(body)} truncated=true preview=\"{preview}\"")
 
 
+def message_read_output(d, full=False):
+    """What `cccp read --ts` prints for one message. Default = the body remainder
+    PAST the watchtower preview cutoff (with a marker), so the reader doesn't
+    re-pay for the prefix it already saw in the event. full=True (or an
+    untruncated message) returns the whole body. The split point is recomputed
+    from the same preview_budget/preview_split the watchtower used, so it matches
+    byte-for-byte - no delivery state is stored."""
+    body = d.get("body", "")
+    to = render_to(d.get("to", ["*"]))
+    full_line = f"message from={d['from']} ts={d['ts']} to={to} body={json.dumps(body)}"
+    if full or len(full_line) <= TRUNCATE_THRESHOLD:
+        return body
+    budget = preview_budget(d["from"], d["ts"], to, len(body))
+    _, n = preview_split(body, budget)
+    marker = (f"[continuation from char {n} of {len(body)} -- first {n} chars were "
+              f"in the watchtower preview; re-run with --full for the whole message]")
+    return f"{marker}\n{body[n:]}"
+
+
 def render_filesystem_event(d):
     parts = [f"filesystem from={d['from']} op={d.get('op')} "
              f"path={display_path(d.get('path', ''))}"]
@@ -1030,8 +1052,8 @@ def cmd_read(args):
             m = next((m for m in msgs if m.get("ts") == args.ts), None)
             if not m:
                 sys.exit(f"error: no message with ts={args.ts!r}")
-            body = m.get("body", "")
-            sys.stdout.write(body if body.endswith("\n") else body + "\n")
+            out = message_read_output(m, full=args.full)
+            sys.stdout.write(out if out.endswith("\n") else out + "\n")
             return
 
         if args.last is not None:
@@ -1236,6 +1258,11 @@ def build_parser():
     g.add_argument("--ts", help="Print only the message with this exact timestamp.")
     g.add_argument("--last", type=int, metavar="N",
                    help="Print only the last N messages.")
+    rd.add_argument("--full", action="store_true",
+                    help="With --ts: print the whole body. Default prints only the "
+                         "continuation past the watchtower preview cutoff (the "
+                         "prefix you already saw). Use when you never saw the "
+                         "preview - a successor or post-compaction read.")
     rd.set_defaults(func=cmd_read)
 
     rm = sub.add_parser("rm",
