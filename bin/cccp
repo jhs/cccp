@@ -648,8 +648,7 @@ def message_read_output(d, full=False):
         return body
     budget = preview_budget(d["from"], d["ts"], to, len(body))
     _, n = preview_split(body, budget)
-    marker = (f"[continuation from char {n} of {len(body)} -- first {n} chars were "
-              f"in the watchtower preview; re-run with --full for the whole message]")
+    marker = f"[…from char {n}]"
     return f"{marker}\n{body[n:]}"
 
 
