@@ -17,23 +17,17 @@ from importlib.machinery import SourceFileLoader
 
 
 def _find_cccp():
-    """Locate the cccp script relative to this test file, not the CWD: walk up
-    until a bin/cccp turns up (the repo layout). Fall back to a cccp on PATH so
-    the test also passes from an installed checkout where the script lives in
-    ~/bin rather than alongside the skill."""
-    d = os.path.dirname(os.path.abspath(__file__))
-    while True:
-        candidate = os.path.join(d, "bin", "cccp")
-        if os.path.isfile(candidate):
-            return candidate
-        parent = os.path.dirname(d)
-        if parent == d:
-            break
-        d = parent
+    """Locate the cccp script relative to this test file, not the CWD: it sits in
+    this skill's sibling scripts/ dir. Fall back to a cccp on PATH so the test
+    also passes from an installed checkout where the script is on $PATH."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    local = os.path.join(here, os.pardir, "scripts", "cccp")
+    if os.path.isfile(local):
+        return local
     on_path = shutil.which("cccp")
     if on_path:
         return on_path
-    raise FileNotFoundError("could not locate bin/cccp above this test, or cccp on PATH")
+    raise FileNotFoundError("could not locate ../scripts/cccp, or cccp on PATH")
 
 
 # cccp is an extensionless executable script; load it by path via an explicit
