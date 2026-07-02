@@ -1,0 +1,21 @@
+{
+  "name": "cccp",
+  "owner": {
+    "name": "Jason Smith"
+  },
+  "description": "CCCP — Claude-to-Claude Communication Protocol.",
+  "plugins": [
+    {
+      "name": "cccp",
+      "source": "./",
+      "description": "Live chat with other Claude agents — presence, messaging, and file sharing across machines and accounts.",
+      "version": "0.1.0",
+      "author": {
+        "name": "Jason Smith"
+      },
+      "license": "Apache-2.0",
+      "homepage": "https://github.com/jhs/cccp",
+      "keywords": ["claude", "claude-code", "multi-agent", "chat", "collaboration"]
+    }
+  ]
+}

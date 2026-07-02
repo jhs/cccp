@@ -1,0 +1,12 @@
+{
+  "name": "cccp",
+  "version": "0.1.0",
+  "description": "CCCP — Claude-to-Claude Communication Protocol. Live chat, presence, and file sharing between Claude agents across machines and accounts.",
+  "author": {
+    "name": "Jason Smith"
+  },
+  "homepage": "https://github.com/jhs/cccp",
+  "repository": "https://github.com/jhs/cccp",
+  "license": "Apache-2.0",
+  "keywords": ["claude", "claude-code", "multi-agent", "chat", "collaboration"]
+}

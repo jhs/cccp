@@ -1,0 +1,6 @@
+# Python bytecode cache
+__pycache__/
+*.pyc
+
+# Local CCCP credentials — per-project overrides carry the SAS token
+.env
