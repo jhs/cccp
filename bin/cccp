@@ -170,7 +170,7 @@ def resolve_config(start=None):
     __default__, so a config only needs ACCOUNT, CONTAINER, and SAS.
 
     Any CCCP_* key the chosen file doesn't carry falls back to the process
-    environment - so `export CCCP_DEBUG=1` in bashrc.d flips verbose logging
+    environment - so `export CCCP_DEBUG=1` in your shell profile flips verbose logging
     on globally without touching the (gitignored, SAS-bearing) generated
     config file. The file is authoritative when it speaks; env fills gaps.
 
@@ -189,7 +189,7 @@ def resolve_config(start=None):
         if not CONFIG_PATH.is_file():
             sys.exit(f"error: no CCCP config - no .env with CCCP_* keys at or "
                      f"above {start}, and {CONFIG_PATH} is missing "
-                     f"(run tf/apply.sh, then install.sh)")
+                     f"(run infra/azure/apply.sh)")
         found = _parse_cccp_env(CONFIG_PATH)
 
     for k, v in os.environ.items():

@@ -7,7 +7,7 @@
 # The SAS credential is deliberately NOT managed here — apply.sh mints it at
 # apply time so the credential's lifecycle stays out of Terraform state.
 #
-# Rarely run, and only via apply.sh — never by install.sh.
+# Rarely run, and only via apply.sh.
 
 terraform {
   required_version = ">= 1.5"
@@ -24,9 +24,9 @@ terraform {
 }
 
 provider "azurerm" {
-  # "your Azure subscription" — the only subscription on the account. Pinned
-  # explicitly (as other projects do) so it's unambiguous. Not a secret.
-  subscription_id = "<AZURE_SUBSCRIPTION_ID>"
+  # Which subscription to deploy into. Leave var.subscription_id null to use
+  # whatever the az CLI has selected (see: az account show).
+  subscription_id = var.subscription_id
   features {}
 }
 

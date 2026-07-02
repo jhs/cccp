@@ -21,3 +21,9 @@ variable "container_name" {
   type        = string
   default     = "cccp"
 }
+
+variable "subscription_id" {
+  description = "Azure subscription ID for the CCCP hub. Leave null to use the az CLI's currently selected subscription."
+  type        = string
+  default     = null
+}

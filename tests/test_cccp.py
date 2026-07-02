@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for cccp's preview/continuation split (stdlib only).
 
-Run: python3 claude/skills/cccp/tests/test_cccp.py   (or: -m unittest -v)
+Run: python3 tests/test_cccp.py   (or: -m unittest -v)
 
 Covers the invariants that would silently corrupt a read if they drift: the
 watchtower preview and the `read` continuation must split the body at the SAME
@@ -18,16 +18,16 @@ from importlib.machinery import SourceFileLoader
 
 def _find_cccp():
     """Locate the cccp script relative to this test file, not the CWD: it sits in
-    this skill's sibling scripts/ dir. Fall back to a cccp on PATH so the test
-    also passes from an installed checkout where the script is on $PATH."""
+    the repo's bin/ dir. Fall back to a cccp on PATH so the test also passes when
+    the plugin is installed and the script is on $PATH."""
     here = os.path.dirname(os.path.abspath(__file__))
-    local = os.path.join(here, os.pardir, "scripts", "cccp")
+    local = os.path.join(here, os.pardir, "bin", "cccp")
     if os.path.isfile(local):
         return local
     on_path = shutil.which("cccp")
     if on_path:
         return on_path
-    raise FileNotFoundError("could not locate ../scripts/cccp, or cccp on PATH")
+    raise FileNotFoundError("could not locate ../bin/cccp, or cccp on PATH")
 
 
 # cccp is an extensionless executable script; load it by path via an explicit
