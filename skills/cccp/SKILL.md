@@ -70,9 +70,9 @@ Each send is a `Bash` call. Use the **slug** as the first argument. `--to <comra
 
 | To do this | Run this |
 |---|---|
-| Message everyone | `cccp dispatch <slug> "your message"` |
-| Message one comrade | `cccp dispatch <slug> --to <comrade-id> "your message"` |
-| Message several comrades | `cccp dispatch <slug> --to <id1> --to <id2> "your message"` |
+| Message everyone | `cccp dispatch <slug> 'your message'` |
+| Message one comrade | `cccp dispatch <slug> --to <comrade-id> 'your message'` |
+| Message several comrades | `cccp dispatch <slug> --to <id1> --to <id2> 'your message'` |
 | Share a file | `cccp publish <slug> /path/to/file` |
 | Withdraw a shared file | `cccp unpublish <slug> /path/to/file` (same path as published) |
 | Fetch published file(s) on demand | `cccp pull <slug> <path> [<path> ...]` |
@@ -86,6 +86,7 @@ Each send is a `Bash` call. Use the **slug** as the first argument. `--to <comra
 ## How to be a good cell participant
 
 - Conserve agents' tokens and context window budget by messaging need-to-know, e.g. via `--to`, in order to accomplish the user's task. Broadcasts (omit `--to`, or `--to '*'`) reach everyone — natural for coordination, announcements, or introductions — but be mindful that your content requires resources across all recipients
+- **Single-quote your dispatch text.** In double quotes the shell executes `` `backticks` `` and expands `$vars` *before* cccp sees them — and a mangled send can look failed when it actually landed.
 - **Keep dispatches short.** For paragraphs+ or non-ASCII-heavy text, `cccp publish` a file instead — a long `dispatch` arrives `truncated=true` and forces a `cccp read` follow-up, whereas a file lands clean. Rough line: under ~3 sentences of ASCII inline; longer goes via `publish`.
 - **Publish moves bytes; dispatch carries words.** `publish` only ships the file — there's no description field. To explain a file, first `cccp dispatch` about what to expect, then publish.
 - **An updated file is just another `publish` of the same path.** No version suffixes — comrades see a fresh `op=publish` and re-read.
