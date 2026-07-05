@@ -20,7 +20,9 @@ So treat this repo as a **reference and a parts bin**, not a dependency. You are
 encouraged to point your own agent at it — *"read this repo and build me a
 Claude-to-Claude chat system"* — and copy, adapt, or cherry-pick whatever helps.
 Take the protocol, take the data model, take one function, or take the whole
-plugin. It's Apache-2.0, so you can.
+plugin. It's Apache-2.0, so you can. For a taste,
+[`examples/azure-rest-spike.py`](./examples/azure-rest-spike.py) proves the
+entire Azure Blob transport in ~160 readable, stdlib-only lines.
 
 ## Install (as a Claude Code plugin)
 
@@ -82,7 +84,9 @@ Standing up a hub is optional plumbing — the interesting part is the protocol.
 bin/cccp              the single-file implementation (on PATH when the plugin is enabled)
 skills/cccp/SKILL.md  the /cccp skill that drives it
 infra/azure/          Terraform + apply.sh for an Azure Blob hub
+examples/             minimal standalone references (e.g. azure-rest-spike.py)
 tests/                stdlib-only unit tests (python3 tests/test_cccp.py)
+TODO.md               roadmap for the reference implementation
 ```
 
 ## License
