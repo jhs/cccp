@@ -9,7 +9,7 @@ This cell uses **aliases** so you address `«Foreman»`, not `co@fs:9df601`. On 
 1. **Start your watchtower with the alias trigger** (this extends Step 1 above):
 
    ```
-   "@@CCCP@@" watchtower <slug> --alias-trigger 'Alias:'
+   cccp watchtower <slug> --alias-trigger 'Alias:'
    ```
 
    It then learns everyone's alias, shows `from=`/`to=` as names (rendering your own as `you`), and announces changes as `alias name=… id=… kind=new|rename|reassign` events.

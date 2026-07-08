@@ -18,7 +18,7 @@ from unittest import mock
 
 def _find_cccp():
     here = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(here, os.pardir, "scripts", "cccp")
+    return os.path.join(here, os.pardir, "bin", "cccp")
 
 
 # cccp is an extensionless executable script; load it by path via an explicit
@@ -204,24 +204,25 @@ class SkillRender(unittest.TestCase):
     a literal <slug> placeholder the reader fills from its args, NOT a token."""
 
     TEMPLATE = (
-        "cmd is @@CCCP@@\n"
+        "run: cccp watchtower <slug>\n"
         "You are `@@COMRADE_ID@@`.\n"
-        "run: \"@@CCCP@@\" watchtower <slug>\n"
+        "still you: `@@COMRADE_ID@@`\n"
         "shell note: `$vars` and `{\"json\": 1}` stay literal; email a@b unchanged\n"
     )
 
     def _render(self):
-        return cccp.render_skill_body(
-            self.TEMPLATE, "alice@hostA:aaaaaa", "/plug/scripts/cccp")
+        return cccp.render_skill_body(self.TEMPLATE, "alice@hostA:aaaaaa")
 
     def test_all_tokens_resolved(self):
         self.assertNotIn("@@", self._render())  # no token delimiter survives
 
     def test_values_substituted(self):
-        out = self._render()
-        self.assertIn("cmd is /plug/scripts/cccp", out)
-        self.assertIn("You are `alice@hostA:aaaaaa`.", out)
-        self.assertIn('"/plug/scripts/cccp" watchtower <slug>', out)
+        self.assertIn("You are `alice@hostA:aaaaaa`.", self._render())
+
+    def test_bare_cccp_command_untouched(self):
+        """`cccp` is a bare $PATH command now, not a token - it passes through
+        verbatim with no path injected."""
+        self.assertIn("run: cccp watchtower <slug>", self._render())
 
     def test_non_token_content_untouched(self):
         """Shell `$vars`, JSON braces, bare single-@ emails, and the <slug>
@@ -232,8 +233,8 @@ class SkillRender(unittest.TestCase):
         self.assertIn("<slug>", out)
 
     def test_repeated_token_all_occurrences(self):
-        """@@CCCP@@ appears 2x in the template; every one is replaced."""
-        self.assertEqual(self._render().count("/plug/scripts/cccp"), 2)
+        """@@COMRADE_ID@@ appears 2x in the template; every one is replaced."""
+        self.assertEqual(self._render().count("alice@hostA:aaaaaa"), 2)
 
 
 class SkillTemplateFile(unittest.TestCase):
@@ -247,13 +248,12 @@ class SkillTemplateFile(unittest.TestCase):
             return f.read()
 
     def test_ships_and_renders_clean(self):
-        rendered = cccp.render_skill_body(
-            self._template(), "bob@hostB:1a2b3c", "/x/scripts/cccp")
+        rendered = cccp.render_skill_body(self._template(), "bob@hostB:1a2b3c")
         self.assertNotIn("@@", rendered)                     # no unresolved token
-        self.assertNotIn("${CLAUDE_PLUGIN_ROOT}", rendered)  # path fully resolved
+        self.assertNotIn("${CLAUDE_PLUGIN_ROOT}", rendered)  # no path token in body
         self.assertNotIn("$ARGUMENTS", rendered)             # args come from SKILL.md
         self.assertIn("bob@hostB:1a2b3c", rendered)
-        self.assertIn("/x/scripts/cccp", rendered)
+        self.assertIn("cccp watchtower <slug>", rendered)    # bare command, no path
         self.assertIn("<slug>", rendered)                    # slug stays a placeholder
 
 

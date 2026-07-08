@@ -5,6 +5,6 @@ argument-hint: <cell-name> [optional additional context]
 allowed-tools: Bash, Monitor, TaskStop
 ---
 
-!`"${CLAUDE_PLUGIN_ROOT}/scripts/cccp" skill foreman`
+!`"${CLAUDE_PLUGIN_ROOT}/bin/cccp" skill foreman`
 
 User arguments: $ARGUMENTS

@@ -18,7 +18,7 @@ A comrade is registered in a cell purely by having a gazette - identity is a
 local `user@host:<session>` computed offline, so there is no claim blob and no
 coordination step; comrades are discovered when their first message arrives.
 
-scripts/cccp is an executable script, not an importable module. When an ad-hoc
+bin/cccp is an executable script, not an importable module. When an ad-hoc
 one-off needs the REST logic (e.g. the large-file staging fallback), read this
 file as a reference implementation rather than importing it.
 
@@ -1123,33 +1123,26 @@ class Watchtower:
 # ---------- skill rendering ----------
 
 def plugin_root():
-    """The plugin install directory. This script lives at <root>/scripts/cccp,
-    so the root is two parents up - true both in the repo and in the installed
-    plugin cache (~/.claude/plugins/cache/<mp>/<plugin>/<ver>/scripts/cccp)."""
+    """The plugin install directory. This script lives at <root>/bin/cccp, so the
+    root is two parents up - true both in the repo and in the installed plugin
+    cache (~/.claude/plugins/cache/<mp>/<plugin>/<ver>/bin/cccp)."""
     return Path(__file__).resolve().parent.parent
 
 
-def cccp_command_path():
-    """Absolute path to this script, for embedding in rendered skill text so the
-    reader runs the exact binary that rendered the skill - no $PATH assumption."""
-    return str(Path(__file__).resolve())
-
-
-def render_skill_body(template, comrade_id, cccp_path):
+def render_skill_body(template, comrade_id):
     """Substitute the render-time tokens into the skill body template.
 
-    Only two tokens exist: @@COMRADE_ID@@ (this session's id) and @@CCCP@@ (the
-    absolute path to this script). The cell slug is NOT a token - it stays the
-    literal placeholder `<slug>`, which the reader fills from its own invocation
-    arguments, so the rendered body is fully determined by the comrade id alone.
+    Only one token exists: @@COMRADE_ID@@ (this session's id). The cell slug is
+    NOT a token - it stays the literal placeholder `<slug>`, which the reader
+    fills from its own invocation arguments, so the rendered body is fully
+    determined by the comrade id alone. `cccp` itself is a bare command on $PATH
+    (shipped in <root>/bin), so the body says `cccp ...` with no path to inject.
 
     @@NAME@@ delimiters are used deliberately, NOT $ or {} - the skill text is full
     of shell `$vars`/`$0` and JSON `{...}` a str.format/Template pass would corrupt.
     @@ never occurs in the body. Output is spliced verbatim by Claude Code and is
     NOT re-rendered, so every token must be resolved here."""
-    return (template
-            .replace("@@CCCP@@", cccp_path)
-            .replace("@@COMRADE_ID@@", comrade_id))
+    return template.replace("@@COMRADE_ID@@", comrade_id)
 
 
 # Each skill is its stack of body.template.md parts, base first - `cccp skill
@@ -1180,12 +1173,12 @@ was given. Ask the user which cell to join before doing anything else."""
 def compose_skill(name):
     """Return a skill's whole body: its stack of templates rendered base-first,
     joined, with the shared args outro last. Pure and hermetic - the only inputs
-    are the local comrade id, this script's path, and on-disk templates."""
+    are the local comrade id and on-disk templates."""
     stack = SKILL_STACK.get(name)
     if stack is None:
         sys.exit(f"cccp skill error: unknown skill {name!r}; "
                  f"known: {', '.join(sorted(SKILL_STACK))}")
-    me, cccp_path = comrade_id(), cccp_command_path()
+    me = comrade_id()
     parts = []
     for part in stack:
         template_path = plugin_root() / "skills" / part / "body.template.md"
@@ -1193,7 +1186,7 @@ def compose_skill(name):
             template = template_path.read_text(encoding="utf-8")
         except OSError as e:
             sys.exit(f"cccp skill error: cannot read template {template_path}: {e}")
-        parts.append(render_skill_body(template, me, cccp_path).strip())
+        parts.append(render_skill_body(template, me).strip())
     parts.append(ARGS_OUTRO.strip())
     return "\n\n".join(parts) + "\n"
 

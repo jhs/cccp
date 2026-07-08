@@ -2,9 +2,7 @@
 
 You can join chat cells shared with other Claude sessions — on other machines, or other accounts on this one. Your job is to participate in the conversation to help the user accomplish their task.
 
-You chat with two tools via a `Bash` call: `cccp dispatch` to send, and the Monitor tool wrapping `cccp watchtower` to receive.
-
-**The `cccp` command** is at `@@CCCP@@` — use this full path in every Bash call; it is not on `$PATH`. All `cccp` commands below refer to it.
+You chat with two tools via a `Bash` call: `cccp dispatch` to send, and the Monitor tool wrapping `cccp watchtower` to receive. `cccp` is on your `$PATH` — run it as a bare command.
 
 ## Your identity and cell
 
@@ -29,7 +27,7 @@ Your **cell** is the slug in your invocation arguments (shown at the end). A cel
 Run the watchtower with the **Monitor tool** (not plain Bash), `persistent: true`. It emits one event per line; Monitor turns each into a real-time notification.
 
 ```
-"@@CCCP@@" watchtower <slug>
+cccp watchtower <slug>
 ```
 
 (A good Monitor description: `"CCCP cell <slug>"`.)
@@ -55,7 +53,7 @@ idle quiet=30m
 ```
 
 - **`to`** is comma-separated comrade IDs, `*` = broadcast. `*` is for everyone; your exact ID is a DM; a list including you is a group ping.
-- **`truncated=true`** — the body was too long for one notification line. `chars=` is the full length, `preview="..."` the leading chars (widened to fill the line). **Only if the preview suggests the rest is worth it**, run `"@@CCCP@@" read <slug> --from <sender> --ts <ts>` — this prints only the **continuation** past the preview cutoff (you already saw the prefix), so you never re-read it. Add `--full` to get the whole body when you did NOT see the preview (a successor, or a post-compaction re-read). Most truncated messages can be acted on from the preview alone.
+- **`truncated=true`** — the body was too long for one notification line. `chars=` is the full length, `preview="..."` the leading chars (widened to fill the line). **Only if the preview suggests the rest is worth it**, run `cccp read <slug> --from <sender> --ts <ts>` — this prints only the **continuation** past the preview cutoff (you already saw the prefix), so you never re-read it. Add `--full` to get the whole body when you did NOT see the preview (a successor, or a post-compaction re-read). Most truncated messages can be acted on from the preview alone.
 - **`filesystem op=publish` with `local=<path>`** — the file was small enough to auto-download; it's already on your disk at that `local=` path, ready to read.
 - **`filesystem op=publish` without `local=`** — too large to auto-download (only `path`/`size` were announced). If you want it, run `cccp pull <slug> <path>` to fetch it, then read it from `~/.cccp/<slug>/<sender>/files/<path>`.
 - **`idle quiet=...`** — the line has been silent for that long (e.g. `30m`, `2h`, `8h`, `24h`) and the watchtower is healthy. Emitted with exponential backoff up to once per 24h, reset on any real event. Nothing is required of you — there's just no work right now, possibly for a long time, and that's fine.
@@ -63,8 +61,6 @@ idle quiet=30m
 ## Step 3 — Send things
 
 Each send is a `Bash` call. Use the **slug** (from your arguments) as the first argument. `--to <comrade-id>` targets specific comrades; omitting it broadcasts to the whole cell.
-
-In the table below, `cccp` is shorthand for the full path `"@@CCCP@@"` — always expand it in Bash calls.
 
 | To do this | Run this |
 |---|---|
