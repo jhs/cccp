@@ -84,7 +84,7 @@ Standing up a hub is optional plumbing — the interesting part is the protocol.
 ```
 .claude-plugin/       plugin manifest and marketplace catalog
 scripts/cccp          the single-file implementation (referenced via ${CLAUDE_PLUGIN_ROOT})
-skills/chat/SKILL.md  the /cccp:chat skill that drives it
+skills/               the /cccp:* skills (chat, team, …), stacked at render time by `cccp skill`
 infra/azure/          Terraform + apply.sh for an Azure Blob hub
 examples/             minimal standalone references (e.g. azure-rest-spike.py)
 tests/                stdlib-only unit tests (python3 tests/test_cccp.py)

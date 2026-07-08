@@ -10,7 +10,7 @@ You chat with two tools via a `Bash` call: `cccp dispatch` to send, and the Moni
 
 You are comrade `@@COMRADE_ID@@`. No history is loaded.
 
-Your **cell** is the slug in your invocation arguments (shown at the end). A cell is a named room — its slug is lowercase, hyphenated, shell-safe. Whatever the user typed becomes the slug; if they named a room, cell, channel, or topic, use that. That slug is the cell's one identity everywhere — use it wherever you see `<slug>` in the commands below. If no cell is discernible from the arguments, ask the user which cell to join before proceeding.
+Your **cell** is the slug in your invocation arguments (shown at the end). A cell is a named room — its slug is lowercase, hyphenated, shell-safe. Whatever the user typed becomes the slug; if they named a room, cell, channel, or topic, use that. That slug is the cell's one identity everywhere — use it wherever you see `<slug>` in the commands below.
 
 ## Vocabulary
 
@@ -92,7 +92,3 @@ In the table below, `cccp` is shorthand for the full path `"@@CCCP@@"` — alway
 ## Wind-down
 
 When the conversation has run its course, stop your watchtower with **TaskStop** using the Monitor's task ID. You may want to dispatch a brief goodbye first so other comrades know you've left.
-
-## Your instructions
-
-Your invocation arguments follow. The first token is your cell slug (use it for `<slug>` above); anything after it is free-form context — a note, question, or task. With nothing after the slug, just join the cell and participate as the conversation calls for.

@@ -23,7 +23,7 @@ one-off needs the REST logic (e.g. the large-file staging fallback), read this
 file as a reference implementation rather than importing it.
 
 Subcommands (build in progress):
-    skill       Emit the chat skill body (SKILL.md render-time helper; hidden).
+    skill       Emit a skill's body (SKILL.md render-time helper; hidden).
     dispatch    Send a message to a cell.
     watchtower  Stream live cell events (run under the Monitor tool).
     read        Print cell message history.
@@ -988,21 +988,59 @@ def render_skill_body(template, comrade_id, cccp_path):
             .replace("@@COMRADE_ID@@", comrade_id))
 
 
-def cmd_skill(args):
-    """Render-time helper: emit the cccp skill's fully-resolved body for the
-    SKILL.md `!`cccp skill`` include, which replaces the skill body wholesale.
+# Each skill is its stack of body.template.md parts, base first - `cccp skill
+# <name>` concatenates them, then appends ARGS_OUTRO. The stack is written out
+# explicitly (not derived from a require directive), so with a shallow family
+# there is nothing to parse and nothing double-includes by accident.
+SKILL_STACK = {
+    "chat": ["chat"],
+    "team": ["chat", "team"],
+}
 
-    Fully local and hermetic: no config, no network, no cell. It computes the
-    comrade id (a pure local function) and substitutes it plus the absolute cccp
-    path into skills/chat/body.template.md. Whatever this prints becomes the entire
-    skill body Claude reads, so a failure must be visible, not a silent empty body.
-    """
-    template_path = plugin_root() / "skills" / "chat" / "body.template.md"
-    try:
-        template = template_path.read_text(encoding="utf-8")
-    except OSError as e:
-        sys.exit(f"cccp skill error: cannot read template {template_path}: {e}")
-    sys.stdout.write(render_skill_body(template, comrade_id(), cccp_command_path()))
+# The trailing frame, appended once after the whole stack. The user's arguments
+# are auto-appended by the harness as `ARGUMENTS: <value>` unless the SKILL.md
+# references $ARGUMENTS itself - so each SKILL.md ends with a bare `$ARGUMENTS`
+# and this outro is the prose that introduces it. It must be LAST (after every
+# delta), which is why it lives here rather than in any one template.
+ARGS_OUTRO = """## Your instructions
+
+The user's invocation is on the final `User arguments:` line below:
+- **If it has text** - the first token is your cell slug (use it wherever you \
+see `<slug>` above); anything after it is your task or context. Get on the \
+watchtower, then act on it.
+- **If it is empty** - the interface does not require an argument, so no cell \
+was given. Ask the user which cell to join before doing anything else."""
+
+
+def compose_skill(name):
+    """Return a skill's whole body: its stack of templates rendered base-first,
+    joined, with the shared args outro last. Pure and hermetic - the only inputs
+    are the local comrade id, this script's path, and on-disk templates."""
+    stack = SKILL_STACK.get(name)
+    if stack is None:
+        sys.exit(f"cccp skill error: unknown skill {name!r}; "
+                 f"known: {', '.join(sorted(SKILL_STACK))}")
+    me, cccp_path = comrade_id(), cccp_command_path()
+    parts = []
+    for part in stack:
+        template_path = plugin_root() / "skills" / part / "body.template.md"
+        try:
+            template = template_path.read_text(encoding="utf-8")
+        except OSError as e:
+            sys.exit(f"cccp skill error: cannot read template {template_path}: {e}")
+        parts.append(render_skill_body(template, me, cccp_path).strip())
+    parts.append(ARGS_OUTRO.strip())
+    return "\n\n".join(parts) + "\n"
+
+
+def cmd_skill(args):
+    """Render-time helper: emit a skill's fully-resolved body for its SKILL.md
+    `!`cccp skill <name>`` include, which replaces the skill body wholesale.
+
+    Fully local and hermetic: no config, no network, no cell. Whatever this prints
+    becomes the entire skill body Claude reads, so a failure must be visible (a
+    non-zero exit with a message), not a silent empty body."""
+    sys.stdout.write(compose_skill(args.name))
 
 
 def cmd_dispatch(args):
@@ -1293,8 +1331,11 @@ def build_parser():
     # no arguments - its output is fully determined by the comrade id.
     sk = sub.add_parser(
         "skill",
-        description="Emit the cccp skill's fully-resolved body text (render-time "
-                    "helper; replaces the SKILL.md body via `!`cccp skill``).")
+        description="Emit a skill's fully-resolved body text (render-time helper; "
+                    "replaces the SKILL.md body via `!`cccp skill <name>``).")
+    sk.add_argument("name", nargs="?", default="chat",
+                    help="Skill to render (default chat). Its stack of "
+                         "skills/<part>/body.template.md is concatenated base-first.")
     sk.set_defaults(func=cmd_skill)
 
     disp = sub.add_parser("dispatch", help="Send a message to a cell.")

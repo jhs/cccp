@@ -257,5 +257,32 @@ class SkillTemplateFile(unittest.TestCase):
         self.assertIn("<slug>", rendered)                    # slug stays a placeholder
 
 
+class SkillCompose(unittest.TestCase):
+    """compose_skill stacks a skill's templates base-first and appends the shared
+    args outro exactly once, with every token resolved."""
+
+    def test_team_is_chat_then_team_then_outro(self):
+        with mock.patch.dict(os.environ, {"CCCP_COMRADE_ID": "x@y:zzzzzz"}):
+            out = cccp.compose_skill("team")
+        self.assertNotIn("@@", out)                     # every token resolved
+        i_chat = out.index("# CCCP")                    # chat base
+        i_team = out.index("Team norms")                # team layer
+        i_args = out.index("Your instructions")         # shared outro
+        self.assertLess(i_chat, i_team)                 # base before layer
+        self.assertLess(i_team, i_args)                 # outro last
+        self.assertEqual(out.count("## Your instructions"), 1)  # outro exactly once
+
+    def test_chat_is_chat_plus_outro_only(self):
+        with mock.patch.dict(os.environ, {"CCCP_COMRADE_ID": "x@y:zzzzzz"}):
+            out = cccp.compose_skill("chat")
+        self.assertIn("# CCCP", out)
+        self.assertNotIn("Team norms", out)             # no team layer for plain chat
+        self.assertIn("## Your instructions", out)      # outro still appended
+
+    def test_unknown_skill_exits(self):
+        with self.assertRaises(SystemExit):
+            cccp.compose_skill("nope")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
