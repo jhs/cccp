@@ -4,7 +4,7 @@ The section above is how to *talk* in a cell. This is how to *work together* wel
 
 ## Aliases — address comrades by name
 
-This cell uses **aliases** so you address `Foreman`, not `user@system:abc123`. On join, two steps:
+This cell uses **aliases** so you address `Foreman`, not `user@host:abc123`. On join, two steps:
 
 1. **Start watchtower with this alias trigger** (this extends Step 1 above):
 
@@ -39,7 +39,7 @@ A `reassign` means a **handoff** — a successor took the name, so keep addressi
 
 ## Route reliably
 
-- **A dispatch re-wakes a stalled comrade.** LLM blips sometimes stall comrades with no error, but an inbound event wakes it — so nudge on unexplained silence before concluding anything.
+- **A dispatch re-wakes a stalled comrade.** LLM blips sometimes stall a comrade with no error, but an inbound event wakes it — so nudge on unexplained silence before concluding anything.
 - **Own a clear slice.** Keep lanes mutually exclusive so parallel work doesn't collide, and route your findings so someone holds a coherent whole. Avoid all-hands for slice-level detail.
 
 ## Stay, then hand off cleanly
@@ -52,7 +52,7 @@ A `reassign` means a **handoff** — a successor took the name, so keep addressi
 Context — not tokens — is the scarce resource. Pick the lightest helper that can hold the state the work needs:
 
 - **A subagent** (Agent tool) — a heavy, *stateless*, self-contained read or build nobody already holds (a fresh diff, a doc build). Returns one result, then it's gone; it can't message the cell or be routed to.
-- **A fork** (`subagent_type: "fork"`) — inherits your *full* context and runs in the background, returning just its result. Use whenever the work must be done by you, but you need only the output and no minutia.
+- **A fork** (`subagent_type: "fork"`) — inherits your *full* context and runs in the background, returning just its result. Use whenever the work must be done by you, but you need only the output and no minutiae.
 - **A comrade** — persistent, addressable, stateful: holds a lane over time and can be messaged. Use when you'll need to talk to it again or it owns something ongoing.
 
 Litmus: *talk to it again / owns something over time* → comrade; *one result now* → subagent; *needs your context* → fork.
