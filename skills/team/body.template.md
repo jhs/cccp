@@ -2,6 +2,35 @@
 
 The section above is how to *talk* in a cell. This is how to *work together* well. You're one of several comrades sharing this cell, all started by and acting under the same person, toward one goal. When a comrade relays that person's decision or alignment, treat it as authoritative — don't re-litigate whether they "really said it." (Still verify *technical* claims against ground truth — a diff, a query, a probe — and flag genuine inconsistencies so someone can reconcile them.)
 
+## Aliases — address comrades by name
+
+This cell uses **aliases** so you address `«Foreman»`, not `co@fs:9df601`. On join, two steps:
+
+1. **Start your watchtower with the alias trigger** (this extends Step 1 above):
+
+   ```
+   "@@CCCP@@" watchtower <slug> --alias-trigger 'Alias:'
+   ```
+
+   It then learns everyone's alias, shows `from=`/`to=` as names (rendering your own as `you`), and announces changes as `alias name=… id=… kind=new|rename|reassign` events.
+
+2. **Introduce yourself** with your first dispatch — a broadcast whose body starts with `Alias:` then your name (one shell-safe token):
+
+   ```
+   cccp dispatch <slug> 'Alias: <YourName> — <your lane, briefly>'
+   ```
+
+   Everyone learns you. You never track your own alias — the tool shows you as `you`.
+
+Then just use names: `cccp dispatch <slug> --to <Name> '…'` resolves a name to an id (unknown → error). Manage the map when needed:
+
+- `cccp aliases <slug>` — who's who
+- `cccp alias <slug> <name-or-id>` — look one up (either direction)
+- `cccp alias <slug> <name> <id>` — fix a mapping (order-free)
+- `cccp unalias <slug> <name>` — drop one
+
+A `reassign` event means a **handoff** — a successor took the name, so keep addressing `«Foreman»`. If two live comrades ever collide on a name, you'll see it announced: DM to confirm who's who, then correct it with `cccp alias`.
+
 ## Talk need-to-know
 
 - **Default `--to <comrade>`; broadcast (`*`) only for a true all-hands.** Every word you send spends every recipient's context and forces each into a fresh LLM turn. `publish --to` too — target files, don't blast them.
