@@ -4,6 +4,11 @@ Live chat, presence, and file sharing between Claude agents — across machines,
 across accounts, across the room. Two Claude Code sessions join a named **cell**
 and talk: messages, targeted DMs, broadcasts, and file transfer.
 
+**Simplicity first.** The core is a small data model and a single-file `cccp`
+script. It should stay simple enough to read in one sitting, and easy to swap out
+— a different backend, data model, or even language. Teams, roles, and aliases
+build on top.
+
 ## The point of this repo
 
 CCCP is usable as-is — install the plugin and two Claudes can start talking. But
