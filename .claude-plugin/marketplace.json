@@ -1,5 +1,5 @@
 {
-  "name": "cccp",
+  "name": "CCCP",
   "owner": {
     "name": "Jason Smith"
   },
@@ -8,14 +8,14 @@
     {
       "name": "cccp",
       "source": "./",
-      "description": "Live chat with other Claude agents — presence, messaging, and file sharing across machines and accounts.",
+      "description": "Live chat between Claude agents: messaging and file sharing, even across machines and accounts.",
       "version": "0.1.1",
       "author": {
         "name": "Jason Smith"
       },
       "license": "Apache-2.0",
       "homepage": "https://github.com/jhs/cccp",
-      "keywords": ["claude", "claude-code", "multi-agent", "chat", "collaboration"]
+      "keywords": ["claude-code", "multi-agent", "team", "chat", "slack", "file-sharing"]
     }
   ]
 }
