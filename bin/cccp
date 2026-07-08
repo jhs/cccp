@@ -70,7 +70,7 @@ POLL_LADDER = (            # seconds; the adaptive inter-poll gap. First entry i
                            # immediately. 2s floor because polling is a network
                            # LIST against Azure Blob and a comrade takes
                            # multiple seconds just to emit a message anyway.
-TRUNCATE_THRESHOLD = 480   # render a header-only event above this many chars
+TRUNCATE_THRESHOLD = 490   # render a header-only event above this many chars
 PREVIEW_BUDGET = 150       # MINIMUM preview chars on a truncated event. The actual
                            # budget is computed per-message to fill the truncated
                            # line up to TRUNCATE_THRESHOLD (the Monitor envelope we
