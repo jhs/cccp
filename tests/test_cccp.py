@@ -17,7 +17,7 @@ from importlib.machinery import SourceFileLoader
 
 def _find_cccp():
     here = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(here, os.pardir, "bin", "cccp")
+    return os.path.join(here, os.pardir, "scripts", "cccp")
 
 
 # cccp is an extensionless executable script; load it by path via an explicit

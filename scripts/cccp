@@ -13,14 +13,17 @@ Storage layout (a cell is the triple (account, container, prefix) + slug):
 
     <container>/<prefix>/<slug>/<comrade-id>/gazette.jsonl   append blob
     <container>/<prefix>/<slug>/<comrade-id>/files/<path>    block blobs
-    <container>/<prefix>/<slug>/<comrade-id>/claim           identity claim
 
-bin/cccp is an executable script, not an importable module. When an ad-hoc
+A comrade is registered in a cell purely by having a gazette - identity is a
+local `user@host:<session>` computed offline, so there is no claim blob and no
+coordination step; comrades are discovered when their first message arrives.
+
+scripts/cccp is an executable script, not an importable module. When an ad-hoc
 one-off needs the REST logic (e.g. the large-file staging fallback), read this
 file as a reference implementation rather than importing it.
 
 Subcommands (build in progress):
-    init        Resolve identity for a cell (SKILL.md render-time helper).
+    skill       Emit the cccp skill body (SKILL.md render-time helper; hidden).
     dispatch    Send a message to a cell.
     watchtower  Stream live cell events (run under the Monitor tool).
     read        Print cell message history.
@@ -107,7 +110,9 @@ def short_hostname():
 
 
 def base_comrade_id():
-    """The clean, cell-scoped-unique-by-default comrade id: user@host."""
+    """The machine/account part of a comrade id: user@host. comrade_id() appends
+    the session suffix; a few read-only commands use this bare form for a log
+    path where the exact id doesn't matter."""
     return f"{current_user()}@{short_hostname()}"
 
 
@@ -122,19 +127,18 @@ def current_session_id():
     """The Claude Code session UUID, exported as CLAUDE_CODE_SESSION_ID.
 
     Stable for the whole conversation, including across `claude --resume`. Every
-    cccp invocation from one Claude session reads the same value, so identity
-    stays consistent across the separate init / dispatch / watchtower processes
-    with no local state file. Used as the cross-invocation re-derivation key
-    and (truncated to 6 chars) as the same-host collision disambiguator; the
-    default comrade id stays the clean user@host.
+    cccp invocation from one Claude session reads the same value, so all of that
+    session's processes (dispatch / watchtower / skill) derive the identical
+    comrade id with no local state file. Truncated to 6 chars, it is the suffix
+    of every comrade id (see comrade_id).
 
     Non-Claude callers (manual testing, scripts) should set CCCP_COMRADE_ID to
-    bypass identity claim entirely.
+    supply an explicit id and bypass session-derived identity entirely.
     """
     sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
     if not sid:
         sys.exit("error: CLAUDE_CODE_SESSION_ID is not set; cccp must run under "
-                 "Claude Code, or set CCCP_COMRADE_ID to bypass identity claim")
+                 "Claude Code, or set CCCP_COMRADE_ID to supply an explicit id")
     return sid
 
 
@@ -318,11 +322,10 @@ def setup_logging(cfg, slug, me, argv):
     nothing is written. If truthy, installs a RotatingFileHandler at
     ~/.cccp/<slug>/<me>/cccp-debug.log and emits the startup header.
 
-    Called *after* claim_identity, so the handful of HTTP calls inside identity
-    claim are not logged - a small known gap (plug by buffering through a
-    MemoryHandler and flushing post-claim, if it ever matters). The lag
-    investigation this debug feature exists for happens in the steady-state
-    poll loop, which is fully covered.
+    Identity is now a local computation (comrade_id), so there are no pre-logging
+    HTTP calls to miss - the first network call a subcommand makes happens after
+    this returns. The lag investigation this debug feature exists for happens in
+    the steady-state poll loop, which is fully covered.
 
     Fails closed: any setup error degrades to the NullHandler logger with a
     one-line warning on stderr, never breaking the caller.
@@ -395,10 +398,10 @@ class BlobClient:
     def __init__(self, account, container, sas, log=None):
         self.base = f"https://{account}.blob.core.windows.net/{container}"
         self.sas = sas.lstrip("?")
-        # The logger is hot-swappable: subcommands construct the client before
-        # claim_identity resolves `me`, then assign `client.log = real_log`
-        # once setup_logging can choose a path. The default no-op keeps every
-        # `self.log.debug(...)` site safe to call unconditionally.
+        # The logger is hot-swappable: subcommands construct the client, then
+        # assign `client.log = real_log` once setup_logging has chosen a path
+        # from the comrade id. The default no-op keeps every `self.log.debug(...)`
+        # site safe to call unconditionally.
         self.log = log or _NULL_LOG
 
     def _url(self, path, query=""):
@@ -454,13 +457,10 @@ class BlobClient:
 
     # -- convenience operations --
 
-    def put_block(self, path, data, if_none_match=False):
-        """PUT a block blob. With if_none_match, creates only if absent (201) and
-        returns 409 if it already exists."""
-        h = {"x-ms-blob-type": "BlockBlob"}
-        if if_none_match:
-            h["If-None-Match"] = "*"
-        return self.request("PUT", path, data=data, headers=h)[0]
+    def put_block(self, path, data):
+        """PUT a block blob."""
+        return self.request("PUT", path, data=data,
+                            headers={"x-ms-blob-type": "BlockBlob"})[0]
 
     def get(self, path):
         st, _, body = self.request("GET", path)
@@ -499,51 +499,25 @@ class BlobClient:
         return out
 
 
-# ---------- identity claim & roster ----------
+# ---------- identity & roster ----------
 
-def claim_identity(client, prefix, slug):
-    """Resolve (claiming if needed) this session's comrade id for a cell.
+def comrade_id():
+    """This session's comrade id: always `user@host:<first-6-of-session-id>`.
 
-    Idempotent and self-recomputing: every cccp invocation from the same Claude
-    session arrives at the same id, keyed on the Claude session UUID. The clean
-    `user@host` is used by default; a sibling session on the same host that
-    finds it already taken falls back to `user@host:<first-6-of-session-id>`.
+    A pure local function - no network, no per-cell claim, no coordination. The
+    Claude session UUID is globally unique, so this id is unique by construction:
+    `user@host` scopes it to a machine/account, and the 6-char session suffix
+    separates sibling Claude sessions on the same host (collision needs two
+    siblings whose UUIDs share the first 6 hex - negligible). Every process from
+    one session (dispatch, watchtower, skill) computes the identical id with no
+    shared state, so they agree for free; that is why claiming is unnecessary.
 
-    CCCP_COMRADE_ID in the environment overrides all of this with an explicit id
-    (used for testing and deliberate identity control).
+    CCCP_COMRADE_ID overrides with an explicit id (testing, deliberate control).
     """
     env_id = os.environ.get("CCCP_COMRADE_ID")
     if env_id:
-        client.put_block(f"{prefix}/{slug}/{env_id}/claim",
-                         json.dumps({"ts": now_iso()}).encode())
-        client.log.debug(f"ev=identity_claim outcome=env_override comrade={_kv(env_id)}")
         return env_id
-    base = base_comrade_id()
-    mysession = current_session_id()
-    body = json.dumps({"session_id": mysession, "ts": now_iso()}).encode()
-    base_claim = f"{prefix}/{slug}/{base}/claim"
-
-    st = client.put_block(base_claim, body, if_none_match=True)
-    if st == 201:
-        client.log.debug(f"ev=identity_claim outcome=fresh comrade={_kv(base)}")
-        return base                       # claimed the clean id
-    if st == 409:
-        # Someone holds the clean id - a prior invocation of mine, or a sibling?
-        gst, gbody = client.get(base_claim)
-        owner_session = None
-        if gst == 200:
-            try:
-                owner_session = json.loads(gbody).get("session_id")
-            except (ValueError, AttributeError):
-                pass
-        if owner_session == mysession:
-            client.log.debug(f"ev=identity_claim outcome=reused comrade={_kv(base)}")
-            return base                   # it is mine - a re-run from this session
-        suffix_id = f"{base}:{mysession[:6]}"
-        client.put_block(f"{prefix}/{slug}/{suffix_id}/claim", body)  # overwrite ok
-        client.log.debug(f"ev=identity_claim outcome=collision comrade={_kv(suffix_id)}")
-        return suffix_id
-    raise BlobError(st, b"")
+    return f"{base_comrade_id()}:{current_session_id()[:6]}"
 
 
 def cell_roster(client, prefix, slug):
@@ -982,26 +956,53 @@ class Watchtower:
 
 # ---------- subcommands ----------
 
-def cmd_init(args):
-    """Render-time helper: resolve identity, print the block the skill
-    string-substitutes into Claude's view so it starts already oriented.
+# ---------- skill rendering ----------
 
-    The skill passes just the first /cccp argument (`!`cccp init '$0'``) - the
-    cell name - so freeform trailing context never reaches the shell. The name
-    is slugified; the slug is the cell's one identity everywhere.
+def plugin_root():
+    """The plugin install directory. This script lives at <root>/scripts/cccp,
+    so the root is two parents up - true both in the repo and in the installed
+    plugin cache (~/.claude/plugins/cache/<mp>/<plugin>/<ver>/scripts/cccp)."""
+    return Path(__file__).resolve().parent.parent
+
+
+def cccp_command_path():
+    """Absolute path to this script, for embedding in rendered skill text so the
+    reader runs the exact binary that rendered the skill - no $PATH assumption."""
+    return str(Path(__file__).resolve())
+
+
+def render_skill_body(template, comrade_id, cccp_path):
+    """Substitute the render-time tokens into the skill body template.
+
+    Only two tokens exist: @@COMRADE_ID@@ (this session's id) and @@CCCP@@ (the
+    absolute path to this script). The cell slug is NOT a token - it stays the
+    literal placeholder `<slug>`, which the reader fills from its own invocation
+    arguments, so the rendered body is fully determined by the comrade id alone.
+
+    @@NAME@@ delimiters are used deliberately, NOT $ or {} - the skill text is full
+    of shell `$vars`/`$0` and JSON `{...}` a str.format/Template pass would corrupt.
+    @@ never occurs in the body. Output is spliced verbatim by Claude Code and is
+    NOT re-rendered, so every token must be resolved here."""
+    return (template
+            .replace("@@CCCP@@", cccp_path)
+            .replace("@@COMRADE_ID@@", comrade_id))
+
+
+def cmd_skill(args):
+    """Render-time helper: emit the cccp skill's fully-resolved body for the
+    SKILL.md `!`cccp skill`` include, which replaces the skill body wholesale.
+
+    Fully local and hermetic: no config, no network, no cell. It computes the
+    comrade id (a pure local function) and substitutes it plus the absolute cccp
+    path into skills/cccp/body.template.md. Whatever this prints becomes the entire
+    skill body Claude reads, so a failure must be visible, not a silent empty body.
     """
+    template_path = plugin_root() / "skills" / "cccp" / "body.template.md"
     try:
-        slug = slugify(args.name)
-    except ValueError as e:
-        sys.exit(f"error: {e}")
-    cfg = resolve_config()
-    client = BlobClient(cfg["ACCOUNT"], cfg["CONTAINER"], cfg["SAS"])
-    me = claim_identity(client, cfg["PREFIX"], slug)
-    log = setup_logging(cfg, slug, me, sys.argv)
-    client.log = log
-    with subcommand_footer(log):
-        print(f"You are comrade `{me}` in CCCP cell `{slug}`.")
-        print("No history loaded.")
+        template = template_path.read_text(encoding="utf-8")
+    except OSError as e:
+        sys.exit(f"cccp skill error: cannot read template {template_path}: {e}")
+    sys.stdout.write(render_skill_body(template, comrade_id(), cccp_command_path()))
 
 
 def cmd_dispatch(args):
@@ -1009,7 +1010,7 @@ def cmd_dispatch(args):
     cfg = resolve_config()
     client = BlobClient(cfg["ACCOUNT"], cfg["CONTAINER"], cfg["SAS"])
     slug = slugify(args.cell)
-    me = claim_identity(client, cfg["PREFIX"], slug)
+    me = comrade_id()
     log = setup_logging(cfg, slug, me, sys.argv)
     client.log = log
     with subcommand_footer(log):
@@ -1030,7 +1031,7 @@ def cmd_watchtower(args):
     cfg = resolve_config()
     client = BlobClient(cfg["ACCOUNT"], cfg["CONTAINER"], cfg["SAS"])
     slug = slugify(args.cell)
-    me = claim_identity(client, cfg["PREFIX"], slug)
+    me = comrade_id()
     log = setup_logging(cfg, slug, me, sys.argv)
     client.log = log
     # No subcommand_footer here - the Watchtower emits its own ev=watchtower_stop
@@ -1054,10 +1055,9 @@ def cmd_wake(args):
     a pidfile keyed on CLAUDE_CODE_SESSION_ID is captured in TODO for later.
     """
     slug = slugify(args.cell)
-    # cmd_wake makes no network call, so it doesn't claim_identity. Use the
-    # default comrade id for the log path - on this same host+user the wake
-    # is host-local anyway, and any collision-suffixed sibling watchtower is
-    # logging at its own suffixed path independently.
+    # Use the bare user@host for the log path - the exact session-suffixed id
+    # doesn't matter here (wake is host-local and signals every sibling anyway),
+    # and each sibling watchtower logs at its own suffixed path independently.
     cfg = resolve_config()
     me = base_comrade_id()
     log = setup_logging(cfg, slug, me, sys.argv)
@@ -1082,9 +1082,8 @@ def cmd_read(args):
     (--from), recipient (--to), and select with --ts or --last."""
     cfg = resolve_config()
     slug = slugify(args.cell)
-    # cmd_read doesn't claim identity (read-only) so we don't know the actual
-    # `me` here. Use base_comrade_id() for the log path - close enough for the
-    # rare case of a sibling-session collision.
+    # Read-only, so the log path uses the bare user@host - it avoids requiring a
+    # session id (this can run outside Claude) and the exact id is immaterial here.
     log = setup_logging(cfg, slug, base_comrade_id(), sys.argv)
     client = BlobClient(cfg["ACCOUNT"], cfg["CONTAINER"], cfg["SAS"], log=log)
     prefix = cfg["PREFIX"]
@@ -1162,7 +1161,7 @@ def cmd_publish(args):
     cfg = resolve_config()
     client = BlobClient(cfg["ACCOUNT"], cfg["CONTAINER"], cfg["SAS"])
     slug = slugify(args.cell)
-    me = claim_identity(client, cfg["PREFIX"], slug)
+    me = comrade_id()
     log = setup_logging(cfg, slug, me, sys.argv)
     client.log = log
     with subcommand_footer(log):
@@ -1201,7 +1200,7 @@ def cmd_unpublish(args):
     cfg = resolve_config()
     client = BlobClient(cfg["ACCOUNT"], cfg["CONTAINER"], cfg["SAS"])
     slug = slugify(args.cell)
-    me = claim_identity(client, cfg["PREFIX"], slug)
+    me = comrade_id()
     log = setup_logging(cfg, slug, me, sys.argv)
     client.log = log
     with subcommand_footer(log):
@@ -1220,8 +1219,8 @@ def cmd_pull(args):
     can chain it: `cccp pull <cell> <paths> && <follow-up>`."""
     cfg = resolve_config()
     slug = slugify(args.cell)
-    # cmd_pull doesn't claim identity (it's a fetch, not a participation
-    # event); use base_comrade_id() for the log path.
+    # A fetch, not a participation event; the log path uses the bare user@host
+    # (no session id required, exact id immaterial).
     log = setup_logging(cfg, slug, base_comrade_id(), sys.argv)
     client = BlobClient(cfg["ACCOUNT"], cfg["CONTAINER"], cfg["SAS"], log=log)
     prefix = cfg["PREFIX"]
@@ -1277,13 +1276,26 @@ def build_parser():
         prog="cccp",
         description="Claude-to-Claude Communication Protocol (v2, Azure Blob).",
     )
-    sub = p.add_subparsers(dest="cmd", required=True)
+    # Explicit metavar lists only the operator-facing subcommands. `skill` is a
+    # render-time internal (the SKILL.md `!`cccp skill ...`` include calls it, not
+    # a human) - it stays a valid choice, so `cccp skill` and `cccp skill --help`
+    # both work, but it is omitted here (and given no help= below) so it never
+    # shows in top-level `cccp --help`.
+    sub = p.add_subparsers(
+        dest="cmd", required=True,
+        metavar="{dispatch,watchtower,wake,read,rm,publish,unpublish,pull}")
 
-    init = sub.add_parser("init", help="Resolve identity for a cell "
-                                       "(render-time helper for the skill).")
-    init.add_argument("name", help="Cell name - the skill passes just the first "
-                                   "/cccp argument ($0).")
-    init.set_defaults(func=cmd_init)
+    # No `help=` kwarg: argparse only emits a subcommand's detail line when a
+    # truthy help is passed, so omitting it (NOT help=SUPPRESS, which is itself a
+    # truthy string and prints literally as "==SUPPRESS==") keeps `skill` out of
+    # the detail list. Combined with the metavar above, it's fully hidden from
+    # top-level help while `cccp skill` / `cccp skill --help` still work. It takes
+    # no arguments - its output is fully determined by the comrade id.
+    sk = sub.add_parser(
+        "skill",
+        description="Emit the cccp skill's fully-resolved body text (render-time "
+                    "helper; replaces the SKILL.md body via `!`cccp skill``).")
+    sk.set_defaults(func=cmd_skill)
 
     disp = sub.add_parser("dispatch", help="Send a message to a cell.")
     disp.add_argument("cell", help="Cell slug.")
