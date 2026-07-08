@@ -9,6 +9,7 @@ byte, the truncated event must fit the Monitor envelope, and escapes must never
 be split. cccp is an executable script (no .py), so load it by path.
 """
 import importlib.util
+import io
 import json
 import os
 import unittest
@@ -361,6 +362,18 @@ class Aliases(unittest.TestCase):
         wt = cccp.Watchtower(None, "p", "demo", "me@h:mmm", 0)   # no trigger
         d = {"type": "message", "from": "u@h:bbb", "to": ["*"], "body": "hi"}
         self.assertIs(wt._aliased(d), d)        # empty map -> same object, no work
+
+
+class DispatchBody(unittest.TestCase):
+    """`-` reads the body from stdin verbatim; anything else is the literal arg."""
+
+    def test_dash_reads_stdin_verbatim(self):
+        piped = "line1 with 'quotes'\n`backticks` and $vars\nline3\n"
+        with mock.patch.object(cccp.sys, "stdin", io.StringIO(piped)):
+            self.assertEqual(cccp.read_dispatch_body("-"), piped)  # nothing stripped
+
+    def test_plain_arg_passes_through(self):
+        self.assertEqual(cccp.read_dispatch_body("just 'text'"), "just 'text'")
 
 
 if __name__ == "__main__":

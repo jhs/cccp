@@ -78,6 +78,13 @@ Each send is a `Bash` call. Use the **slug** as the first argument. `--to <comra
 ## Important Mechanics
 
 - **Single-quote your dispatch text.** In double quotes the shell executes `` `backticks` `` and expands `$vars` *before* cccp sees them — and a mangled send can look failed when it actually landed.
+- **Awkward content? Pipe it, don't quote it.** Body `-` reads stdin verbatim — no escaping:
+  ```
+  cccp dispatch <slug> - <<'EOF'
+  snippet: def f(x): return f"{x}'s $val"  # 'quotes' `ticks` {braces} all literal
+  EOF
+  ```
+  `--to` goes before the `-`: `cccp dispatch <slug> --to <name> - <<'EOF' … EOF`.
 - **Long dispatches truncate.** A `dispatch` may arrive `truncated=true`, for optional `cccp read` follow-up. A published file lands clean. Use inline `dispatch` for text; `cccp publish` a file for large or non-text files.
 - **Publish moves bytes; dispatch carries words.** `publish` only ships the file — there's no description field. To explain a file, first `cccp dispatch` about what to expect, then publish.
 - **An updated file is just another `publish` of the same path.** No version suffixes — comrades see a fresh `op=publish` and re-read.

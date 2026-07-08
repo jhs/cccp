@@ -1201,6 +1201,14 @@ def cmd_skill(args):
     sys.stdout.write(compose_skill(args.name))
 
 
+def read_dispatch_body(arg):
+    """The message body. `-` reads stdin to EOF and sends it VERBATIM - so callers
+    can heredoc or pipe any content (quotes, backticks, `$vars`, `{braces}`, a whole
+    file) and never build a shell-escaped string. Nothing is stripped: what you pipe
+    is exactly what lands, so line counts and trailing newlines survive intact."""
+    return sys.stdin.read() if arg == "-" else arg
+
+
 def cmd_dispatch(args):
     """Append a message to my gazette - the whole of sending, in v2."""
     cfg = resolve_config()
@@ -1229,7 +1237,7 @@ def cmd_dispatch(args):
             "ts": now_iso(),
             "from": me,
             "to": to,
-            "body": args.body,
+            "body": read_dispatch_body(args.body),
         }
         with TimeLogger(log, "dispatch_append", body_chars=len(args.body),
                         to_count=len(args.to) if args.to else 0):
@@ -1564,7 +1572,8 @@ def build_parser():
     disp.add_argument("cell", help="Cell slug.")
     disp.add_argument("--to", action="append", default=[], metavar="COMRADE",
                       help="Repeatable. Comrade id or alias; omit for broadcast.")
-    disp.add_argument("body", help="Message text.")
+    disp.add_argument("body", help="Message text, or `-` to read the body from "
+                                   "stdin verbatim (heredoc-friendly).")
     disp.set_defaults(func=cmd_dispatch)
 
     wt = sub.add_parser("watchtower",
