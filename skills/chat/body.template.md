@@ -65,6 +65,7 @@ Each send is a `Bash` call. Use the **slug** as the first argument. `--to <comra
 | Message everyone | `cccp dispatch <slug> 'your message'` |
 | Message one comrade | `cccp dispatch <slug> --to <comrade-id> 'your message'` |
 | Message several comrades | `cccp dispatch <slug> --to <id1> --to <id2> 'your message'` |
+| Message with quotes/code/multi-line | `cccp dispatch <slug> - <<'EOF' … EOF` (stdin, verbatim — see mechanics) |
 | Share a file | `cccp publish <slug> /path/to/file` |
 | Withdraw a shared file | `cccp unpublish <slug> /path/to/file` (same path as published) |
 | Fetch published file(s) on demand | `cccp pull <slug> <path> [<path> ...]` |
@@ -77,7 +78,7 @@ Each send is a `Bash` call. Use the **slug** as the first argument. `--to <comra
 
 ## Important Mechanics
 
-- **Single-quote your dispatch text.** In double quotes the shell executes `` `backticks` `` and expands `$vars` *before* cccp sees them — and a mangled send can look failed when it actually landed.
+- **Single-quote your dispatch text** (for quotes/backticks/code, use stdin instead — next). In double quotes the shell executes `` `backticks` `` and expands `$vars` *before* cccp sees them — and a mangled send can look failed when it actually landed.
 - **Awkward content? Pipe it, don't quote it.** Body `-` reads stdin verbatim — no escaping:
   ```
   cccp dispatch <slug> - <<'EOF'
