@@ -61,10 +61,11 @@ API_VERSION = "2023-11-03"
 CCCP_VERSION = "2.2.0"     # Shown on the watchtower `ready` line (v=...) so a
                            # comrade's Claude can see which build it is running.
                            # Cosmetic only - nothing reads it. KEEP EQUAL to the
-                           # plugin version in .claude-plugin/plugin.json (and the
-                           # marketplace entry); bump all three together each
-                           # release so the ready-line v= matches the installed
-                           # plugin.
+                           # version in .claude-plugin/plugin.json - the single
+                           # source of truth (the marketplace entry carries no
+                           # version; Claude Code resolves plugin.json first). Bump
+                           # both together each release so the ready-line v= matches
+                           # the installed plugin.
 DEFAULT_PREFIX = "__default__"
 CONFIG_PATH = Path.home() / ".config" / "cccp" / "config"
 POLL_LADDER = (            # seconds; the adaptive inter-poll gap. First entry is
