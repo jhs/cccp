@@ -11,23 +11,13 @@ be split. cccp is an executable script (no .py), so load it by path.
 import importlib.util
 import json
 import os
-import shutil
 import unittest
 from importlib.machinery import SourceFileLoader
 
 
 def _find_cccp():
-    """Locate the cccp script relative to this test file, not the CWD: it sits in
-    the repo's bin/ dir. Fall back to a cccp on PATH so the test also passes when
-    the plugin is installed and the script is on $PATH."""
     here = os.path.dirname(os.path.abspath(__file__))
-    local = os.path.join(here, os.pardir, "bin", "cccp")
-    if os.path.isfile(local):
-        return local
-    on_path = shutil.which("cccp")
-    if on_path:
-        return on_path
-    raise FileNotFoundError("could not locate ../bin/cccp, or cccp on PATH")
+    return os.path.join(here, os.pardir, "bin", "cccp")
 
 
 # cccp is an extensionless executable script; load it by path via an explicit
@@ -39,8 +29,9 @@ _loader.exec_module(cccp)
 
 
 def msg(body, frm="alice@hostA:aaaaaa", ts="2026-06-11T17:00:00.000000Z", to=None):
-    return {"type": "message", "from": frm, "ts": ts, "to": to or ["alice@hostA:bbbbbb"],
-            "body": body}
+    if to is None:
+        to = ["alice@hostA:bbbbbb"]
+    return {"type": "message", "from": frm, "ts": ts, "to": to, "body": body}
 
 
 class PreviewSplit(unittest.TestCase):
@@ -72,10 +63,97 @@ class TruncatedEvent(unittest.TestCase):
         self.assertIn("truncated=true", self.line)
         self.assertLessEqual(len(self.line), cccp.TRUNCATE_THRESHOLD)
 
-    def test_preview_is_wider_than_legacy_fixed_budget(self):
-        # the whole point of dynamic widening: more than the old fixed 150
+    def test_preview_fills_available_budget(self):
         preview = self.line.split('preview="', 1)[1].rsplit('"', 1)[0]
-        self.assertGreater(len(preview), cccp.PREVIEW_BUDGET)
+        self.assertGreater(len(preview), 150)
+
+
+class HugeHeader(unittest.TestCase):
+    """Edge cases when the to-list is so long the header dominates the line."""
+
+    def test_truncated_line_fits_with_large_to(self):
+        """Many recipients still produce a line within the threshold."""
+        body = "important " * 80
+        to_list = [f"comrade{i}@host{i}:{'a' * 6}" for i in range(12)]
+        d = msg(body, to=to_list)
+        line = cccp.render_message_event(d)
+        self.assertLessEqual(len(line), cccp.TRUNCATE_THRESHOLD)
+
+    def test_short_body_huge_header_prefers_full_form(self):
+        """When truncation syntax costs more bytes than the full body, use full."""
+        body = "hi"
+        to_list = [f"comrade{i}@host{i}:{'a' * 6}" for i in range(14)]
+        d = msg(body, to=to_list)
+        line = cccp.render_message_event(d)
+        self.assertIn("body=", line)
+        self.assertNotIn("truncated=true", line)
+        self.assertLessEqual(len(line), cccp.TRUNCATE_THRESHOLD)
+
+
+class Overflow(unittest.TestCase):
+    """When even the header exceeds the threshold, the overflow form kicks in."""
+
+    def _overflow_msg(self, n_recipients=30, body="hello world"):
+        to_list = [f"comrade{i}@host{i}:{'a' * 6}" for i in range(n_recipients)]
+        return msg(body, to=to_list)
+
+    def test_overflow_always_fits_threshold(self):
+        d = self._overflow_msg(n_recipients=50, body="x" * 1000)
+        line = cccp.render_message_event(d)
+        self.assertLessEqual(len(line), cccp.TRUNCATE_THRESHOLD)
+
+    def test_overflow_has_marker(self):
+        d = self._overflow_msg()
+        line = cccp.render_message_event(d)
+        self.assertIn("overflow=true", line)
+
+    def test_overflow_has_recipient_count(self):
+        d = self._overflow_msg(n_recipients=30)
+        line = cccp.render_message_event(d)
+        self.assertIn("recipients=30", line)
+
+    def test_overflow_preserves_from_and_ts(self):
+        d = self._overflow_msg()
+        line = cccp.render_message_event(d)
+        self.assertIn(f"from={d['from']}", line)
+        self.assertIn(f"ts={d['ts']}", line)
+
+    def test_overflow_has_chars(self):
+        d = self._overflow_msg(body="x" * 200)
+        line = cccp.render_message_event(d)
+        self.assertIn("chars=200", line)
+
+    def test_overflow_read_returns_full_body(self):
+        """message_read_output on an overflow message returns the full body."""
+        d = self._overflow_msg(body="the full text here")
+        out = cccp.message_read_output(d, full=False)
+        self.assertEqual(out, "the full text here")
+
+    def test_guarantee_no_message_ever_exceeds_threshold(self):
+        """Sweep across a range of recipient counts and body sizes. Every
+        rendered message line must fit within TRUNCATE_THRESHOLD."""
+        for n_recip in (1, 5, 10, 20, 50, 100):
+            for body_len in (0, 2, 100, 500, 2000):
+                to_list = [f"c{i}@h{i}:{'a'*6}" for i in range(n_recip)]
+                d = msg("x" * body_len, to=to_list)
+                line = cccp.render_message_event(d)
+                self.assertLessEqual(
+                    len(line), cccp.TRUNCATE_THRESHOLD,
+                    f"recipients={n_recip} body={body_len} len={len(line)}")
+
+    def test_guarantee_no_filesystem_event_ever_exceeds_threshold(self):
+        """Sweep across recipient counts and path lengths. Every rendered
+        filesystem line must fit within TRUNCATE_THRESHOLD."""
+        for n_recip in (1, 10, 50):
+            for path_len in (20, 200, 600):
+                to_list = [f"c{i}@h{i}:{'a'*6}" for i in range(n_recip)]
+                d = {"type": "filesystem", "from": "alice@boxA:abc123",
+                     "op": "publish", "path": "x" * path_len,
+                     "size": 1234, "to": to_list}
+                line = cccp.render_filesystem_event(d)
+                self.assertLessEqual(
+                    len(line), cccp.TRUNCATE_THRESHOLD,
+                    f"recipients={n_recip} path={path_len} len={len(line)}")
 
 
 class Continuation(unittest.TestCase):

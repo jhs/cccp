@@ -70,14 +70,7 @@ POLL_LADDER = (            # seconds; the adaptive inter-poll gap. First entry i
                            # immediately. 2s floor because polling is a network
                            # LIST against Azure Blob and a comrade takes
                            # multiple seconds just to emit a message anyway.
-TRUNCATE_THRESHOLD = 490   # render a header-only event above this many chars
-PREVIEW_BUDGET = 150       # MINIMUM preview chars on a truncated event. The actual
-                           # budget is computed per-message to fill the truncated
-                           # line up to TRUNCATE_THRESHOLD (the Monitor envelope we
-                           # already pay for) - see preview_budget(). The reader
-                           # gets the body remainder PAST this cutoff via
-                           # `cccp read --ts` (continuation), so a wider preview
-                           # here shrinks every follow-up read.
+TRUNCATE_THRESHOLD = 500   # max chars per watchtower stdout line (Monitor cuts at 500)
 IDLE_MAX_SECONDS = 24 * 3600   # cap for the idle backoff - past this, idles fire
                                # at most once a day so a long-silent watchtower
                                # stops forcing Claude to wake and respond
@@ -614,12 +607,20 @@ def preview_split(body, budget):
 
 def preview_budget(frm, ts, to, nchars):
     """Per-message preview budget: fill the truncated line up to TRUNCATE_THRESHOLD
-    (the Monitor envelope) rather than a fixed 150, so we use the ~200 chars of
-    envelope the header leaves on the table. Floored at PREVIEW_BUDGET so a
-    many-recipient header still yields a usable preview."""
+    (the Monitor envelope) rather than a fixed amount, so we use whatever room the
+    header leaves. Degrades gracefully to 0 with very long headers."""
     fixed = (f"message from={frm} ts={ts} to={to} "
              f"chars={nchars} truncated=true preview=\"\"")
-    return max(PREVIEW_BUDGET, TRUNCATE_THRESHOLD - len(fixed))
+    return max(0, TRUNCATE_THRESHOLD - len(fixed))
+
+
+def render_overflow_event(d):
+    """Compact form when even the truncated line would exceed TRUNCATE_THRESHOLD.
+    Replaces the full to-list with a recipient count so the line always fits."""
+    n_recip = len(d.get("to") or ["*"])
+    body = d.get("body", "")
+    return (f"message from={d['from']} ts={d['ts']} "
+            f"recipients={n_recip} chars={len(body)} overflow=true")
 
 
 def render_message_event(d):
@@ -630,8 +631,12 @@ def render_message_event(d):
         return full
     budget = preview_budget(d["from"], d["ts"], to, len(body))
     preview, _ = preview_split(body, budget)
-    return (f"message from={d['from']} ts={d['ts']} to={to} "
-            f"chars={len(body)} truncated=true preview=\"{preview}\"")
+    truncated = (f"message from={d['from']} ts={d['ts']} to={to} "
+                 f"chars={len(body)} truncated=true preview=\"{preview}\"")
+    best = truncated if len(truncated) < len(full) else full
+    if len(best) <= TRUNCATE_THRESHOLD:
+        return best
+    return render_overflow_event(d)
 
 
 def message_read_output(d, full=False):
@@ -647,7 +652,12 @@ def message_read_output(d, full=False):
     if full or len(full_line) <= TRUNCATE_THRESHOLD:
         return body
     budget = preview_budget(d["from"], d["ts"], to, len(body))
-    _, n = preview_split(body, budget)
+    preview, n = preview_split(body, budget)
+    truncated = (f"message from={d['from']} ts={d['ts']} to={to} "
+                 f"chars={len(body)} truncated=true preview=\"{preview}\"")
+    best = truncated if len(truncated) < len(full_line) else full_line
+    if len(best) > TRUNCATE_THRESHOLD:
+        return body
     marker = f"[…from char {n}]"
     return f"{marker}\n{body[n:]}"
 
@@ -659,7 +669,17 @@ def render_filesystem_event(d):
         if k in d:
             parts.append(f"{k}={d[k]}")
     parts.append(f"to={render_to(d.get('to', ['*']))}")
-    return " ".join(parts)
+    line = " ".join(parts)
+    if len(line) <= TRUNCATE_THRESHOLD:
+        return line
+    n_recip = len(d.get("to") or ["*"])
+    overflow = (f"filesystem from={d['from']} op={d.get('op')} "
+                f"path={display_path(d.get('path', ''))} "
+                f"recipients={n_recip} overflow=true")
+    if len(overflow) <= TRUNCATE_THRESHOLD:
+        return overflow
+    return (f"filesystem from={d['from']} op={d.get('op')} "
+            f"recipients={n_recip} overflow=true")
 
 
 def download_to_mirror(client, prefix, slug, sender, wire_path,
@@ -744,9 +764,8 @@ class Watchtower:
             pass
 
     def _emit(self, line):
-        # Guard the stdout write: a harness/Monitor pipe disruption (BrokenPipe)
-        # must NOT kill the watchtower -- log it and skip; the next write succeeds
-        # once the pipe recovers (#503 guard).
+        if len(line) > TRUNCATE_THRESHOLD:
+            line = line[:TRUNCATE_THRESHOLD - 14] + " overflow=true"
         try:
             print(line, flush=True)
         except (BrokenPipeError, OSError) as e:
