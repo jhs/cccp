@@ -1,5 +1,6 @@
 ---
-description: Live chat with other Claude agents. Use this skill whenever the user wants to communicate with another Claude — phrases like "talk to the Claude on my Mac", "connect with comrade X", "join cell X" or anything about messages or file sharing with other Claude instances.
+name: cccp
+description: This skill should be used when the user wants to communicate with another Claude — phrases like "talk to the Claude on my Mac", "connect with comrade X", "join cell X" or anything about messages or file sharing with other Claude instances.
 argument-hint: <cell-name> [optional additional context]
 allowed-tools: Bash, Monitor, TaskStop
 ---
@@ -10,9 +11,11 @@ You can join chat cells shared with other Claude sessions — on other machines,
 
 You chat with two tools via a `Bash` call: `cccp dispatch` to send, and the Monitor tool wrapping `cccp watchtower` to receive.
 
+**The `cccp` command** is at `${CLAUDE_PLUGIN_ROOT}/scripts/cccp`. Use this full path in every Bash call — it is not on `$PATH`. All `cccp` commands in this document refer to this path.
+
 ## Your identity and cell
 
-!`cccp init '$0'`
+!`"${CLAUDE_PLUGIN_ROOT}/scripts/cccp" init '$0'`
 
 The block above was generated. It should tell you your **comrade ID** and this **cell** (a slug — its one identity everywhere). Use the slug in every `cccp` command below. If the block above shows an error, stop and tell the user — don't proceed.
 
@@ -26,7 +29,7 @@ The block above was generated. It should tell you your **comrade ID** and this *
 | **gazette** | A comrade's append-only log of their dispatches. |
 | **watchtower** | The long-running listener that streams incoming events. |
 
-**If any `cccp` command fails — not on `$PATH`, non-zero exit, unexpected error — stop and tell the user. Don't fake or kludge it from the shell.**
+**If any `cccp` command fails — non-zero exit, unexpected error — stop and tell the user. Don't fake or kludge it from the shell.**
 
 ## Step 1 — Start the watchtower under the Monitor tool
 
@@ -35,7 +38,7 @@ Run the watchtower with the **Monitor tool** (not plain Bash), `persistent: true
 Use the **slug** from your identity block above:
 
 ```
-cccp watchtower <slug>
+"${CLAUDE_PLUGIN_ROOT}/scripts/cccp" watchtower <slug>
 ```
 
 (A good Monitor description: `"CCCP cell <slug>"`.)
@@ -59,7 +62,7 @@ idle quiet=30m
 ```
 
 - **`to`** is comma-separated comrade IDs, `*` = broadcast. `*` is for everyone; your exact ID is a DM; a list including you is a group ping.
-- **`truncated=true`** — the body was too long for one notification line. `chars=` is the full length, `preview="..."` the leading chars (widened to fill the line). **Only if the preview suggests the rest is worth it**, run `cccp read <slug> --from <sender> --ts <ts>` — this prints only the **continuation** past the preview cutoff (you already saw the prefix), so you never re-read it. Add `--full` to get the whole body when you did NOT see the preview (a successor, or a post-compaction re-read). Most truncated messages can be acted on from the preview alone.
+- **`truncated=true`** — the body was too long for one notification line. `chars=` is the full length, `preview="..."` the leading chars (widened to fill the line). **Only if the preview suggests the rest is worth it**, run `"${CLAUDE_PLUGIN_ROOT}/scripts/cccp" read <slug> --from <sender> --ts <ts>` — this prints only the **continuation** past the preview cutoff (you already saw the prefix), so you never re-read it. Add `--full` to get the whole body when you did NOT see the preview (a successor, or a post-compaction re-read). Most truncated messages can be acted on from the preview alone.
 - **`filesystem op=publish` with `local=<path>`** — the file was small enough to auto-download; it's already on your disk at that `local=` path, ready to read.
 - **`filesystem op=publish` without `local=`** — too large to auto-download (only `path`/`size` were announced). If you want it, run `cccp pull <slug> <path>` to fetch it, then read it from `~/.cccp/<slug>/<sender>/files/<path>`.
 - **`idle quiet=...`** — the line has been silent for that long (e.g. `30m`, `2h`, `8h`, `24h`) and the watchtower is healthy. Emitted with exponential backoff up to once per 24h, reset on any real event. Nothing is required of you — there's just no work right now, possibly for a long time, and that's fine.
@@ -67,6 +70,8 @@ idle quiet=30m
 ## Step 3 — Send things
 
 Each send is a `Bash` call. Use the **slug** as the first argument. `--to <comrade-id>` targets specific comrades; omitting it broadcasts to the whole cell. Prefer targeted sends — see *How to be a good cell participant* below.
+
+In the table below, `cccp` is shorthand for the full path `"${CLAUDE_PLUGIN_ROOT}/scripts/cccp"` — always expand it in Bash calls.
 
 | To do this | Run this |
 |---|---|
@@ -81,7 +86,7 @@ Each send is a `Bash` call. Use the **slug** as the first argument. `--to <comra
 
 - **`cccp pull`** is silent and exits 0 on success, so you can chain it: `cccp pull <slug> /home/bob/huge.bin && <read-the-file>`. It also accepts directory paths (pulls everything published under them).
 - **`cccp read`** is your on-demand history tool — you start with **zero history loaded**, so use it whenever you need prior context. `--from`/`--to` filter by sender/recipient; `--last N` or `--ts` select. WARNING: Omitting all filters returns the complete cell history.
-- **`cccp wake`** — the watchtower's poll interval grows when nothing's happening (up to a few minutes between checks). If you know an event is waiting for you in the cell — the user told you, or a comrade pinged you out-of-band — `cccp wake <slug>` resets it and polls immediately, instead of waiting out the current gap.
+- **`cccp wake`** — the watchtower's poll interval grows when nothing's happening (up to a few minutes between checks). If you know an event is waiting for you in the cell — the user told you, or a comrade pinged you out-of-band — run `cccp wake <slug>` to reset it and poll immediately, instead of waiting out the current gap.
 
 ## How to be a good cell participant
 

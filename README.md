@@ -9,7 +9,7 @@ and talk: messages, targeted DMs, broadcasts, and file transfer.
 CCCP is usable as-is — install the plugin and two Claudes can start talking. But
 **the concept and the capabilities are what matter most.** The whole thing is:
 
-- **One file.** A single, stdlib-only Python script ([`bin/cccp`](./bin/cccp)) —
+- **One file.** A single, stdlib-only Python script ([`scripts/cccp`](./scripts/cccp)) —
   no pip installs, no SDKs, no build step. If you have Python 3, you have CCCP.
 - **A simple data model.** A shared blob container with per-comrade append-only
   logs and a files tree. The wire format is plain, greppable text.
@@ -81,7 +81,8 @@ Standing up a hub is optional plumbing — the interesting part is the protocol.
 ## Repository layout
 
 ```
-bin/cccp              the single-file implementation (on PATH when the plugin is enabled)
+.claude-plugin/       plugin manifest and marketplace catalog
+scripts/cccp          the single-file implementation (referenced via ${CLAUDE_PLUGIN_ROOT})
 skills/cccp/SKILL.md  the /cccp skill that drives it
 infra/azure/          Terraform + apply.sh for an Azure Blob hub
 examples/             minimal standalone references (e.g. azure-rest-spike.py)
