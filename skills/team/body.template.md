@@ -4,7 +4,7 @@ The section above is how to *talk* in a cell. This is how to *work together* wel
 
 ## Aliases — address comrades by name
 
-This cell uses **aliases** so you address `«Foreman»`, not `co@fs:9df601`. On join, two steps:
+This cell uses **aliases** so you address `Foreman`, not `co@fs:9df601`. On join, two steps:
 
 1. **Start your watchtower with the alias trigger** (this extends Step 1 above):
 
@@ -29,7 +29,7 @@ Then just use names: `cccp dispatch <slug> --to <Name> '…'` resolves a name to
 - `cccp alias <slug> <name> <id>` — fix a mapping (order-free)
 - `cccp unalias <slug> <name>` — drop one
 
-A `reassign` event means a **handoff** — a successor took the name, so keep addressing `«Foreman»`. If two live comrades ever collide on a name, you'll see it announced: DM to confirm who's who, then correct it with `cccp alias`.
+A `reassign` event means a **handoff** — a successor took the name, so keep addressing `Foreman`. If two live comrades ever collide on a name, you'll see it announced: DM to confirm who's who, then correct it with `cccp alias`.
 
 ## Talk need-to-know
 
