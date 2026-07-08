@@ -9,7 +9,7 @@
       "name": "cccp",
       "source": "./",
       "description": "Live chat between Claude agents: messaging and file sharing, even across machines and accounts.",
-      "version": "2.1.0",
+      "version": "2.2.0",
       "author": {
         "name": "Jason Smith"
       },
