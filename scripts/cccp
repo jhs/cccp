@@ -471,6 +471,13 @@ class BlobClient:
         st, _, body = self.request("GET", path, headers={"Range": f"bytes={offset}-"})
         return st, body
 
+    def get_head(self, path, nbytes):
+        """GET the first `nbytes` of a blob (0..nbytes-1). 206 partial, or 200 if
+        the blob is smaller. Used to seed aliases from a gazette's head cheaply."""
+        st, _, body = self.request("GET", path,
+                                   headers={"Range": f"bytes=0-{nbytes - 1}"})
+        return st, body
+
     def ensure_append_blob(self, path):
         """Create an append blob if absent. 201 created or 409 exists - both fine."""
         return self.request("PUT", path, data=b"",
@@ -686,18 +693,113 @@ def download_to_mirror(client, prefix, slug, sender, wire_path,
 
 # ---------- watchtower ----------
 
+# ---------- aliases (opt-in, view-layer) ----------
+#
+# Aliases are human/LLM-friendly names for comrades, kept as a LOCAL projection:
+# the wire and the data model always carry raw user@host:hex ids. A comrade
+# declares its alias in an intro whose body starts with the watchtower's
+# --alias-trigger prefix; every other comrade learns it and translates on the way
+# in (watchtower metadata) and out (dispatch --to). Off entirely unless a trigger
+# is set, so bare `chat` is unchanged; `team` is the layer that turns it on.
+
+ALIAS_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")   # a shell-safe alias
+ALIAS_SEED_BYTES = 64 * 1024   # per-gazette cap when seeding the map at startup.
+                               # The declaring intro sits at a gazette's START, so
+                               # a small head read finds it without scanning a
+                               # months-long history.
+
+
+def is_comrade_id(s):
+    """A comrade id always carries both '@' and ':'; a shell-safe alias never does.
+    That makes the two unambiguous - which is what lets `alias` set/show take the
+    id and the name in either order, and lets --to tell an alias from an id."""
+    return "@" in s and ":" in s
+
+
+def alias_map_path(slug, me):
+    return LOCAL_MIRROR / slug / me / "aliases.json"
+
+
+def load_aliases(slug, me):
+    """The local {comrade_id: alias} map for this cell. Missing/corrupt -> {}."""
+    try:
+        data = json.loads(alias_map_path(slug, me).read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_aliases(slug, me, amap):
+    path = alias_map_path(slug, me)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(amap, sort_keys=True))
+
+
+def parse_alias(body, trigger):
+    """If `body` starts with `trigger`, return the first shell-safe token after it,
+    else None. The alias is a single token, so parsing can never over-read."""
+    if not trigger or not body.startswith(trigger):
+        return None
+    m = ALIAS_TOKEN.match(body[len(trigger):].lstrip())
+    return m.group(0) if m else None
+
+
+def learn_alias(amap, cid, alias):
+    """Apply a declaration to `amap` (mutated in place); return a one-line info
+    event describing the change, or None if nothing changed. A name maps to exactly
+    one id (last-writer-wins), so three cases arise:
+      new      - cid had no alias and the name was free
+      rename   - cid already had a different alias (same comrade, new name)
+      reassign - the name was held by a different id (a handoff/succession)"""
+    if amap.get(cid) == alias:
+        return None
+    prev_holder = next((i for i, a in amap.items() if a == alias and i != cid), None)
+    old_alias = amap.get(cid)
+    amap[cid] = alias
+    if prev_holder is not None:
+        del amap[prev_holder]      # the name moves; one name -> one id
+        return f"alias name={alias} id={cid} was_id={prev_holder} kind=reassign"
+    if old_alias is not None:
+        return f"alias name={alias} id={cid} was={old_alias} kind=rename"
+    return f"alias name={alias} id={cid} kind=new"
+
+
+def alias_or_id(amap, me, cid):
+    """How a comrade id renders in event metadata: 'you' for self, the alias if
+    known, else the raw id unchanged."""
+    if cid == me:
+        return "you"
+    return amap.get(cid, cid)
+
+
+def resolve_recipient(amap, token):
+    """Map a --to token to a comrade id: an id or '*' passes through; an alias is
+    looked up. Returns (id_or_None, error_or_None)."""
+    if token == "*" or is_comrade_id(token):
+        return token, None
+    for cid, alias in amap.items():
+        if alias == token:
+            return cid, None
+    return None, f"unknown alias {token!r}"
+
+
 class Watchtower:
-    """Polls the cell prefix and emits one event line per new dispatch. A pure
-    live-event stream: it skips backlog at startup (no replay) and has no local
-    state - identity and history live in the container."""
+    """Polls the cell prefix and emits one event line per new dispatch. A live-
+    event stream: it skips backlog at startup (no replay). The only local state is
+    an optional, opt-in alias map (--alias-trigger); identity and history otherwise
+    live in the container."""
 
     def __init__(self, client, prefix, slug, me, idle_initial,
-                 idle_max=IDLE_MAX_SECONDS, log=None, quiet=()):
+                 idle_max=IDLE_MAX_SECONDS, log=None, quiet=(), trigger=None):
         self.client = client
         self.prefix = prefix
         self.slug = slug
         self.me = me
         self.head = f"{prefix}/{slug}/"
+        # Alias support is opt-in: with no --alias-trigger, `self.trigger` is None
+        # and the whole feature is inert (no seed, no learn, no translation).
+        self.trigger = trigger
+        self.aliases = {}   # comrade_id -> alias; reloaded from disk each poll
         self.quiet = set(quiet)   # event types to handle but not emit (e.g. a
                                   # coordination hub suppresses 'filesystem' - the
                                   # file still auto-downloads, just no notify turn)
@@ -783,9 +885,42 @@ class Watchtower:
         for comrade, size in gazettes.items():
             self.hwm[comrade] = size
 
+    def seed_aliases(self):
+        """Build the baseline alias map from each gazette's HEAD (capped at
+        ALIAS_SEED_BYTES) SILENTLY - the startup baseline emits no events; only
+        live changes do. Declarations are applied oldest-first so last-writer-wins
+        holds within the seeded window."""
+        amap = load_aliases(self.slug, self.me)
+        decls = []   # (ts, from_id, alias)
+        for comrade in self._scan():
+            if comrade == self.me:
+                continue
+            st, data = self.client.get_head(
+                f"{self.head}{comrade}/gazette.jsonl", ALIAS_SEED_BYTES)
+            if st not in (200, 206):
+                continue
+            for chunk in data.splitlines():
+                try:
+                    dd = json.loads(chunk)
+                except ValueError:
+                    continue   # a byte-capped head can end mid-line - skip it
+                if dd.get("type") != "message":
+                    continue
+                name = parse_alias(dd.get("body", ""), self.trigger)
+                if name and dd.get("from"):
+                    decls.append((dd.get("ts", ""), dd["from"], name))
+        for _ts, cid, name in sorted(decls, key=lambda x: x[0]):
+            learn_alias(amap, cid, name)   # silent: discard the event line
+        save_aliases(self.slug, self.me, amap)
+        self.aliases = amap
+        self.log.debug(f"ev=aliases_seeded count={len(amap)}")
+
     def run(self):
         with TimeLogger(self.log, "initial_scan"):
             self.initial_scan()
+        if self.trigger:
+            with TimeLogger(self.log, "seed_aliases"):
+                self.seed_aliases()
         self._emit(f"ready {self.me} slug={self.slug} v={CCCP_VERSION}")
         self.log.debug(
             f"ev=watchtower_ready comrade={_kv(self.me)} slug={_kv(self.slug)} "
@@ -846,6 +981,11 @@ class Watchtower:
     def _poll_once(self):
         gazettes = self._scan()
         messages = []   # (ts, line)
+        # Reload the alias map from disk each poll so manual `cccp alias` edits
+        # (written by a separate process) are picked up; live learnings merge in.
+        if self.trigger:
+            self.aliases = load_aliases(self.slug, self.me)
+        alias_dirty = False
 
         for comrade, size in gazettes.items():
             if comrade == self.me:
@@ -866,11 +1006,22 @@ class Watchtower:
                     d = json.loads(chunk)
                 except ValueError:
                     continue
+                # Learn aliases from every visible message (not just those
+                # addressed to me - intros broadcast), before the render filter.
+                if self.trigger and d.get("type") == "message":
+                    name = parse_alias(d.get("body", ""), self.trigger)
+                    if name and d.get("from"):
+                        ev = learn_alias(self.aliases, d["from"], name)
+                        if ev:
+                            alias_dirty = True
+                            messages.append((d.get("ts", now_iso()), ev))
                 line = self._render(d)
                 if line:
                     messages.append((d.get("ts", now_iso()), line))
             self.hwm[comrade] = offset + consumed
 
+        if alias_dirty:
+            save_aliases(self.slug, self.me, self.aliases)
         messages.sort(key=lambda x: x[0])
         for ts_str, line in messages:
             self._emit(line)
@@ -912,12 +1063,25 @@ class Watchtower:
             self.idle_current = next_idle
             self.idle_due = now + self.idle_current
 
+    def _aliased(self, d):
+        """A copy of `d` with `from`/`to` ids rendered as aliases (metadata only,
+        never the body). A no-op when aliases are off/empty. Called AFTER the
+        addressed-to-me check and any side effects, which use the raw ids."""
+        if not self.aliases:
+            return d
+        out = dict(d)
+        if out.get("from") is not None:
+            out["from"] = alias_or_id(self.aliases, self.me, out["from"])
+        out["to"] = [alias_or_id(self.aliases, self.me, x)
+                     for x in (d.get("to") or ["*"])]
+        return out
+
     def _render(self, d):
         if not addressed_to_me(d.get("to") or ["*"], self.me):
             return None
         t = d.get("type")
         if t == "message":
-            return render_message_event(d)
+            return render_message_event(self._aliased(d))
         if t == "filesystem":
             line = self._render_filesystem(d)   # keep the download/unpublish side
             if t in self.quiet:                 # effect; suppress only the notification
@@ -951,7 +1115,7 @@ class Watchtower:
                     missing_ok=True)
             except OSError:
                 pass
-        return render_filesystem_event(d)
+        return render_filesystem_event(self._aliased(d))
 
 
 # ---------- subcommands ----------
@@ -1053,11 +1217,25 @@ def cmd_dispatch(args):
     log = setup_logging(cfg, slug, me, sys.argv)
     client.log = log
     with subcommand_footer(log):
+        # Resolve any alias in --to back to a raw comrade id (the wire only ever
+        # carries ids). Aliases and ids are distinguishable, so this is a no-op
+        # for id/`*` recipients and errors on an unknown alias.
+        to = args.to if args.to else ["*"]
+        if any(not is_comrade_id(t) and t != "*" for t in to):
+            amap = load_aliases(slug, me)
+            resolved = []
+            for t in to:
+                cid, err = resolve_recipient(amap, t)
+                if err:
+                    sys.exit(f"error: {err} - known aliases: "
+                             f"{', '.join(sorted(amap.values())) or '(none)'}")
+                resolved.append(cid)
+            to = resolved
         d = {
             "type": "message",
             "ts": now_iso(),
             "from": me,
-            "to": args.to if args.to else ["*"],
+            "to": to,
             "body": args.body,
         }
         with TimeLogger(log, "dispatch_append", body_chars=len(args.body),
@@ -1077,7 +1255,7 @@ def cmd_watchtower(args):
     # with a reason, which is the richer lifecycle record for a long-lived
     # process.
     Watchtower(client, cfg["PREFIX"], slug, me, args.idle * 60, log=log,
-               quiet=args.quiet).run()
+               quiet=args.quiet, trigger=args.alias_trigger).run()
 
 
 def cmd_wake(args):
@@ -1310,6 +1488,55 @@ def cmd_pull(args):
 
 # ---------- argparse ----------
 
+def cmd_aliases(args):
+    """List this cell's local alias map (name = id), one per line. Purely local -
+    no config, no network."""
+    amap = load_aliases(slugify(args.cell), comrade_id())
+    if not amap:
+        print("(no aliases)")
+        return
+    for cid, name in sorted(amap.items(), key=lambda kv: kv[1]):
+        print(f"{name} = {cid}")
+
+
+def cmd_alias(args):
+    """Show or set an alias in the local map. One arg shows (by name or id); two
+    args set/correct - order-free, since an id (has @:) and an alias never look
+    alike. Local only."""
+    slug, me = slugify(args.cell), comrade_id()
+    amap = load_aliases(slug, me)
+    parts = args.args
+    if len(parts) == 1:
+        q = parts[0]
+        if is_comrade_id(q):
+            print(f"{q} = {amap[q]}" if q in amap else f"{q}: no alias")
+        else:
+            cid = next((i for i, a in amap.items() if a == q), None)
+            print(f"{q} = {cid}" if cid else f"{q}: no such alias")
+    elif len(parts) == 2:
+        ids = [p for p in parts if is_comrade_id(p)]
+        names = [p for p in parts if not is_comrade_id(p)]
+        if len(ids) != 1 or len(names) != 1:
+            sys.exit("error: set needs exactly one comrade id and one alias")
+        learn_alias(amap, ids[0], names[0])   # reassign semantics; discard event
+        save_aliases(slug, me, amap)
+        print(f"{names[0]} = {ids[0]}")
+    else:
+        sys.exit("error: alias takes <name-or-id> (show) or <name> <id> (set)")
+
+
+def cmd_unalias(args):
+    """Remove an alias from the local map, by name. Local only."""
+    slug, me = slugify(args.cell), comrade_id()
+    amap = load_aliases(slug, me)
+    cid = next((i for i, a in amap.items() if a == args.name), None)
+    if cid is None:
+        sys.exit(f"error: no such alias {args.name!r}")
+    del amap[cid]
+    save_aliases(slug, me, amap)
+    print(f"cleared {args.name}")
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="cccp",
@@ -1322,7 +1549,8 @@ def build_parser():
     # shows in top-level `cccp --help`.
     sub = p.add_subparsers(
         dest="cmd", required=True,
-        metavar="{dispatch,watchtower,wake,read,rm,publish,unpublish,pull}")
+        metavar="{dispatch,watchtower,wake,read,rm,publish,unpublish,pull,"
+                "aliases,alias,unalias}")
 
     # No `help=` kwarg: argparse only emits a subcommand's detail line when a
     # truthy help is passed, so omitting it (NOT help=SUPPRESS, which is itself a
@@ -1342,7 +1570,7 @@ def build_parser():
     disp = sub.add_parser("dispatch", help="Send a message to a cell.")
     disp.add_argument("cell", help="Cell slug.")
     disp.add_argument("--to", action="append", default=[], metavar="COMRADE",
-                      help="Repeatable. Comrade id; omit for broadcast.")
+                      help="Repeatable. Comrade id or alias; omit for broadcast.")
     disp.add_argument("body", help="Message text.")
     disp.set_defaults(func=cmd_dispatch)
 
@@ -1361,7 +1589,29 @@ def build_parser():
                          "suppressed). A coordination hub passes `--quiet filesystem` "
                          "to drop redundant publish pings when a pointer dispatch "
                          "already announced the file.")
+    wt.add_argument("--alias-trigger", metavar="PREFIX", default=None,
+                    help="Opt-in aliases: when a message body starts with this "
+                         "prefix, the first shell-safe token after it is the "
+                         "sender's alias. Off (ids only) when omitted; the `team` "
+                         "skill sets it.")
     wt.set_defaults(func=cmd_watchtower)
+
+    al = sub.add_parser("aliases", help="List this cell's local alias map.")
+    al.add_argument("cell", help="Cell slug.")
+    al.set_defaults(func=cmd_aliases)
+
+    ali = sub.add_parser("alias",
+                         help="Show or set an alias (local): one arg shows (name "
+                              "or id), two args set (order-free).")
+    ali.add_argument("cell", help="Cell slug.")
+    ali.add_argument("args", nargs="+", metavar="NAME|ID",
+                     help="<name-or-id> to show, or <name> <id> (either order) to set.")
+    ali.set_defaults(func=cmd_alias)
+
+    un = sub.add_parser("unalias", help="Clear an alias (local).")
+    un.add_argument("cell", help="Cell slug.")
+    un.add_argument("name", help="Alias to remove.")
+    un.set_defaults(func=cmd_unalias)
 
     wk = sub.add_parser("wake",
                         help="SIGUSR1 the local watchtower for this cell so it "

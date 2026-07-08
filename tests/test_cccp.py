@@ -297,5 +297,71 @@ class SkillCompose(unittest.TestCase):
             cccp.compose_skill("nope")
 
 
+class Aliases(unittest.TestCase):
+    """Pure alias logic: id/name disambiguation, parsing, learn/classify, render."""
+
+    def test_id_vs_alias(self):
+        self.assertTrue(cccp.is_comrade_id("co@fs:abc123"))
+        self.assertFalse(cccp.is_comrade_id("Alice"))
+        self.assertFalse(cccp.is_comrade_id("also-not-1"))
+
+    def test_parse_alias(self):
+        self.assertEqual(cccp.parse_alias("Alias: Foreman — hi", "Alias:"), "Foreman")
+        self.assertEqual(cccp.parse_alias("Alias:   Bob_1 reporting", "Alias:"), "Bob_1")
+        self.assertIsNone(cccp.parse_alias("just a normal message", "Alias:"))
+        self.assertIsNone(cccp.parse_alias("Alias: hi", None))       # no trigger -> off
+        self.assertIsNone(cccp.parse_alias("Alias: !!!", "Alias:"))  # no token after
+
+    def test_learn_new_rename_reassign(self):
+        m = {}
+        self.assertIn("kind=new", cccp.learn_alias(m, "u@h:aaa", "Alice"))
+        self.assertEqual(m, {"u@h:aaa": "Alice"})
+        self.assertIsNone(cccp.learn_alias(m, "u@h:aaa", "Alice"))   # no-op
+
+        # rename: same id, new name
+        ev = cccp.learn_alias(m, "u@h:aaa", "Ada")
+        self.assertIn("kind=rename", ev)
+        self.assertIn("was=Alice", ev)
+        self.assertEqual(m, {"u@h:aaa": "Ada"})
+
+        # reassign: name taken by a new id (handoff) -> old holder drops it
+        ev = cccp.learn_alias(m, "u@h:bbb", "Ada")
+        self.assertIn("kind=reassign", ev)
+        self.assertIn("was_id=u@h:aaa", ev)
+        self.assertEqual(m, {"u@h:bbb": "Ada"})   # one name -> one id
+
+    def test_alias_or_id(self):
+        m = {"u@h:bbb": "Bob"}
+        self.assertEqual(cccp.alias_or_id(m, "u@h:me", "u@h:me"), "you")
+        self.assertEqual(cccp.alias_or_id(m, "u@h:me", "u@h:bbb"), "Bob")
+        self.assertEqual(cccp.alias_or_id(m, "u@h:me", "u@h:ccc"), "u@h:ccc")
+
+    def test_resolve_recipient(self):
+        m = {"u@h:bbb": "Bob"}
+        self.assertEqual(cccp.resolve_recipient(m, "Bob"), ("u@h:bbb", None))
+        self.assertEqual(cccp.resolve_recipient(m, "u@h:ccc"), ("u@h:ccc", None))
+        self.assertEqual(cccp.resolve_recipient(m, "*"), ("*", None))
+        cid, err = cccp.resolve_recipient(m, "Nobody")
+        self.assertIsNone(cid)
+        self.assertIn("unknown alias", err)
+
+    def test_watchtower_translates_metadata_only(self):
+        wt = cccp.Watchtower(None, "p", "demo", "me@h:mmm", 0, trigger="Alias:")
+        wt.aliases = {"u@h:bbb": "Bob"}
+        d = {"type": "message", "from": "u@h:bbb",
+             "ts": "2026-01-01T00:00:00.000000Z",
+             "to": ["me@h:mmm", "u@h:ccc"], "body": "u@h:bbb in the body stays"}
+        out = cccp.render_message_event(wt._aliased(d))
+        self.assertIn("from=Bob", out)          # known id -> alias
+        self.assertIn("you", out)               # self -> you
+        self.assertIn("u@h:ccc", out)           # unknown -> raw id
+        self.assertIn("u@h:bbb in the body stays", out)  # body untouched
+
+    def test_watchtower_aliased_is_noop_when_off(self):
+        wt = cccp.Watchtower(None, "p", "demo", "me@h:mmm", 0)   # no trigger
+        d = {"type": "message", "from": "u@h:bbb", "to": ["*"], "body": "hi"}
+        self.assertIs(wt._aliased(d), d)        # empty map -> same object, no work
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
