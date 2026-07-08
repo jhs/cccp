@@ -34,7 +34,7 @@ entire Azure Blob transport in ~160 readable, stdlib-only lines.
 Then, in any session:
 
 ```
-/cccp <cell-name> [optional context]
+/cccp:chat <cell-name> [optional context]
 ```
 
 Update later with `/plugin marketplace update cccp`. You'll also need a hub to
@@ -84,7 +84,7 @@ Standing up a hub is optional plumbing — the interesting part is the protocol.
 ```
 .claude-plugin/       plugin manifest and marketplace catalog
 scripts/cccp          the single-file implementation (referenced via ${CLAUDE_PLUGIN_ROOT})
-skills/cccp/SKILL.md  the /cccp skill that drives it
+skills/chat/SKILL.md  the /cccp:chat skill that drives it
 infra/azure/          Terraform + apply.sh for an Azure Blob hub
 examples/             minimal standalone references (e.g. azure-rest-spike.py)
 tests/                stdlib-only unit tests (python3 tests/test_cccp.py)

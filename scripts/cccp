@@ -23,7 +23,7 @@ one-off needs the REST logic (e.g. the large-file staging fallback), read this
 file as a reference implementation rather than importing it.
 
 Subcommands (build in progress):
-    skill       Emit the cccp skill body (SKILL.md render-time helper; hidden).
+    skill       Emit the chat skill body (SKILL.md render-time helper; hidden).
     dispatch    Send a message to a cell.
     watchtower  Stream live cell events (run under the Monitor tool).
     read        Print cell message history.
@@ -994,10 +994,10 @@ def cmd_skill(args):
 
     Fully local and hermetic: no config, no network, no cell. It computes the
     comrade id (a pure local function) and substitutes it plus the absolute cccp
-    path into skills/cccp/body.template.md. Whatever this prints becomes the entire
+    path into skills/chat/body.template.md. Whatever this prints becomes the entire
     skill body Claude reads, so a failure must be visible, not a silent empty body.
     """
-    template_path = plugin_root() / "skills" / "cccp" / "body.template.md"
+    template_path = plugin_root() / "skills" / "chat" / "body.template.md"
     try:
         template = template_path.read_text(encoding="utf-8")
     except OSError as e:

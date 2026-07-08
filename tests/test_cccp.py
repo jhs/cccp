@@ -242,7 +242,7 @@ class SkillTemplateFile(unittest.TestCase):
 
     def _template(self):
         here = os.path.dirname(os.path.abspath(__file__))
-        path = os.path.join(here, os.pardir, "skills", "cccp", "body.template.md")
+        path = os.path.join(here, os.pardir, "skills", "chat", "body.template.md")
         with open(path, encoding="utf-8") as f:
             return f.read()
 
