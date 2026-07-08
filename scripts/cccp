@@ -995,6 +995,7 @@ def render_skill_body(template, comrade_id, cccp_path):
 SKILL_STACK = {
     "chat": ["chat"],
     "team": ["chat", "team"],
+    "foreman": ["chat", "team", "foreman"],
 }
 
 # The trailing frame, appended once after the whole stack. The user's arguments

@@ -279,6 +279,19 @@ class SkillCompose(unittest.TestCase):
         self.assertNotIn("Team norms", out)             # no team layer for plain chat
         self.assertIn("## Your instructions", out)      # outro still appended
 
+    def test_foreman_is_three_layer_stack(self):
+        """foreman = [chat, team, foreman] - transitive composition, base-first,
+        outro still exactly once."""
+        with mock.patch.dict(os.environ, {"CCCP_COMRADE_ID": "x@y:zzzzzz"}):
+            out = cccp.compose_skill("foreman")
+        self.assertNotIn("@@", out)
+        i_chat = out.index("# CCCP")
+        i_team = out.index("Team norms")
+        i_fore = out.index("owning the cell's coordination")
+        i_args = out.index("Your instructions")
+        self.assertTrue(i_chat < i_team < i_fore < i_args)   # base → L1 → L2 → outro
+        self.assertEqual(out.count("## Your instructions"), 1)
+
     def test_unknown_skill_exits(self):
         with self.assertRaises(SystemExit):
             cccp.compose_skill("nope")
