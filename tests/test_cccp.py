@@ -13,6 +13,7 @@ import json
 import os
 import unittest
 from importlib.machinery import SourceFileLoader
+from unittest import mock
 
 
 def _find_cccp():
@@ -179,6 +180,81 @@ class Continuation(unittest.TestCase):
         out = cccp.message_read_output(short, full=False)
         self.assertEqual(out, "short enough to arrive whole")
         self.assertNotIn("…from char", out)
+
+
+class ComradeId(unittest.TestCase):
+    """Identity is a pure local function - no network, no cell, no claim."""
+
+    def test_env_override_wins(self):
+        with mock.patch.dict(os.environ, {"CCCP_COMRADE_ID": "custom@id:xyz"}):
+            self.assertEqual(cccp.comrade_id(), "custom@id:xyz")
+
+    def test_format_is_user_at_host_colon_six_hex(self):
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "abcdef1234567890"}):
+            os.environ.pop("CCCP_COMRADE_ID", None)   # ensure override is off
+            cid = cccp.comrade_id()
+        # user@host:<first-6-of-session> - always suffixed, never bare
+        self.assertRegex(cid, r"^[^@]+@[^:]+:abcdef$")
+
+
+class SkillRender(unittest.TestCase):
+    """render_skill_body must resolve every @@token@@ and touch nothing else - its
+    output is spliced verbatim into Claude's view and is NOT re-rendered, so a
+    leftover token would reach the reader literally. The cell slug is deliberately
+    a literal <slug> placeholder the reader fills from its args, NOT a token."""
+
+    TEMPLATE = (
+        "cmd is @@CCCP@@\n"
+        "You are `@@COMRADE_ID@@`.\n"
+        "run: \"@@CCCP@@\" watchtower <slug>\n"
+        "shell note: `$vars` and `{\"json\": 1}` stay literal; email a@b unchanged\n"
+    )
+
+    def _render(self):
+        return cccp.render_skill_body(
+            self.TEMPLATE, "alice@hostA:aaaaaa", "/plug/scripts/cccp")
+
+    def test_all_tokens_resolved(self):
+        self.assertNotIn("@@", self._render())  # no token delimiter survives
+
+    def test_values_substituted(self):
+        out = self._render()
+        self.assertIn("cmd is /plug/scripts/cccp", out)
+        self.assertIn("You are `alice@hostA:aaaaaa`.", out)
+        self.assertIn('"/plug/scripts/cccp" watchtower <slug>', out)
+
+    def test_non_token_content_untouched(self):
+        """Shell `$vars`, JSON braces, bare single-@ emails, and the <slug>
+        placeholder must all pass through unchanged - only @@...@@ is a token."""
+        out = self._render()
+        self.assertIn('`$vars` and `{"json": 1}` stay literal', out)
+        self.assertIn("email a@b unchanged", out)
+        self.assertIn("<slug>", out)
+
+    def test_repeated_token_all_occurrences(self):
+        """@@CCCP@@ appears 2x in the template; every one is replaced."""
+        self.assertEqual(self._render().count("/plug/scripts/cccp"), 2)
+
+
+class SkillTemplateFile(unittest.TestCase):
+    """The shipped cccp skill template must render with no leftover tokens and must
+    not smuggle in a substitution Claude would choke on (it is not re-rendered)."""
+
+    def _template(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(here, os.pardir, "skills", "cccp", "body.template.md")
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+
+    def test_ships_and_renders_clean(self):
+        rendered = cccp.render_skill_body(
+            self._template(), "bob@hostB:1a2b3c", "/x/scripts/cccp")
+        self.assertNotIn("@@", rendered)                     # no unresolved token
+        self.assertNotIn("${CLAUDE_PLUGIN_ROOT}", rendered)  # path fully resolved
+        self.assertNotIn("$ARGUMENTS", rendered)             # args come from SKILL.md
+        self.assertIn("bob@hostB:1a2b3c", rendered)
+        self.assertIn("/x/scripts/cccp", rendered)
+        self.assertIn("<slug>", rendered)                    # slug stays a placeholder
 
 
 if __name__ == "__main__":
