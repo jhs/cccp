@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""claude-tokens - report or watch this Claude session's context/token usage.
+
+See skills/token-aware/SKILL.md for usage.
+
+Reads the per-session snapshot the statusLine side-write drops at
+~/.claude-status/<session_id>.json (see bin/cccp-statusline). 'status'
+prints a one-shot summary; 'watch' streams milestone events for the Monitor tool.
+Session id resolves from the optional positional arg, else $CLAUDE_CODE_SESSION_ID
+(exported into Bash and Monitor commands), else the newest snapshot on disk.
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+STATUS_DIR = Path.home() / ".claude-status"
+DEFAULT_THRESHOLDS = (50, 75, 90, 95)
+
+
+def resolve_session(arg):
+    """Return (session_id, source). Positional arg > env > newest snapshot."""
+    if arg:
+        return arg, "argument"
+    for var in ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID"):
+        v = os.environ.get(var)
+        if v:
+            return v, var
+    snaps = sorted(STATUS_DIR.glob("*.json"),
+                   key=lambda p: p.stat().st_mtime, reverse=True)
+    if snaps:
+        return snaps[0].stem, "newest-snapshot"
+    return None, None
+
+
+def snapshot_path(sid):
+    return STATUS_DIR / f"{sid}.json"
+
+
+def humanize(n):
+    """840 -> '840', 15700 -> '15.7k', 1000000 -> '1M'."""
+    n = float(n)
+    if n < 1000:
+        return str(int(round(n)))
+    if n < 1_000_000:
+        v = n / 1000
+        return f"{v:.0f}k" if v == int(v) else f"{v:.1f}k"
+    v = n / 1_000_000
+    return f"{v:.0f}M" if v == int(v) else f"{v:.1f}M"
+
+
+def fmt_elapsed(seconds):
+    seconds = int(round(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    m, s = divmod(seconds, 60)
+    if m < 60:
+        return f"{m}m{s:02d}s" if s else f"{m}m"
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m"
+
+
+def metrics(payload):
+    """Extract usage fields, or None when context data is absent (fresh/compacted)."""
+    cw = payload.get("context_window") or {}
+    size = cw.get("context_window_size") or 0
+    if not size:
+        return None
+    used = (cw.get("total_input_tokens") or 0) + (cw.get("total_output_tokens") or 0)
+    pct = cw.get("used_percentage")
+    if pct is None:
+        pct = used / size * 100
+    return {
+        "pct": pct,
+        "used": used,
+        "size": size,
+        "model": (payload.get("model") or {}).get("display_name") or "?",
+        "cost": (payload.get("cost") or {}).get("total_cost_usd"),
+    }
+
+
+def summary(m, sid, age=None):
+    cost = f"${m['cost']:.2f}" if m["cost"] is not None else "n/a"
+    parts = [
+        f"{m['pct']:.0f}% ({humanize(m['used'])}/{humanize(m['size'])})",
+        f"model {m['model']}",
+        f"cost {cost}",
+    ]
+    if age is not None:
+        parts.append(f"snapshot {fmt_elapsed(age)} old")
+    parts.append(f"session {sid[:8]}")
+    return " | ".join(parts)
+
+
+def cmd_status(args):
+    sid, source = resolve_session(args.session)
+    if not sid:
+        print("No session id and no snapshots in ~/.claude-status/ "
+              "-- is the statusLine side-write installed?", file=sys.stderr)
+        return 1
+    path = snapshot_path(sid)
+    if not path.exists():
+        print(f"No snapshot yet for session {sid[:8]} ({source}). The statusLine "
+              "side-write may not be wired up (see skills/token-aware/SKILL.md Setup) "
+              "or no render has fired since this session started.")
+        return 0
+    m = metrics(json.loads(path.read_text()))
+    if m is None:
+        print(f"Snapshot for {sid[:8]} has no context_window data yet "
+              "(fresh session or just compacted)")
+        return 0
+    age = time.time() - path.stat().st_mtime
+    print(summary(m, sid, age))
+    return 0
+
+
+def cmd_watch(args):
+    sid, source = resolve_session(args.session)
+    if not sid:
+        print("No session id and no snapshots in ~/.claude-status/ "
+              "-- is the statusLine side-write installed?", flush=True)
+        return 1
+
+    thresholds = sorted(set(args.thresholds)) if args.thresholds else list(DEFAULT_THRESHOLDS)
+
+    path = snapshot_path(sid)
+    prev = None          # last emitted event: {t, pct, used}
+    armed = set()        # thresholds already fired (or passed at start)
+    waiting = False
+    while True:
+        try:
+            m = metrics(json.loads(path.read_text())) if path.exists() else None
+        except (ValueError, OSError):
+            m = None       # transient (mid-write race is impossible: writer is atomic)
+        now = time.time()
+
+        if m is None:
+            if not waiting:
+                print(f"Waiting for first snapshot for session {sid[:8]} ({source})...",
+                      flush=True)
+                waiting = True
+            time.sleep(args.interval)
+            continue
+
+        if prev is None:
+            print("Start watch: " + summary(m, sid), flush=True)
+            prev = {"t": now, "pct": m["pct"], "used": m["used"]}
+            armed = {t for t in thresholds if m["pct"] >= t}  # don't retro-fire
+            time.sleep(args.interval)
+            continue
+
+        for t in thresholds:
+            if t in armed or m["pct"] < t:
+                continue
+            armed.add(t)
+            dt = now - prev["t"]
+            vel = (m["used"] - prev["used"]) / dt * 60 if dt > 0 else 0  # tokens/min
+            etas = []
+            if vel > 0:
+                for x in (x for x in thresholds if x > t):
+                    target = x / 100 * m["size"]
+                    if target > m["used"]:
+                        etas.append(f"to {x:g}% ~{fmt_elapsed((target - m['used']) / vel * 60)}")
+            eta = f", ETA {', '.join(etas)}" if etas else ""
+            print(f"Crossed {t:g}%: {summary(m, sid)} "
+                  f"(+{fmt_elapsed(dt)} since {prev['pct']:.0f}%/{humanize(prev['used'])}, "
+                  f"~{humanize(vel)}/min avg{eta})", flush=True)
+            prev = {"t": now, "pct": m["pct"], "used": m["used"]}
+
+        time.sleep(args.interval)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Report or watch this session's token usage")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("status", help="Print a one-shot usage summary")
+    s.add_argument("session", nargs="?", help="Session id (default: $CLAUDE_CODE_SESSION_ID)")
+    s.set_defaults(func=cmd_status)
+
+    w = sub.add_parser("watch", help="Stream milestone events for the Monitor tool")
+    w.add_argument("session", nargs="?", help="Session id (default: $CLAUDE_CODE_SESSION_ID)")
+    w.add_argument("--interval", type=float, default=5.0, help="Poll seconds (default 5)")
+    w.add_argument("--threshold", "-t", type=float, action="append", dest="thresholds",
+                   metavar="PCT", help="Milestone percent to alert on; repeatable "
+                   "(default: 50 75 90 95)")
+    w.set_defaults(func=cmd_watch)
+
+    args = ap.parse_args()
+    sys.exit(args.func(args))
+
+
+if __name__ == "__main__":
+    main()
