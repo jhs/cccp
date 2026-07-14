@@ -1,87 +1,53 @@
-#!/usr/bin/env python3
-"""cccp-statusline - minimal statusLine command with a token-aware side-write.
+#!/bin/bash
+#
+# Collect session status data for CCCP.
+#
+# Reads the statusLine JSON payload from stdin and atomically writes it to
+# <data_dir>/<session_id>.json for use by other programs in this plugin.
+# 
+# Produces no output
+#
+# --plugin-data <dir>   Data directory (required).
+# --passthrough         Copy stdin to stdout, for piping into another
+#                       statusLine command.
 
-Wire into settings.json or settings.local.json:
+data_dir=""
+passthrough=false
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --plugin-data) data_dir="$2"; shift 2 ;;
+        --plugin-data=*) data_dir="${1#--plugin-data=}"; shift ;;
+        --passthrough) passthrough=true; shift ;;
+        *) shift ;;
+    esac
+done
 
-    "statusLine": {"command": "${CLAUDE_PLUGIN_ROOT}/bin/cccp-statusline"}
+if [[ -z "$data_dir" ]]; then
+    echo "cccp-statusline: --plugin-data is required" >&2
+    exit 1
+fi
 
-Reads the statusLine JSON payload Claude Code passes on stdin, atomically
-side-writes it to ~/.claude-status/<session_id>.json (consumed by the
-token-aware skill's `claude-tokens` command), then prints a minimal status
-line: context-window usage, model, and cwd.
+input=$(cat)
 
-Already run a custom statusLine script and want to keep it? Simpler than
-switching wholesale: copy the side_write() call below into it instead of
-replacing it outright.
-"""
+# Write claude auth status. Cached with 5h TTL.
+auth_file="$data_dir/claude-auth-status.json"
+if ! [[ -f "$auth_file" ]] || [[ -z $(find "$auth_file" -mmin -300 -print 2>/dev/null) ]]; then
+    mkdir -p "$data_dir" 2>/dev/null
+    auth_tmp=$(mktemp "${auth_file}.XXXXXX")
+    if claude auth status 2>/dev/null >"$auth_tmp"; then
+        mv "$auth_tmp" "$auth_file" 2>/dev/null || rm -f "$auth_tmp" 2>/dev/null
+    else
+        rm -f "$auth_tmp"
+    fi
+fi
 
-import json
-import sys
-from pathlib import Path
+# Write session status data to a per-session file for claude-tokens.
+sid=$(printf '%s' "$input" | jq -r '.session_id // empty')
+if [[ -n "$sid" ]]; then
+    mkdir -p "$data_dir" 2>/dev/null
+    printf '%s' "$input" > "$data_dir/$sid.json.tmp" && mv "$data_dir/$sid.json.tmp" "$data_dir/$sid.json"
+fi
 
-STATUS_DIR = Path.home() / ".claude-status"
-
-
-def humanize(n):
-    """840 -> '840', 15700 -> '15.7k', 1000000 -> '1M'."""
-    n = float(n)
-    if n < 1000:
-        return str(int(round(n)))
-    if n < 1_000_000:
-        v = n / 1000
-        return f"{v:.0f}k" if v == int(v) else f"{v:.1f}k"
-    v = n / 1_000_000
-    return f"{v:.0f}M" if v == int(v) else f"{v:.1f}M"
-
-
-def side_write(payload, session_id):
-    """Atomically drop the full payload so other tools (claude-tokens) can read it."""
-    STATUS_DIR.mkdir(parents=True, exist_ok=True)
-    dest = STATUS_DIR / f"{session_id}.json"
-    tmp = dest.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload))
-    tmp.rename(dest)
-
-
-def context_widget(payload):
-    cw = payload.get("context_window") or {}
-    size = cw.get("context_window_size") or 0
-    if not size:
-        return None
-    used = (cw.get("total_input_tokens") or 0) + (cw.get("total_output_tokens") or 0)
-    pct = cw.get("used_percentage")
-    if pct is None:
-        pct = used / size * 100
-    return f"{pct:.0f}% ({humanize(used)}/{humanize(size)})"
-
-
-def rel_home(path):
-    home = str(Path.home())
-    return "~" + path[len(home):] if path.startswith(home) else path
-
-
-def main():
-    payload = json.loads(sys.stdin.read() or "{}")
-
-    session_id = payload.get("session_id")
-    if session_id:
-        try:
-            side_write(payload, session_id)
-        except OSError as e:
-            print(f"cccp-statusline: side-write failed: {e}", file=sys.stderr)
-
-    parts = []
-    ctx = context_widget(payload)
-    if ctx:
-        parts.append(ctx)
-    model = (payload.get("model") or {}).get("display_name")
-    if model:
-        parts.append(model)
-    cwd = (payload.get("workspace") or {}).get("current_dir")
-    if cwd:
-        parts.append(rel_home(cwd))
-    print(" | ".join(parts))
-
-
-if __name__ == "__main__":
-    main()
+if $passthrough; then
+    printf '%s' "$input"
+fi

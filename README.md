@@ -94,24 +94,15 @@ long-running work, so a comrade knows when to wrap a lane, write a hand-off
 note, and go quiet on its own terms — matching the `team` skill's wind-down
 norms — instead of running out entirely.
 
-It needs a `statusLine` command that side-writes session JSON snapshots to
-`~/.claude-status/<session_id>.json` — Claude Code plugins can't register a
-`statusLine` themselves (there's no such hook type), so wire it in once:
-
-```json
-"statusLine": {"command": "${CLAUDE_PLUGIN_ROOT}/bin/cccp-statusline"}
-```
-
-in `~/.claude/settings.json`. See [`skills/token-aware/SKILL.md`](./skills/token-aware/SKILL.md)
-for details, including how to fold the side-write into an existing custom
-statusline instead of replacing it.
+It requires a one-time setup, to use Claude Code's `statusLine` feature,
+which the skill walks through on first use.
 
 ## Repository layout
 
 ```
 .claude-plugin/       plugin manifest and marketplace catalog
 bin/cccp              the single-file implementation (on $PATH as bare `cccp` while the plugin is enabled)
-bin/cccp-statusline   minimal statusLine command + token-aware's side-write (see Staying context-aware)
+bin/cccp-statusline   side-writes session JSON for claude-tokens; no visible output (see Staying context-aware)
 bin/claude-tokens     token-aware's CLI (on $PATH as bare `claude-tokens`)
 skills/               the /cccp:* skills — chat, team, … stacked at render time by `cccp skill`, plus token-aware for context-budget awareness
 infra/azure/          Terraform + apply.sh for an Azure Blob hub

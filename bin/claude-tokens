@@ -4,10 +4,10 @@
 See skills/token-aware/SKILL.md for usage.
 
 Reads the per-session snapshot the statusLine side-write drops at
-~/.claude-status/<session_id>.json (see bin/cccp-statusline). 'status'
-prints a one-shot summary; 'watch' streams milestone events for the Monitor tool.
-Session id resolves from the optional positional arg, else $CLAUDE_CODE_SESSION_ID
-(exported into Bash and Monitor commands), else the newest snapshot on disk.
+$CCCP_PLUGIN_DATA/<session_id>.json (see bin/cccp-statusline). 'status'
+prints a one-shot summary; 'watch' streams milestone events for the Monitor
+tool. Session id resolves from the optional positional arg, else
+$CLAUDE_CODE_SESSION_ID, else the newest snapshot on disk.
 """
 
 import argparse
@@ -17,7 +17,16 @@ import sys
 import time
 from pathlib import Path
 
-STATUS_DIR = Path.home() / ".claude-status"
+
+def _data_dir():
+    d = os.environ.get("CCCP_PLUGIN_DATA")
+    if not d:
+        print("CCCP_PLUGIN_DATA is not set -- is the cccp plugin enabled?",
+              file=sys.stderr)
+        sys.exit(1)
+    return Path(d)
+
+
 DEFAULT_THRESHOLDS = (50, 75, 90, 95)
 
 
@@ -29,7 +38,7 @@ def resolve_session(arg):
         v = os.environ.get(var)
         if v:
             return v, var
-    snaps = sorted(STATUS_DIR.glob("*.json"),
+    snaps = sorted(_data_dir().glob("*.json"),
                    key=lambda p: p.stat().st_mtime, reverse=True)
     if snaps:
         return snaps[0].stem, "newest-snapshot"
@@ -37,7 +46,7 @@ def resolve_session(arg):
 
 
 def snapshot_path(sid):
-    return STATUS_DIR / f"{sid}.json"
+    return _data_dir() / f"{sid}.json"
 
 
 def humanize(n):
@@ -98,7 +107,7 @@ def summary(m, sid, age=None):
 def cmd_status(args):
     sid, source = resolve_session(args.session)
     if not sid:
-        print("No session id and no snapshots in ~/.claude-status/ "
+        print("No session id and no snapshots in data dir "
               "-- is the statusLine side-write installed?", file=sys.stderr)
         return 1
     path = snapshot_path(sid)
@@ -120,21 +129,21 @@ def cmd_status(args):
 def cmd_watch(args):
     sid, source = resolve_session(args.session)
     if not sid:
-        print("No session id and no snapshots in ~/.claude-status/ "
+        print("No session id and no snapshots in data dir "
               "-- is the statusLine side-write installed?", flush=True)
         return 1
 
     thresholds = sorted(set(args.thresholds)) if args.thresholds else list(DEFAULT_THRESHOLDS)
 
     path = snapshot_path(sid)
-    prev = None          # last emitted event: {t, pct, used}
-    armed = set()        # thresholds already fired (or passed at start)
+    prev = None
+    armed = set()
     waiting = False
     while True:
         try:
             m = metrics(json.loads(path.read_text())) if path.exists() else None
         except (ValueError, OSError):
-            m = None       # transient (mid-write race is impossible: writer is atomic)
+            m = None
         now = time.time()
 
         if m is None:
@@ -148,7 +157,7 @@ def cmd_watch(args):
         if prev is None:
             print("Start watch: " + summary(m, sid), flush=True)
             prev = {"t": now, "pct": m["pct"], "used": m["used"]}
-            armed = {t for t in thresholds if m["pct"] >= t}  # don't retro-fire
+            armed = {t for t in thresholds if m["pct"] >= t}
             time.sleep(args.interval)
             continue
 
@@ -157,7 +166,7 @@ def cmd_watch(args):
                 continue
             armed.add(t)
             dt = now - prev["t"]
-            vel = (m["used"] - prev["used"]) / dt * 60 if dt > 0 else 0  # tokens/min
+            vel = (m["used"] - prev["used"]) / dt * 60 if dt > 0 else 0
             etas = []
             if vel > 0:
                 for x in (x for x in thresholds if x > t):
