@@ -38,17 +38,17 @@ Run under the **Monitor** tool to get timely notifications as usage climbs:
 claude-tokens watch
 ```
 
-Its **first line** is the same reading as `status`, minus the snapshot-age field (and prefixed `Start watch:`). Example:
+Its **first line** is the same reading as `status`, minus the snapshot-age field (and prefixed `Start watch:`). Example (from a live session):
 
 ```
-Start watch: 8% (80k/1M) | model Fable 5 | cost $2.72 | session 3a0c5a8e
+Start watch: 8% (82.9k/1M) | model Fable 5 | cost $2.72 | session 3a0c5a8e
 ```
 
 Subsequent lines fire only when usage crosses a milestone. These lines include the latest reading, plus: elapsed time since the previous event, interval-average velocity, and an ETA to every remaining milestone. Example:
 
 ```
-Crossed 50%: 50% (500k/1M) | model Fable 5 | cost $305.10 | session 3a0c5a8e (+50h00m since 8%/80k, ~140/min avg, ETA to 75% ~29h45m, to 90% ~47h37m, to 95% ~53h34m)
-Crossed 75%: 75% (750k/1M) | model Fable 5 | cost $470.00 | session 3a0c5a8e (+29h45m since 50%/500k, ~140/min avg, ETA to 90% ~17h51m, to 95% ~23h48m)
+Crossed 20%: 20% (196.0k/1M) | model Fable 5 | cost $42.05 | session 3a0c5a8e (+12h39m since 8%/82.9k, ~149/min avg, ETA to 50% ~34h01m, to 70% ~56h24m, to 85% ~73h11m, to 92% ~81h01m, to 95% ~84h23m)
+Crossed 50%: 50% (495.1k/1M) | model Fable 5 | cost $300.94 | session 3a0c5a8e (+48h54m since 20%/196.0k, ~102/min avg, ETA to 70% ~33h30m, to 85% ~58h02m, to 92% ~69h29m, to 95% ~84h23m)
 ```
 
 Milestones default to 50/75/90/95%. Override them with one or more `--threshold PCT` (repeatable):
@@ -56,6 +56,8 @@ Milestones default to 50/75/90/95%. Override them with one or more `--threshold 
 ```bash
 claude-tokens watch --threshold 80 --threshold 95
 ```
+
+The line shape is the same for any threshold — the run above set custom early ones; the defaults just fire the same format later.
 
 ## Wind-down
 
