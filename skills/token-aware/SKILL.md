@@ -12,7 +12,7 @@ To ascertain how much of the context window this session has consumed, use these
 | Command | Purpose |
 |---|---|
 | `claude-tokens status` | One-shot: print current usage (pct, used/size, model, cost, snapshot age) |
-| `claude-tokens watch` | Stream milestone events (50/80/95%) for the Monitor tool |
+| `claude-tokens watch` | Stream milestone events (50/75/90/95%) for the Monitor tool |
 
 If `claude-tokens` fails (not found, non-zero exit, traceback, etc.) do not troubleshoot but instead halt and inform the user. A "no snapshot yet" message is not an error; it means data is not yet available.
 
@@ -38,15 +38,24 @@ Run under the **Monitor** tool to get timely notifications as usage climbs:
 claude-tokens watch
 ```
 
-The first line is the current reading, identical to running `status`. After that it emits one line only when usage crosses a milestone -- each carrying the current numbers, elapsed since the previous event, the previous event's numbers, and an interval-average velocity (tokens/min) with a rough ETA to each remaining milestone based on velocity.
+Its **first line** is the same reading as `status`, minus the snapshot-age field (and prefixed `Start watch:`). Example:
+
+```
+Start watch: 8% (80k/1M) | model Fable 5 | cost $2.72 | session 3a0c5a8e
+```
+
+Subsequent lines fire only when usage crosses a milestone. These lines include the latest reading, plus: elapsed time since the previous event, interval-average velocity, and an ETA to every remaining milestone. Example:
+
+```
+Crossed 50%: 50% (500k/1M) | model Fable 5 | cost $305.10 | session 3a0c5a8e (+50h00m since 8%/80k, ~140/min avg, ETA to 75% ~29h45m, to 90% ~47h37m, to 95% ~53h34m)
+Crossed 75%: 75% (750k/1M) | model Fable 5 | cost $470.00 | session 3a0c5a8e (+29h45m since 50%/500k, ~140/min avg, ETA to 90% ~17h51m, to 95% ~23h48m)
+```
 
 Milestones default to 50/75/90/95%. Override them with one or more `--threshold PCT` (repeatable):
 
 ```bash
 claude-tokens watch --threshold 80 --threshold 95
 ```
-
-(TODO: Run with some early thresholds like 1% and 5% and then get an example to paste in this document about what that full line looks like)
 
 ## Wind-down
 
