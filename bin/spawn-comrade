@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# spawn-comrade — launch a cccp comrade in a new tmux window.
+#
+# Usage:
+#   spawn-comrade -m MODEL -e EFFORT [OPTIONS] NAME SLUG [DOC...]
+#
+#   NAME        tmux window name and comrade role label
+#   SLUG        cccp cell slug to join
+#   DOC...      docs to point the comrade at on join, in order
+#
+# Options:
+#   -m MODEL    Required. claude --model value (e.g. 'claude-opus-4-8[1m]')
+#   -e EFFORT   Required. claude --effort value (low|medium|high|xhigh|max)
+#   -s SESSION  tmux session (default: current)
+#   -c CWD      working directory (default: current)
+#   -f ID       Foreman comrade ID for targeted intro on join
+#   --skill SK  cccp skill variant (default: team)
+#   --no-skip   don't pass --dangerously-skip-permissions
+#   --force     allow duplicate window names
+#
+# Observe:  tmux capture-pane -t SESSION:NAME -p | tail -40
+# Retire:   tmux kill-window -t SESSION:NAME
+set -euo pipefail
+
+usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+
+session=""
+cwd=""
+model=""
+effort=""
+foreman=""
+skill="team"
+skip=1
+force=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -s) [[ $# -ge 2 ]] || { echo "spawn-comrade: -s needs a value" >&2; exit 1; }; session="$2"; shift 2 ;;
+    -c) [[ $# -ge 2 ]] || { echo "spawn-comrade: -c needs a value" >&2; exit 1; }; cwd="$2"; shift 2 ;;
+    -m|--model) [[ $# -ge 2 ]] || { echo "spawn-comrade: $1 needs a value" >&2; exit 1; }; model="$2"; shift 2 ;;
+    -e|--effort) [[ $# -ge 2 ]] || { echo "spawn-comrade: $1 needs a value" >&2; exit 1; }; effort="$2"; shift 2 ;;
+    -f|--foreman) [[ $# -ge 2 ]] || { echo "spawn-comrade: $1 needs a value" >&2; exit 1; }; foreman="$2"; shift 2 ;;
+    --skill) [[ $# -ge 2 ]] || { echo "spawn-comrade: --skill needs a value" >&2; exit 1; }; skill="$2"; shift 2 ;;
+    --no-skip) skip=0; shift ;;
+    --force) force=1; shift ;;
+    -h|--help) usage ;;
+    --) shift; break ;;
+    -*) echo "spawn-comrade: unknown option: $1" >&2; usage ;;
+    *) break ;;
+  esac
+done
+
+[[ $# -ge 2 ]] || usage
+name="$1"; slug="$2"; shift 2
+extra_docs=("$@")
+
+[[ -n "$model" ]] || { echo "spawn-comrade: -m/--model is required — pass the comrade's model explicitly; never rely on claude's ambient default" >&2; exit 1; }
+[[ -n "$effort" ]] || { echo "spawn-comrade: -e/--effort is required — pass the comrade's effort explicitly; never rely on claude's ambient default" >&2; exit 1; }
+
+command -v tmux >/dev/null || { echo "spawn-comrade: tmux not found" >&2; exit 1; }
+command -v claude >/dev/null || { echo "spawn-comrade: claude not found" >&2; exit 1; }
+
+# Default the session to the one we're running inside.
+if [[ -z "$session" ]]; then
+  session="$(tmux display-message -p '#S' 2>/dev/null || true)"
+  [[ -n "$session" ]] || { echo "spawn-comrade: not inside tmux and no -s given" >&2; exit 1; }
+fi
+tmux has-session -t "$session" 2>/dev/null || { echo "spawn-comrade: no tmux session '$session'" >&2; exit 1; }
+
+# One comrade per role — refuse a duplicate window unless --force.
+if tmux list-windows -t "$session" -F '#W' 2>/dev/null | grep -qxF "$name"; then
+  if (( force )); then
+    echo "spawn-comrade: window '$name' already exists — spawning anyway (--force)" >&2
+  else
+    echo "spawn-comrade: window '$name' already exists in session '$session'" >&2
+    echo "  One comrade per role. Retire it first or pass --force." >&2
+    exit 1
+  fi
+fi
+
+# Build the /cccp:<skill> prompt.
+prompt="/cccp:$skill $slug"
+if [[ ${#extra_docs[@]} -gt 0 ]]; then
+  refs="${extra_docs[0]}"
+  for d in "${extra_docs[@]:1}"; do refs+=" then $d"; done
+  prompt+=" # See $refs"
+fi
+if [[ -n "$foreman" ]]; then
+  prompt+=" -- then introduce yourself to your Foreman at ${foreman},"
+  prompt+=" beginning with the literal prefix Intro: followed by your alias ${name}"
+fi
+
+# Escape single-quotes for the sh -c string ( ' -> '\'' ).
+esc=${prompt//\'/\'\\\'\'}
+flag=""; (( skip )) && flag=" --dangerously-skip-permissions"
+mflag=" --model '${model//\'/\'\\\'\'}'"
+eflag=" --effort '${effort//\'/\'\\\'\'}'"
+nflag=" --name '${name//\'/\'\\\'\'}'"
+cmd="claude${flag}${mflag}${eflag}${nflag} '${esc}'"
+
+[[ -z "$cwd" ]] && cwd="$(pwd)"
+
+# Trailing ':' so tmux reads it as the SESSION and picks the next free window index.
+tmux new-window -d -t "${session}:" -n "$name" -c "$cwd" "$cmd"
+
+echo "Spawned '$name' in $session (cell: $slug, skill: $skill)"
+echo "  watch:  tmux capture-pane -t $session:$name -p | tail -40"
+echo "  retire: tmux kill-window -t $session:$name"

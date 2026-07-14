@@ -1157,6 +1157,7 @@ SKILL_STACK = {
     "chat": ["chat"],
     "team": ["chat", "team"],
     "foreman": ["chat", "team", "foreman"],
+    "foreman-with-tmux": ["chat", "team", "foreman", "foreman-with-tmux"],
 }
 
 # The trailing frame, appended once after the whole stack. The user's arguments
