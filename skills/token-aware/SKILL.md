@@ -38,7 +38,7 @@ Run under the **Monitor** tool to get timely notifications as usage climbs:
 claude-tokens watch
 ```
 
-Its **first line** is the same reading as `status`, minus the snapshot-age field (and prefixed `Start watch:`). Example (from a live session):
+Its **first line** is the current reading, similar to `status`. Example:
 
 ```
 Start watch: 8% (82.9k/1M) | model Fable 5 | cost $2.72 | session 3a0c5a8e
@@ -56,8 +56,6 @@ Milestones default to 50/75/90/95%. Override them with one or more `--threshold 
 ```bash
 claude-tokens watch --threshold 80 --threshold 95
 ```
-
-The line shape is the same for any threshold — the run above set custom early ones; the defaults just fire the same format later.
 
 ## Wind-down
 
