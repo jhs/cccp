@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/export-plugin-env.sh\" >> \"${CLAUDE_ENV_FILE}\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
