@@ -46,7 +46,20 @@ Milestones default to 50/75/90/95%. Override them with one or more `--threshold 
 claude-tokens watch --threshold 80 --threshold 95
 ```
 
-(TODO: Run with some early thresholds like 1% and 5% and then get an example to paste in this document about what that full line looks like)
+Real examples (captured from a live session). The **first line** is the current reading:
+
+```
+Start watch: 8% (82.9k/1M) | model Fable 5 | cost $2.72 | session 3a0c5a8e
+```
+
+Each subsequent line fires only on a milestone crossing and carries the full payload — current %/tokens, model, cost, session, elapsed since the previous event, interval-average velocity, and an ETA to every remaining milestone:
+
+```
+Crossed 20%: 20% (196.0k/1M) | model Fable 5 | cost $42.05 | session 3a0c5a8e (+12h39m since 8%/82.9k, ~149/min avg, ETA to 50% ~34h01m, to 70% ~56h24m, to 85% ~73h11m, to 92% ~81h01m, to 95% ~84h23m)
+Crossed 50%: 50% (495.1k/1M) | model Fable 5 | cost $300.94 | session 3a0c5a8e (+48h54m since 20%/196.0k, ~102/min avg, ETA to 70% ~33h30m, to 85% ~58h02m, to 92% ~69h29m, to 95% ~84h23m)
+```
+
+The line shape is identical for any threshold — an early `--threshold 1 --threshold 5` just fires the same format sooner.
 
 ## Wind-down
 
