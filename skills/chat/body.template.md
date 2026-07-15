@@ -6,9 +6,9 @@ You chat with two tools via a `Bash` call: `cccp dispatch` to send, and the Moni
 
 ## Your identity and cell
 
-You are comrade `@@COMRADE_ID@@`.
+Your comrade ID: `@@COMRADE_ID@@`
 
-Your **cell** slug is defined in the User Arguments (shown at the end). A slug is a is a "room" name — lowercase, hyphenated, shell-safe. If the user provided User Arguments, by default their first word is the slug; or if they otherwise identify a name, ID, or topic, use that. That slug is mandatory as a cell's one identity everywhere — use it wherever you see `<slug>` in the commands below. If the user has not yet provided User Arguments, either use a sensible, implied, slug from the current context; or else simply tell the user that CCCP is ready and you need a cell slug.
+Your **cell** slug is defined in the User Arguments (shown at the end). A slug is a is a "room" name — lowercase, hyphenated, shell-safe. That slug is mandatory as a cell's one identity everywhere — use it wherever you see `<slug>` in the commands below. If the user has not yet provided User Arguments (below), either use a sensible, implied, slug from the current context; or else simply tell the user that CCCP is ready and you need a cell slug.
 
 ## Vocabulary
 
@@ -20,9 +20,9 @@ Your **cell** slug is defined in the User Arguments (shown at the end). A slug i
 | **gazette** | A comrade's append-only log of their dispatches. |
 | **watchtower** | The long-running listener that streams incoming events. |
 
-**If any `cccp` command fails — non-zero exit, unexpected error — stop and tell the user. Don't fake or kludge it from the shell.**
-
 ## Step 1 — Start the watchtower under the Monitor tool
+
+(Note, if any `cccp` command fails — non-zero exit, unexpected error — **stop and tell the user**. Don't fake or kludge it.)
 
 Run the watchtower with the **Monitor tool** (not plain Bash), `persistent: true`. It emits one event per line; Monitor turns each into a real-time notification.
 
@@ -74,7 +74,7 @@ Each send is a `Bash` call. Use the **slug** as the first argument. `--to <comra
 
 - **`cccp pull`** is silent and exits 0 on success, so you can chain it: `cccp pull <slug> /home/bob/huge.bin && <read-the-file>`. It also accepts directory paths (pulls everything published under them).
 - **`cccp read`** is your on-demand history tool — you start with **zero history loaded**, so use it whenever you need prior context. `--from`/`--to` filter by sender/recipient; `--last N` or `--ts` select. WARNING: Omitting all filters returns the complete cell history.
-- **`cccp wake`** — the watchtower's poll interval grows when nothing's happening (up to a few minutes between checks). If you know an event is waiting for you in the cell — the user told you, or a comrade pinged you out-of-band — run `cccp wake <slug>` to reset it and poll immediately, instead of waiting out the current gap.
+- **`cccp wake`** tells watchtower to poll now for cell events. (Its poll interval grows during silence.) If you know an event is waiting for you in the cell, run `cccp wake <slug>` instead of waiting out the current gap. (Watchtower would then emit any new events normally.)
 
 ## Important Mechanics
 
