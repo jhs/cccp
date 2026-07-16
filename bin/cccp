@@ -1032,6 +1032,10 @@ class Watchtower:
         self.hwm = {}        # comrade -> bytes consumed of their gazette
         self.stop = False
         self.stop_reason = None
+        # Whoever launched us (the Monitor bash wrapper). A watchtower must never
+        # outlive its creator: once this changes we have been re-parented, our
+        # stdout reader is gone, and every event we emit is unread.
+        self.ppid = os.getppid()
         self.log = log or _NULL_LOG
         # Idle backoff: start at idle_initial, double after each idle emission up
         # to idle_max, reset to idle_initial on any activity. idle_initial=0
@@ -1070,7 +1074,25 @@ class Watchtower:
             line = line[:TRUNCATE_THRESHOLD - 14] + " overflow=true"
         try:
             print(line, flush=True)
-        except (BrokenPipeError, OSError) as e:
+        except BrokenPipeError as e:
+            # Our stdout reader is gone - no Monitor, no Claude, and nothing will
+            # ever see another event. That is proof we have no purpose, not a
+            # fault to survive: stop. (Python ignores SIGPIPE, so a dead pipe
+            # raises here instead of killing us.) The _log call stays - it is the
+            # record of WHY we stopped, which is what the #503 catch wanted.
+            self._log(f"_emit stdout closed ({type(e).__name__}: {e}); stopping; "
+                      f"line skipped: {line[:120]!r}")
+            self.stop = True
+            self.stop_reason = "stdout_closed"
+            # Python flushes stdout once more at interpreter exit; on a dead pipe
+            # that re-raises and prints "Exception ignored ... BrokenPipeError" to
+            # stderr. Point stdout at devnull so the final flush is a no-op and
+            # this stays a clean, deliberate exit.
+            try:
+                os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+            except OSError:
+                pass
+        except OSError as e:
             self._log(f"_emit failed ({type(e).__name__}: {e}); line skipped: {line[:120]!r}")
 
     @staticmethod
@@ -1161,6 +1183,16 @@ class Watchtower:
         signal.signal(signal.SIGINT, self._on_signal)
         signal.signal(signal.SIGUSR1, self._on_wake)
         while not self.stop:
+            # Never outlive our creator. A changed ppid means the parent exited
+            # and we were re-parented, so nobody is reading stdout any more.
+            # Compare against the ORIGINAL ppid, never against 1: a subreaper
+            # (`systemd --user`) adopts orphans instead of init, which is exactly
+            # what #1 observed. Checked before the poll so a dead reader costs no
+            # network I/O.
+            if os.getppid() != self.ppid:
+                self._log(f"parent exited (ppid {self.ppid} -> {os.getppid()}); stopping")
+                self.stop_reason = "parent_exited"
+                break
             try:
                 with TimeLogger(self.log, "poll"):
                     self._poll_once()
