@@ -1858,7 +1858,15 @@ def cmd_wake(args):
     me = base_comrade_id()
     log = setup_logging(cfg, slug, me, sys.argv)
     with subcommand_footer(log):
-        # Anchored regex: cccp watchtower foo must not match cccp watchtower foo-bar.
+        # Anchored regex, load-bearing twice over:
+        #  1. cccp watchtower foo must not match cccp watchtower foo-bar.
+        #  2. It spares the Monitor bash wrapper, which carries the command QUOTED
+        #     (`... && eval 'cccp watchtower foo' < /dev/null && ...`), so the char
+        #     after the slug is a quote - neither a space nor EOL - and the wrapper
+        #     does not match. Only the watchtower itself does, where the slug ends
+        #     the cmdline or precedes a flag. Not cosmetic: SIGUSR1's default
+        #     disposition is Term, so a matched wrapper would DIE and orphan its
+        #     watchtower child - manufacturing the #1 failure on every wake.
         # Slugs are [a-z0-9-] only (slugify), so re.escape is belt-and-suspenders.
         # POSIX ERE only (BSD pkill on macOS, procps pkill on Linux): literal space
         # alternation, not \s. pkill is built-in on both, no homebrew/extra packages.
