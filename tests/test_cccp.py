@@ -8,12 +8,15 @@ watchtower preview and the `read` continuation must split the body at the SAME
 byte, the truncated event must fit the Monitor envelope, and escapes must never
 be split. cccp is an executable script (no .py), so load it by path.
 """
+import contextlib
 import importlib.util
 import io
 import json
 import os
+import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
+from pathlib import Path
 from unittest import mock
 
 
@@ -212,7 +215,7 @@ class SkillRender(unittest.TestCase):
     )
 
     def _render(self):
-        return cccp.render_skill_body(self.TEMPLATE, "alice@hostA:aaaaaa")
+        return cccp.render_skill_body(self.TEMPLATE, {"COMRADE_ID": "alice@hostA:aaaaaa"})
 
     def test_all_tokens_resolved(self):
         self.assertNotIn("@@", self._render())  # no token delimiter survives
@@ -237,6 +240,13 @@ class SkillRender(unittest.TestCase):
         """@@COMRADE_ID@@ appears 2x in the template; every one is replaced."""
         self.assertEqual(self._render().count("alice@hostA:aaaaaa"), 2)
 
+    def test_multiple_tokens_from_dict(self):
+        """Every token in the subs dict is substituted (COMRADE_ID and BACKEND)."""
+        out = cccp.render_skill_body(
+            "id=@@COMRADE_ID@@ backend=@@BACKEND@@",
+            {"COMRADE_ID": "u@h:aaa", "BACKEND": "local-fs is active"})
+        self.assertEqual(out, "id=u@h:aaa backend=local-fs is active")
+
 
 class SkillTemplateFile(unittest.TestCase):
     """The shipped cccp skill template must render with no leftover tokens and must
@@ -249,13 +259,21 @@ class SkillTemplateFile(unittest.TestCase):
             return f.read()
 
     def test_ships_and_renders_clean(self):
-        rendered = cccp.render_skill_body(self._template(), "bob@hostB:1a2b3c")
+        rendered = cccp.render_skill_body(
+            self._template(),
+            {"COMRADE_ID": "bob@hostB:1a2b3c", "BACKEND": "backend info"})
         self.assertNotIn("@@", rendered)                     # no unresolved token
         self.assertNotIn("${CLAUDE_PLUGIN_ROOT}", rendered)  # no path token in body
         self.assertNotIn("$ARGUMENTS", rendered)             # args come from SKILL.md
         self.assertIn("bob@hostB:1a2b3c", rendered)
+        self.assertIn("backend info", rendered)              # @@BACKEND@@ substituted
         self.assertIn("cccp watchtower <slug>", rendered)    # bare command, no path
         self.assertIn("<slug>", rendered)                    # slug stays a placeholder
+
+    def test_template_declares_backend_token(self):
+        """The shipped chat template carries the @@BACKEND@@ variable that
+        compose_skill fills with the live backend-status section body."""
+        self.assertIn("@@BACKEND@@", self._template())
 
 
 class SkillCompose(unittest.TestCase):
@@ -296,6 +314,19 @@ class SkillCompose(unittest.TestCase):
     def test_unknown_skill_exits(self):
         with self.assertRaises(SystemExit):
             cccp.compose_skill("nope")
+
+    def test_chat_renders_backend_section(self):
+        """The chat base's 'CCCP Data Backend' section is present with @@BACKEND@@
+        resolved to the live status (both healthy and not-ready forms name
+        `cccp backend`), and the outro is still rendered as the implied last part."""
+        with tempfile.TemporaryDirectory() as d, \
+                _isolated_env(d, CCCP_COMRADE_ID="x@y:zzzzzz"):
+            out = cccp.compose_skill("chat")
+        self.assertIn("## CCCP Data Backend", out)   # header from the template
+        self.assertNotIn("@@BACKEND@@", out)          # token resolved
+        self.assertNotIn("@@", out)                   # nothing left unresolved
+        self.assertIn("cccp backend", out)            # backend body rendered
+        self.assertEqual(out.count("## Your instructions"), 1)  # outro still once
 
 
 class Aliases(unittest.TestCase):
@@ -374,6 +405,146 @@ class DispatchBody(unittest.TestCase):
 
     def test_plain_arg_passes_through(self):
         self.assertEqual(cccp.read_dispatch_body("just 'text'"), "just 'text'")
+
+
+@contextlib.contextmanager
+def _isolated_env(data_dir, **cccp_vars):
+    """Run with a clean CCCP_* environment: only CCCP_PLUGIN_DATA (=data_dir) plus
+    explicit overrides, so resolve_config is deterministic regardless of whatever
+    the developer's shell exports (e.g. a stray CCCP_DEBUG)."""
+    saved = {k: v for k, v in os.environ.items() if k.startswith("CCCP_")}
+    for k in list(os.environ):
+        if k.startswith("CCCP_"):
+            del os.environ[k]
+    os.environ["CCCP_PLUGIN_DATA"] = str(data_dir)
+    os.environ.update(cccp_vars)
+    try:
+        yield
+    finally:
+        for k in list(os.environ):
+            if k.startswith("CCCP_"):
+                del os.environ[k]
+        os.environ.update(saved)
+
+
+class ConfigResolution(unittest.TestCase):
+    """Two sources, self-namespacing: settings < backend/<active>/config < process
+    env, with local-fs the zero-config default. No .env walk-up."""
+
+    def setUp(self):
+        self.data = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.data, True))
+
+    def _write(self, path, text):
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text)
+
+    def test_defaults_to_local_fs_with_no_config(self):
+        with _isolated_env(self.data):
+            cfg = cccp.resolve_config()
+        self.assertEqual(cfg["BACKEND"], "local-fs")
+        self.assertEqual(cfg["PREFIX"], "")          # local-fs uses no prefix
+        self.assertEqual(cfg["PARAMS"], {})
+
+    def test_settings_selects_backend_and_reads_namespaced_params(self):
+        self._write(f"{self.data}/settings", "CCCP_ACTIVE_BACKEND=azure-blob\n")
+        self._write(f"{self.data}/backend/azure-blob/config",
+                    "CCCP_AZURE_BLOB_ACCOUNT=acct\nCCCP_AZURE_BLOB_CONTAINER=cont\n"
+                    "CCCP_AZURE_BLOB_SAS=sig123\n")
+        with _isolated_env(self.data):
+            cfg = cccp.resolve_config()
+        self.assertEqual(cfg["BACKEND"], "azure-blob")
+        self.assertEqual(cfg["PARAMS"]["account"], "acct")
+        self.assertEqual(cfg["PARAMS"]["container"], "cont")
+        self.assertEqual(cfg["PARAMS"]["sas"], "sig123")
+        self.assertEqual(cfg["PREFIX"], "__default__")   # azure's prefix default
+
+    def test_env_selects_backend_over_settings(self):
+        self._write(f"{self.data}/settings", "CCCP_ACTIVE_BACKEND=azure-blob\n")
+        with _isolated_env(self.data, CCCP_ACTIVE_BACKEND="local-fs"):
+            cfg = cccp.resolve_config()
+        self.assertEqual(cfg["BACKEND"], "local-fs")     # env beats settings
+
+    def test_env_overrides_backend_config_param(self):
+        self._write(f"{self.data}/settings", "CCCP_ACTIVE_BACKEND=azure-blob\n")
+        self._write(f"{self.data}/backend/azure-blob/config",
+                    "CCCP_AZURE_BLOB_ACCOUNT=file-acct\n"
+                    "CCCP_AZURE_BLOB_CONTAINER=cont\nCCCP_AZURE_BLOB_SAS=s\n")
+        with _isolated_env(self.data, CCCP_AZURE_BLOB_ACCOUNT="env-acct"):
+            cfg = cccp.resolve_config()
+        self.assertEqual(cfg["PARAMS"]["account"], "env-acct")  # env beats the file
+
+    def test_unknown_backend_exits(self):
+        with _isolated_env(self.data, CCCP_ACTIVE_BACKEND="bogus"):
+            with self.assertRaises(SystemExit):
+                cccp.resolve_config()
+
+
+class BackendPaths(unittest.TestCase):
+    """cell_head/comrade_path tolerate an empty prefix (local-fs) with no leading
+    slash or empty segment; backend keys are self-namespacing."""
+
+    def test_cell_head_empty_vs_prefixed(self):
+        self.assertEqual(cccp.cell_head("", "demo"), "demo/")
+        self.assertEqual(cccp.cell_head("__default__", "demo"), "__default__/demo/")
+
+    def test_comrade_and_gazette_paths(self):
+        self.assertEqual(cccp.comrade_path("", "demo", "u@h:aaa", "files/x"),
+                         "demo/u@h:aaa/files/x")
+        self.assertEqual(cccp.gazette_path("__default__", "demo", "u@h:aaa"),
+                         "__default__/demo/u@h:aaa/gazette.jsonl")
+
+    def test_backend_key_namespacing(self):
+        self.assertEqual(cccp._backend_key("azure-blob", "SAS"), "CCCP_AZURE_BLOB_SAS")
+        self.assertEqual(cccp._backend_key("local-fs", "PREFIX"), "CCCP_LOCAL_FS_PREFIX")
+
+
+class MakeBackend(unittest.TestCase):
+    def test_local_fs_builds(self):
+        with tempfile.TemporaryDirectory() as d, _isolated_env(d):
+            b = cccp.make_backend({"BACKEND": "local-fs", "PARAMS": {}})
+        self.assertIsInstance(b, cccp.LocalFilesBackend)
+
+    def test_azure_missing_params_exits_no_downgrade(self):
+        with self.assertRaises(SystemExit):
+            cccp.make_backend({"BACKEND": "azure-blob", "PARAMS": {}})
+
+
+class LocalFilesRoundTrip(unittest.TestCase):
+    """LocalFilesBackend returns Azure-shaped status codes so every caller branches
+    identically. Exercises the whole verb set on one gazette."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.b = cccp.LocalFilesBackend(self._tmp.name)
+
+    def test_full_verb_set(self):
+        p = "demo/u@h:aaa/gazette.jsonl"
+        self.assertEqual(self.b.ensure_append_blob(p), 201)
+        self.assertEqual(self.b.ensure_append_blob(p), 409)      # exists now
+        self.assertEqual(self.b.append_block(p, b"line1\n"), 201)
+        self.assertEqual(self.b.append_block(p, b"line2\n"), 201)
+        self.assertEqual(self.b.get(p), (200, b"line1\nline2\n"))
+        self.assertEqual(self.b.get_range(p, 6), (206, b"line2\n"))
+        self.assertEqual(self.b.get_range(p, 0), (200, b"line1\nline2\n"))
+        self.assertEqual(self.b.get_head(p, 5), (206, b"line1"))
+        names = self.b.list("demo/")
+        self.assertIn(p, names)
+        self.assertEqual(names[p]["size"], 12)
+        self.assertEqual(self.b.get("demo/nope")[0], 404)        # absent read
+        self.assertEqual(self.b.put_block("demo/u@h:aaa/files/x", b"hi"), 201)
+        self.assertEqual(self.b.delete("demo/u@h:aaa/files/x"), 202)
+        self.assertEqual(self.b.delete("demo/u@h:aaa/files/x"), 404)  # already gone
+
+    def test_list_missing_prefix_is_empty(self):
+        self.assertEqual(self.b.list("nothing/"), {})
+
+    def test_get_range_past_eof(self):
+        p = "c/x/gazette.jsonl"
+        self.b.append_block(p, b"abc")
+        self.assertEqual(self.b.get_range(p, 10), (416, b""))
 
 
 if __name__ == "__main__":

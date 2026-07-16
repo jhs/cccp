@@ -4,7 +4,7 @@
 See skills/token-aware/SKILL.md for usage.
 
 Reads the per-session snapshot the statusLine side-write drops at
-$CCCP_PLUGIN_DATA/<session_id>.json (see bin/cccp-statusline). 'status'
+$CCCP_PLUGIN_DATA/telemetry/claude-code/<session_id>.json (see bin/cccp-statusline). 'status'
 prints a one-shot summary; 'watch' streams milestone events for the Monitor
 tool. Session id resolves from the optional positional arg, else
 $CLAUDE_CODE_SESSION_ID, else the newest snapshot on disk.
@@ -24,7 +24,7 @@ def _data_dir():
         print("CCCP_PLUGIN_DATA is not set -- is the cccp plugin enabled?",
               file=sys.stderr)
         sys.exit(1)
-    return Path(d)
+    return Path(d) / "telemetry" / "claude-code"
 
 
 DEFAULT_THRESHOLDS = (50, 75, 90, 95)

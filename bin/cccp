@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
-"""cccp - Claude-to-Claude Communication Protocol (v2 - Azure Blob transport).
+"""cccp - Claude-to-Claude Communication Protocol.
 
-v2 replaces the v1 SSH/rsync mesh with a single Azure Blob Storage container as
-a shared rendezvous: every comrade reads and writes one container, and there are
-no peer-to-peer connections. Transport is pure Python stdlib (urllib) against the
-Blob REST API, authenticated by a container-scoped SAS token - no SDK (pip is a
-devops ticket on locked-down work hosts and breaks across virtualenv switches),
-no separate binary (azcopy is absent on the work cloud VMs), so it runs anywhere
-Python 3 does.
+Comrades rendezvous through one shared blob store - every comrade reads and
+writes the same store, with no peer-to-peer connections. The store is a pluggable
+backend behind a small verb set (list / read / append / delete); see BACKENDS and
+docs/backend.md. Two ship today:
 
-Storage layout (a cell is the triple (account, container, prefix) + slug):
+    local-fs (default)  Files under the plugin data dir. Zero setup, but same
+                        host + same OS user only.
+    azure-blob          A shared Azure Blob container reachable from any host,
+                        user, or network. Pure stdlib urllib against the Blob
+                        REST API, authenticated by a container-scoped SAS - no
+                        SDK, no azcopy, so it runs anywhere Python 3 does.
 
-    <container>/<prefix>/<slug>/<comrade-id>/gazette.jsonl   append blob
-    <container>/<prefix>/<slug>/<comrade-id>/files/<path>    block blobs
+Storage layout (a cell is a store + prefix + slug; local-fs uses no prefix):
+
+    <prefix>/<slug>/<comrade-id>/gazette.jsonl   append-only, their messages
+    <prefix>/<slug>/<comrade-id>/files/<path>    shared files
 
 A comrade is registered in a cell purely by having a gazette - identity is a
 local `user@host:<session>` computed offline, so there is no claim blob and no
@@ -22,7 +26,8 @@ bin/cccp is an executable script, not an importable module. When an ad-hoc
 one-off needs the REST logic (e.g. the large-file staging fallback), read this
 file as a reference implementation rather than importing it.
 
-Subcommands (build in progress):
+Subcommands:
+    backend     Show or switch the active data backend.
     skill       Emit a skill's body (SKILL.md render-time helper; hidden).
     dispatch    Send a message to a cell.
     watchtower  Stream live cell events (run under the Monitor tool).
@@ -67,7 +72,6 @@ CCCP_VERSION = "2.3.0"     # Shown on the watchtower `ready` line (v=...) so a
                            # both together each release so the ready-line v= matches
                            # the installed plugin.
 DEFAULT_PREFIX = "__default__"
-CONFIG_PATH = Path.home() / ".config" / "cccp" / "config"
 POLL_LADDER = (            # seconds; the adaptive inter-poll gap. First entry is
     2, 5, 15, 30, 60,      # the "fast" cadence used right after activity; each
     120, 180, 300,         # no-activity poll advances one rung. Last entry is
@@ -75,7 +79,7 @@ POLL_LADDER = (            # seconds; the adaptive inter-poll gap. First entry i
                            # idle. Any real event resets back to entry 0;
                            # SIGUSR1 (cccp wake) does the same plus polls
                            # immediately. 2s floor because polling is a network
-                           # LIST against Azure Blob and a comrade takes
+                           # LIST against the backend and a comrade takes
                            # multiple seconds just to emit a message anyway.
 TRUNCATE_THRESHOLD = 500   # max chars per watchtower stdout line (Monitor cuts at 500)
 IDLE_MAX_SECONDS = 24 * 3600   # cap for the idle backoff - past this, idles fire
@@ -87,7 +91,6 @@ AUTODOWNLOAD_MAX = 1024 * 1024    # watchtower auto-downloads published files at
                                   # (Claude fetches them with `cccp pull`). Bounded
                                   # by what downloads fast enough not to stall the
                                   # poll loop - not by "how big a file is".
-LOCAL_MIRROR = Path.home() / ".cccp"   # where pulled / auto-downloaded files land
 DEBUG_LOG_MAX_BYTES = 10 * 1024 * 1024    # per debug.log; rotates to keep 5 backups
 DEBUG_LOG_BACKUPS = 5                     # so worst case ~60 MB per (cell, comrade)
 TEXT_EXTENSIONS = {
@@ -146,6 +149,44 @@ def current_session_id():
     return sid
 
 
+# ---------- plugin data tree ----------
+#
+# One namespace, $CCCP_PLUGIN_DATA, split by role (see docs/backend.md):
+#   settings              global cccp state (active backend, ...)
+#   backend/<name>/       per-backend shared state; backend/local-fs/ IS the
+#                         authoritative local cell store, azure-blob/ holds only
+#                         connection config
+#   mirror/               cache: pulled files, aliases, per-cell debug + watchtower logs
+#   telemetry/            cache: harvested session data (token-aware)
+# Claude Code exports CCCP_PLUGIN_DATA (SessionStart hook). Non-Claude callers
+# (manual runs, tests) fall back to $XDG_STATE_HOME/cccp so `cccp` still works -
+# and nothing ever writes to the old ~/.cccp again.
+
+def plugin_data_dir():
+    d = os.environ.get("CCCP_PLUGIN_DATA")
+    if d:
+        return Path(d)
+    xdg = os.environ.get("XDG_STATE_HOME")
+    return (Path(xdg) if xdg else Path.home() / ".local" / "state") / "cccp"
+
+
+def mirror_dir():
+    """Local cache of pulled/auto-downloaded files, aliases, and per-cell logs -
+    reconstructible, safe to delete (successor to the old ~/.cccp)."""
+    return plugin_data_dir() / "mirror"
+
+
+def backend_dir(name):
+    """Shared state for one backend. backend/local-fs/ IS the local cell store
+    (authoritative); backend/azure-blob/ holds only connection config."""
+    return plugin_data_dir() / "backend" / name
+
+
+def settings_path():
+    """Global cccp state (KEY=value), e.g. CCCP_ACTIVE_BACKEND. Absent => local-fs."""
+    return plugin_data_dir() / "settings"
+
+
 # ---------- config resolution ----------
 
 def _parse_cccp_env(path):
@@ -162,52 +203,96 @@ def _parse_cccp_env(path):
     return cfg
 
 
-def resolve_config(start=None):
-    """Resolve the CCCP storage config for the current working directory.
+DEFAULT_BACKEND = "local-fs"
 
-    Walk up from CWD for the closest `.env` that carries CCCP_* keys - that one
-    wins entirely (per-project override). Otherwise fall back to the personal
-    default at ~/.config/cccp/config. CCCP_PREFIX is optional and defaults to
-    __default__, so a config only needs ACCOUNT, CONTAINER, and SAS.
+# Backend registry: the summary/description `cccp backend` shows, the required
+# param names, and the prefix default. Every backend is addressed by
+# CCCP_<BACKEND>_<KEY> keys (name upcased, '-'->'_'), so params never collide -
+# across the tree's config files or across environment variables. A backend name
+# must not collide with a global key stem (ACTIVE_BACKEND, DEBUG). See
+# docs/backend.md.
+BACKENDS = {
+    "local-fs": {
+        "summary": "Same host + same OS user only; zero setup",
+        "description": (
+            "Shared files under the plugin data dir. Zero setup, works "
+            "immediately, but only connects comrades on the same host and same "
+            "OS user (terminal tabs, IDE windows, git worktrees, background "
+            "agents). Cannot reach other users or machines."),
+        "params": (),
+        "prefix_default": "",
+    },
+    "azure-blob": {
+        "summary": "Any host, user, or network; needs Azure + SAS",
+        "description": (
+            "Centralized cloud storage (Azure Blob) reachable from any host, "
+            "user, or network. Low cost (pennies/GB-month), not free; needs an "
+            "Azure subscription. Auth is a container-scoped SAS token shared "
+            "with each comrade. Point cccp at an existing hub via config, or "
+            "provision one with infra/azure/apply.sh."),
+        "params": ("ACCOUNT", "CONTAINER", "SAS"),
+        "prefix_default": DEFAULT_PREFIX,
+    },
+}
 
-    Any CCCP_* key the chosen file doesn't carry falls back to the process
-    environment - so `export CCCP_DEBUG=1` in your shell profile flips verbose logging
-    on globally without touching the (gitignored, SAS-bearing) generated
-    config file. The file is authoritative when it speaks; env fills gaps.
 
-    Returns a dict with ACCOUNT, CONTAINER, SAS, PREFIX, DEBUG.
+def _backend_key(backend, key):
+    """The fully-qualified config key for one backend param: CCCP_<BACKEND>_<KEY>."""
+    return f"CCCP_{backend.upper().replace('-', '_')}_{key}"
+
+
+def _read_kv_file(path):
+    """CCCP_* keys from a KEY=value file; {} if it is missing or unreadable."""
+    try:
+        return _parse_cccp_env(path)
+    except OSError:
+        return {}
+
+
+def _env_layer():
+    """The process-environment config layer: every CCCP_* var currently set."""
+    return {k: v for k, v in os.environ.items() if k.startswith("CCCP_")}
+
+
+def resolve_config():
+    """Resolve the active backend and its config.
+
+    Flat, self-namespacing KEY=value config (dotenv syntax) from two sources, low
+    -> high precedence:
+
+        settings                       global cccp state (active backend, ...)
+          -> backend/<active>/config   the active backend's own params
+            -> process env CCCP_*       highest (per-project via direnv, CI, etc.)
+
+    The active backend must resolve before its config file loads, so it comes from
+    settings + env first (default local-fs); then that backend's file joins the
+    merge for the CCCP_<BACKEND>_* params. The active backend is never inferred
+    from stray credentials and never silently downgraded: a selected-but-broken
+    backend fails loudly in make_backend, not here. Returns
+    {BACKEND, PARAMS, PREFIX, DEBUG}.
     """
-    start = Path(start or os.getcwd()).resolve()
-    found = None
-    for d in (start, *start.parents):
-        env = d / ".env"
-        if env.is_file():
-            cfg = _parse_cccp_env(env)
-            if cfg:  # only counts as a CCCP config if it has CCCP_* keys
-                found = cfg
-                break
-    if found is None:
-        if not CONFIG_PATH.is_file():
-            sys.exit(f"error: no CCCP config - no .env with CCCP_* keys at or "
-                     f"above {start}, and {CONFIG_PATH} is missing "
-                     f"(run infra/azure/apply.sh)")
-        found = _parse_cccp_env(CONFIG_PATH)
+    env = _env_layer()
+    settings = _read_kv_file(settings_path())
 
-    for k, v in os.environ.items():
-        if k.startswith("CCCP_") and k not in found:
-            found[k] = v
+    # Active backend: settings, overridden by process env (default local-fs).
+    backend = {**settings, **env}.get("CCCP_ACTIVE_BACKEND") or DEFAULT_BACKEND
+    spec = BACKENDS.get(backend)
+    if spec is None:
+        sys.exit(f"error: unknown backend {backend!r} (from CCCP_ACTIVE_BACKEND); "
+                 f"known: {', '.join(sorted(BACKENDS))}")
 
-    out = {
-        "ACCOUNT": found.get("CCCP_ACCOUNT"),
-        "CONTAINER": found.get("CCCP_CONTAINER"),
-        "SAS": (found.get("CCCP_SAS") or "").lstrip("?"),
-        "PREFIX": found.get("CCCP_PREFIX") or DEFAULT_PREFIX,
-        "DEBUG": found.get("CCCP_DEBUG"),
+    # Backend params: settings < backend/<active>/config < process env.
+    backend_file = _read_kv_file(backend_dir(backend) / "config")
+    merged = {**settings, **backend_file, **env}
+    params = {k.lower(): merged.get(_backend_key(backend, k)) for k in spec["params"]}
+    prefix = merged.get(_backend_key(backend, "PREFIX")) or spec["prefix_default"]
+
+    return {
+        "BACKEND": backend,
+        "PARAMS": params,
+        "PREFIX": prefix,
+        "DEBUG": merged.get("CCCP_DEBUG"),
     }
-    missing = [k for k in ("ACCOUNT", "CONTAINER", "SAS") if not out[k]]
-    if missing:
-        sys.exit(f"error: CCCP config is missing keys: {missing}")
-    return out
 
 
 # ---------- debug logging ----------
@@ -324,7 +409,7 @@ def _emit_startup_header(log, slug, me, argv):
 def setup_logging(cfg, slug, me, argv):
     """Return a logger. If CCCP_DEBUG is falsy/unset, returns _NULL_LOG and
     nothing is written. If truthy, installs a RotatingFileHandler at
-    ~/.cccp/<slug>/<me>/cccp-debug.log and emits the startup header.
+    <mirror>/<slug>/<me>/cccp-debug.log and emits the startup header.
 
     Identity is now a local computation (comrade_id), so there are no pre-logging
     HTTP calls to miss - the first network call a subcommand makes happens after
@@ -337,7 +422,7 @@ def setup_logging(cfg, slug, me, argv):
     if not _truthy(cfg.get("DEBUG")):
         return _NULL_LOG
     try:
-        path = LOCAL_MIRROR / slug / me / "cccp-debug.log"
+        path = mirror_dir() / slug / me / "cccp-debug.log"
         path.parent.mkdir(parents=True, exist_ok=True)
         # One logger per process - the pid suffix avoids handler-doubling if
         # main() is ever entered twice (e.g. in-process tests).
@@ -382,7 +467,7 @@ def subcommand_footer(log):
         log.debug(f"ev=cccp_end exit={exit_code} duration_ms={dur_ms:.1f}")
 
 
-# ---------- Azure Blob REST client ----------
+# ---------- storage backends ----------
 
 class BlobError(Exception):
     def __init__(self, status, body):
@@ -391,10 +476,13 @@ class BlobError(Exception):
         super().__init__(f"blob error {status}: {body[:200]!r}")
 
 
-class BlobClient:
-    """Minimal Azure Blob REST client - stdlib urllib plus a container SAS.
+class AzureBlobBackend:
+    """Minimal Azure Blob REST backend - stdlib urllib plus a container SAS.
 
-    Paths are relative to the container; the SAS supplies all authentication.
+    One of the pluggable backends (see BACKENDS). Exposes the small verb set every
+    higher-level function calls on its `client` (put_block, get, get_range,
+    get_head, ensure_append_blob, append_block, list, delete). Paths are relative
+    to the container; the SAS supplies all authentication.
     """
 
     RETRYABLE = (500, 502, 503, 504)
@@ -509,6 +597,140 @@ class BlobClient:
             out[name] = {"size": int(size) if size else 0, "last_modified": lm}
         return out
 
+    def delete(self, path):
+        """DELETE a blob. Returns the status (202 deleted, 404 absent - both fine)."""
+        return self.request("DELETE", path)[0]
+
+
+class LocalFilesBackend:
+    """Filesystem backend - the zero-setup default. The store root is a directory
+    (backend/local-fs/); blob 'paths' are POSIX-relative names beneath it, so the
+    on-disk layout matches the blob backends exactly. Same-host/same-user only:
+    writes are plain file writes / O_APPEND, atomic enough for sibling processes
+    on one machine (the backend's whole contract) with no locking.
+
+    Returns Azure-shaped status codes so every caller branches identically:
+    200/206 reads, 201 writes, 202 delete, 404 absent, 416 past end-of-blob.
+    """
+
+    def __init__(self, root, log=None):
+        self.root = Path(root)
+        self.log = log or _NULL_LOG
+
+    def _abs(self, path):
+        return self.root / path
+
+    def put_block(self, path, data):
+        p = self._abs(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+        return 201
+
+    def get(self, path):
+        try:
+            return 200, self._abs(path).read_bytes()
+        except FileNotFoundError:
+            return 404, b""
+
+    def get_range(self, path, offset):
+        """Bytes from `offset` to end. 206 partial, 200 whole, 416 past EOF, 404 absent."""
+        try:
+            data = self._abs(path).read_bytes()
+        except FileNotFoundError:
+            return 404, b""
+        if offset and offset >= len(data):
+            return 416, b""
+        return (206 if offset else 200), data[offset:]
+
+    def get_head(self, path, nbytes):
+        """First `nbytes` (0..nbytes-1). 206 if the blob is larger, else 200; 404 absent."""
+        try:
+            data = self._abs(path).read_bytes()
+        except FileNotFoundError:
+            return 404, b""
+        return (206 if len(data) > nbytes else 200), data[:nbytes]
+
+    def ensure_append_blob(self, path):
+        """Create an empty file if absent. 201 created or 409 exists - both fine."""
+        p = self._abs(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            p.touch(exist_ok=False)
+            return 201
+        except FileExistsError:
+            return 409
+
+    def append_block(self, path, data):
+        """Append bytes to the end of the file. 201 mirrors an Azure appendblock."""
+        p = self._abs(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "ab") as f:
+            f.write(data)
+        return 201
+
+    def list(self, prefix):
+        """Blobs under `prefix`. Returns {name: {"size", "last_modified"}} with
+        names POSIX-relative to the store root (matching the blob backends). cccp
+        only ever lists directory prefixes (they end in '/'), so a plain recursive
+        walk of the corresponding directory is an exact match."""
+        base = self._abs(prefix)
+        out = {}
+        if not base.is_dir():
+            return out
+        for p in base.rglob("*"):
+            if p.is_file():
+                stat = p.stat()
+                name = p.relative_to(self.root).as_posix()
+                out[name] = {
+                    "size": stat.st_size,
+                    "last_modified": time.strftime(
+                        "%a, %d %b %Y %H:%M:%S GMT", time.gmtime(stat.st_mtime)),
+                }
+        return out
+
+    def delete(self, path):
+        """Remove a file. 202 deleted, 404 absent - both fine."""
+        try:
+            self._abs(path).unlink()
+            return 202
+        except FileNotFoundError:
+            return 404
+
+
+def make_backend(cfg, log=None):
+    """Construct the active backend from a resolved config. Enforces the
+    'never silently downgrade' rule: an explicitly selected backend that is
+    missing required params fails loudly here, rather than falling back to
+    local-fs. The returned client exposes the shared blob verb set."""
+    backend = cfg["BACKEND"]
+    params = cfg["PARAMS"]
+    if backend == "local-fs":
+        return LocalFilesBackend(backend_dir("local-fs"), log=log)
+    if backend == "azure-blob":
+        missing = [k.upper() for k in ("account", "container", "sas")
+                   if not params.get(k)]
+        if missing:
+            sys.exit(f"error: backend 'azure-blob' is selected but not configured "
+                     f"(missing {', '.join(missing)}). Run `cccp backend` to inspect "
+                     f"or switch, or set it up (see docs/backend.md).")
+        return AzureBlobBackend(params["account"], params["container"],
+                                params["sas"], log=log)
+    sys.exit(f"error: unknown backend {backend!r}")
+
+
+# ---------- cell blob paths ----------
+
+def cell_head(prefix, slug):
+    """The blob-name prefix for a cell: '<prefix>/<slug>/', or '<slug>/' when the
+    backend uses no prefix (local-fs). Every cell path is built from this, so an
+    empty prefix never yields a leading slash or an empty path segment."""
+    return f"{prefix}/{slug}/" if prefix else f"{slug}/"
+
+
+def comrade_path(prefix, slug, comrade, rest):
+    """A blob path in one comrade's area: '<cell-head><comrade>/<rest>'."""
+    return f"{cell_head(prefix, slug)}{comrade}/{rest}"
+
 
 # ---------- identity & roster ----------
 
@@ -533,7 +755,7 @@ def comrade_id():
 
 def cell_roster(client, prefix, slug):
     """Return the sorted comrade ids registered in a cell."""
-    head = f"{prefix}/{slug}/"
+    head = cell_head(prefix, slug)
     comrades = set()
     for name in client.list(head):
         rest = name[len(head):]
@@ -545,7 +767,7 @@ def cell_roster(client, prefix, slug):
 # ---------- gazette ----------
 
 def gazette_path(prefix, slug, comrade):
-    return f"{prefix}/{slug}/{comrade}/gazette.jsonl"
+    return comrade_path(prefix, slug, comrade, "gazette.jsonl")
 
 
 def append_dispatch(client, prefix, slug, me, dispatch):
@@ -671,8 +893,8 @@ def download_to_mirror(client, prefix, slug, sender, wire_path,
                        expect_size=None, expect_lines=None):
     """Download a published blob into the local mirror; return the local Path.
 
-    Mirror layout is deterministic - ~/.cccp/<slug>/<sender>/<wire_path>, e.g.
-    ~/.cccp/work-on-cccp/alice@hostA/files/home/alice/build.log - so any follow-up tool
+    Mirror layout is deterministic - <mirror>/<slug>/<sender>/<wire_path>, e.g.
+    <mirror>/work-on-cccp/alice@hostA/files/home/alice/build.log - so any follow-up tool
     can read the file by its known path.
 
     If the publisher's claimed size / line count are given, the downloaded bytes
@@ -680,7 +902,7 @@ def download_to_mirror(client, prefix, slug, sender, wire_path,
     everybody-trusts-everybody environment, so the check surfaces bugs, not
     attackers.
     """
-    st, body = client.get(f"{prefix}/{slug}/{sender}/{wire_path}")
+    st, body = client.get(comrade_path(prefix, slug, sender, wire_path))
     if st != 200:
         raise BlobError(st, b"download failed")
     if expect_size is not None and len(body) != expect_size:
@@ -689,7 +911,7 @@ def download_to_mirror(client, prefix, slug, sender, wire_path,
     if expect_lines is not None and body.count(b"\n") != expect_lines:
         raise BlobError(0, f"{wire_path}: got {body.count(chr(10).encode())} "
                            f"lines, publisher claimed {expect_lines}".encode())
-    dest = LOCAL_MIRROR / slug / sender / wire_path
+    dest = mirror_dir() / slug / sender / wire_path
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(body)
     return dest
@@ -721,7 +943,7 @@ def is_comrade_id(s):
 
 
 def alias_map_path(slug, me):
-    return LOCAL_MIRROR / slug / me / "aliases.json"
+    return mirror_dir() / slug / me / "aliases.json"
 
 
 def load_aliases(slug, me):
@@ -799,7 +1021,7 @@ class Watchtower:
         self.prefix = prefix
         self.slug = slug
         self.me = me
-        self.head = f"{prefix}/{slug}/"
+        self.head = cell_head(prefix, slug)
         # Alias support is opt-in: with no --alias-trigger, `self.trigger` is None
         # and the whole feature is inert (no seed, no learn, no translation).
         self.trigger = trigger
@@ -836,7 +1058,7 @@ class Watchtower:
         crash from inference into proof. This is distinct from self.log (the opt-in
         CCCP_DEBUG logger); _log is always on and never depends on config."""
         try:
-            path = LOCAL_MIRROR / self.slug / "watchtower.log"
+            path = mirror_dir() / self.slug / "watchtower.log"
             path.parent.mkdir(parents=True, exist_ok=True)
             with open(path, "a") as f:
                 f.write(f"{now_iso()} {msg}\n")
@@ -1115,7 +1337,7 @@ class Watchtower:
                     f"exc={type(e).__name__} msg={_kv(str(e))}")
         elif op == "unpublish":
             try:
-                (LOCAL_MIRROR / self.slug / d["from"] / wire_path).unlink(
+                (mirror_dir() / self.slug / d["from"] / wire_path).unlink(
                     missing_ok=True)
             except OSError:
                 pass
@@ -1133,26 +1355,32 @@ def plugin_root():
     return Path(__file__).resolve().parent.parent
 
 
-def render_skill_body(template, comrade_id):
-    """Substitute the render-time tokens into the skill body template.
+def render_skill_body(template, subs):
+    """Substitute the render-time @@NAME@@ tokens into a skill body template from
+    `subs` (name -> value). Two tokens exist today:
 
-    Only one token exists: @@COMRADE_ID@@ (this session's id). The cell slug is
-    NOT a token - it stays the literal placeholder `<slug>`, which the reader
-    fills from its own invocation arguments, so the rendered body is fully
-    determined by the comrade id alone. `cccp` itself is a bare command on $PATH
-    (shipped in <root>/bin), so the body says `cccp ...` with no path to inject.
+        @@COMRADE_ID@@   this session's comrade id
+        @@BACKEND@@      the 'CCCP Data Backend' section body (backend_status_block)
+
+    The cell slug is deliberately NOT a token - it stays the literal placeholder
+    `<slug>`, which the reader fills from its own invocation arguments. `cccp` is a
+    bare command on $PATH, so the body says `cccp ...` with no path to inject.
 
     @@NAME@@ delimiters are used deliberately, NOT $ or {} - the skill text is full
     of shell `$vars`/`$0` and JSON `{...}` a str.format/Template pass would corrupt.
-    @@ never occurs in the body. Output is spliced verbatim by Claude Code and is
-    NOT re-rendered, so every token must be resolved here."""
-    return template.replace("@@COMRADE_ID@@", comrade_id)
+    Output is spliced verbatim by Claude Code and is NOT re-rendered, so every token
+    must resolve here. Each value is substituted once and never re-scanned, so a
+    value that happens to contain another token is left as-is (no recursion)."""
+    for name, value in subs.items():
+        template = template.replace(f"@@{name}@@", value)
+    return template
 
 
-# Each skill is its stack of body.template.md parts, base first - `cccp skill
-# <name>` concatenates them, then appends ARGS_OUTRO. The stack is written out
-# explicitly (not derived from a require directive), so with a shallow family
-# there is nothing to parse and nothing double-includes by accident.
+# Each skill is a stack of body.template.md parts, base first, with the shared args
+# outro as an implied final part (ARGS_OUTRO) - `cccp skill <name>` renders every
+# part identically and joins them. The stack is written out explicitly (not derived
+# from a require directive), so with a shallow family there is nothing to parse and
+# nothing double-includes by accident.
 SKILL_STACK = {
     "chat": ["chat"],
     "team": ["chat", "team"],
@@ -1160,11 +1388,11 @@ SKILL_STACK = {
     "foreman-with-tmux": ["chat", "team", "foreman", "foreman-with-tmux"],
 }
 
-# The trailing frame, appended once after the whole stack. The user's arguments
-# are auto-appended by the harness as `ARGUMENTS: <value>` unless the SKILL.md
-# references $ARGUMENTS itself - so each SKILL.md ends with a bare `$ARGUMENTS`
-# and this outro is the prose that introduces it. It must be LAST (after every
-# delta), which is why it lives here rather than in any one template.
+# The trailing frame, rendered as the implied final part of every stack - NOT a
+# special case; it goes through the same token substitution as the body files. The
+# user's arguments are auto-appended by the harness as `ARGUMENTS: <value>` unless
+# the SKILL.md references $ARGUMENTS itself - so each SKILL.md ends with a bare
+# `$ARGUMENTS` and this outro is the prose that introduces it. It must be LAST.
 ARGS_OUTRO = """## Your instructions
 
 The user's invocation is on the final `User arguments:` line below:
@@ -1175,26 +1403,32 @@ watchtower, then act on it.
 was given. Ask the user which cell to join before doing anything else."""
 
 
+def _read_skill_template(part):
+    """Read one skill part's body.template.md, or exit with a clear error."""
+    path = plugin_root() / "skills" / part / "body.template.md"
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as e:
+        sys.exit(f"cccp skill error: cannot read template {path}: {e}")
+
+
 def compose_skill(name):
-    """Return a skill's whole body: its stack of templates rendered base-first,
-    joined, with the shared args outro last. Pure and hermetic - the only inputs
-    are the local comrade id and on-disk templates."""
+    """Return a skill's whole body: its stack of body templates plus the args outro
+    as an implied final part, each rendered through the same token substitution
+    (@@COMRADE_ID@@, @@BACKEND@@) and joined base-first. The backend block is
+    computed once and injected as a variable, so a template places it wherever it
+    reads best (chat puts it in a 'CCCP Data Backend' section)."""
     stack = SKILL_STACK.get(name)
     if stack is None:
         all_skills = sorted(set(SKILL_STACK) | set(SKILL_FNS))
         sys.exit(f"cccp skill error: unknown skill {name!r}; "
                  f"known: {', '.join(all_skills)}")
-    me = comrade_id()
-    parts = []
-    for part in stack:
-        template_path = plugin_root() / "skills" / part / "body.template.md"
-        try:
-            template = template_path.read_text(encoding="utf-8")
-        except OSError as e:
-            sys.exit(f"cccp skill error: cannot read template {template_path}: {e}")
-        parts.append(render_skill_body(template, me).strip())
-    parts.append(ARGS_OUTRO.strip())
-    return "\n\n".join(parts) + "\n"
+    subs = {
+        "COMRADE_ID": comrade_id(),
+        "BACKEND": backend_status_block(),
+    }
+    parts = [_read_skill_template(part) for part in stack] + [ARGS_OUTRO]
+    return "\n\n".join(render_skill_body(part, subs).strip() for part in parts) + "\n"
 
 
 # ---------- data setup ----------
@@ -1305,16 +1539,22 @@ def _ds_validate(plugin_data):
 
 
 def _ds_detect(plugin_data):
-    data = Path(plugin_data)
-    if not (data / "claude-auth-status.json").exists():
+    # Harvested session telemetry lives under telemetry/claude-code/ (see
+    # bin/cccp-statusline and docs/backend.md): an auth-status.json plus one
+    # <session-uuid>.json per session.
+    tele = Path(plugin_data) / "telemetry" / "claude-code"
+    if not (tele / "auth-status.json").exists():
         return False
-    checked = 0
-    for entry in os.scandir(data):
-        if entry.name.endswith(".json") and _UUID_RE.match(entry.name[:-5]):
-            return True
-        checked += 1
-        if checked >= 3:
-            break
+    try:
+        checked = 0
+        for entry in os.scandir(tele):
+            if entry.name.endswith(".json") and _UUID_RE.match(entry.name[:-5]):
+                return True
+            checked += 1
+            if checked >= 3:
+                break
+    except OSError:
+        return False
     return False
 
 
@@ -1345,12 +1585,57 @@ SKILL_FNS = {
 }
 
 
+def _backend_setup_guidance(backend):
+    """Concise, backend-specific setup steps for the not-ready skill header."""
+    if backend == "azure-blob":
+        return (
+            "Set it up one of two ways, then run `cccp backend use azure-blob` "
+            "to validate and activate:\n"
+            f"- **Use an existing hub** — put `CCCP_AZURE_BLOB_ACCOUNT`, "
+            f"`CCCP_AZURE_BLOB_CONTAINER`, and `CCCP_AZURE_BLOB_SAS` in "
+            f"`{backend_dir('azure-blob') / 'config'}` (or export them in your "
+            f"environment).\n"
+            "- **Provision your own** — run `infra/azure/apply.sh` (Terraform), "
+            "which stands up a hub and writes that config for you.")
+    if backend == "local-fs":
+        return ("Confirm `$CCCP_PLUGIN_DATA` is set and writable, then re-run.")
+    return "Run `cccp backend` to see available backends."
+
+
+def backend_status_block():
+    """The body of the skill's 'CCCP Data Backend' section - the @@BACKEND@@ token
+    substituted by compose_skill, so the chat template places it wherever it reads
+    best. Healthy: one line naming the active backend and how to list/switch (its
+    presence is the 'set up correctly' signal). Not ready: the reason, concise
+    backend-specific setup, and a pointer to fix it or escalate. Mirrors token-
+    aware's DONE/START split. Read-only and non-mutating, and it swallows any config
+    error into a helpful line so skill rendering can never fail on it."""
+    try:
+        cfg = resolve_config()
+        backend = cfg["BACKEND"]
+        ok, detail = validate_backend(cfg)   # cheap, no network
+    except (SystemExit, Exception):
+        return ("Your CCCP config could not be resolved. Run `cccp backend` to "
+                "inspect it, then fix it or escalate to the user.")
+    summary = BACKENDS.get(backend, {}).get("summary", "")
+    if ok:
+        return (f"Current backend: `{backend}` — {summary}. "
+                f"To list all backends or switch, run `cccp backend`.")
+    return (f"**NOT READY — `{backend}`: {detail}.** Chat will not work until this "
+            f"is fixed.\n\n"
+            f"{_backend_setup_guidance(backend)}\n\n"
+            f"To list every backend or switch, run `cccp backend` "
+            f"(`cccp backend use <name>` to change it). If you can't resolve it, "
+            f"escalate to the user.")
+
+
 def cmd_skill(args):
     """Render-time helper: emit a skill's fully-resolved body for its SKILL.md
     `!`cccp skill <name>`` include, which replaces the skill body wholesale.
 
-    Template-based skills (chat, team, foreman) go through compose_skill.
-    Callable skills (token-aware-setup) are dispatched directly."""
+    Template-based skills (chat, team, foreman) go through compose_skill (which
+    injects @@COMRADE_ID@@ and @@BACKEND@@); callable skills (data-setup) dispatch
+    directly."""
     fn = SKILL_FNS.get(args.name)
     if fn:
         sys.stdout.write(fn(args.extra) + "\n")
@@ -1369,7 +1654,7 @@ def read_dispatch_body(arg):
 def cmd_dispatch(args):
     """Append a message to my gazette - the whole of sending, in v2."""
     cfg = resolve_config()
-    client = BlobClient(cfg["ACCOUNT"], cfg["CONTAINER"], cfg["SAS"])
+    client = make_backend(cfg)
     slug = slugify(args.cell)
     me = comrade_id()
     log = setup_logging(cfg, slug, me, sys.argv)
@@ -1404,7 +1689,7 @@ def cmd_dispatch(args):
 def cmd_watchtower(args):
     """Run the long-lived live-event stream for a cell (under the Monitor tool)."""
     cfg = resolve_config()
-    client = BlobClient(cfg["ACCOUNT"], cfg["CONTAINER"], cfg["SAS"])
+    client = make_backend(cfg)
     slug = slugify(args.cell)
     me = comrade_id()
     log = setup_logging(cfg, slug, me, sys.argv)
@@ -1460,7 +1745,7 @@ def cmd_read(args):
     # Read-only, so the log path uses the bare user@host - it avoids requiring a
     # session id (this can run outside Claude) and the exact id is immaterial here.
     log = setup_logging(cfg, slug, base_comrade_id(), sys.argv)
-    client = BlobClient(cfg["ACCOUNT"], cfg["CONTAINER"], cfg["SAS"], log=log)
+    client = make_backend(cfg, log=log)
     prefix = cfg["PREFIX"]
 
     with subcommand_footer(log):
@@ -1510,9 +1795,9 @@ def cmd_rm(args):
     cfg = resolve_config()
     slug = slugify(args.cell)
     log = setup_logging(cfg, slug, base_comrade_id(), sys.argv)
-    client = BlobClient(cfg["ACCOUNT"], cfg["CONTAINER"], cfg["SAS"], log=log)
+    client = make_backend(cfg, log=log)
     with subcommand_footer(log):
-        head = f"{cfg['PREFIX']}/{slug}/"
+        head = cell_head(cfg["PREFIX"], slug)
         blobs = list(client.list(head))
         if not blobs:
             print(f"cell {slug!r} is empty or does not exist - nothing to delete")
@@ -1525,7 +1810,7 @@ def cmd_rm(args):
             print("dry run - pass --yes to actually delete")
             return
         for name in blobs:
-            st = client.request("DELETE", name)[0]
+            st = client.delete(name)
             print(f"deleted {name} -> {st}")
         print(f"cell {slug!r} removed")
 
@@ -1534,7 +1819,7 @@ def cmd_publish(args):
     """Upload a file as a block blob under my files/ area and announce it in my
     gazette. Single-PUT only - files over PUBLISH_MAX need ad-hoc staging."""
     cfg = resolve_config()
-    client = BlobClient(cfg["ACCOUNT"], cfg["CONTAINER"], cfg["SAS"])
+    client = make_backend(cfg)
     slug = slugify(args.cell)
     me = comrade_id()
     log = setup_logging(cfg, slug, me, sys.argv)
@@ -1556,7 +1841,7 @@ def cmd_publish(args):
         rel = str(src).lstrip("/")
         data = src.read_bytes()
         with TimeLogger(log, "publish_upload", path=rel, size=size):
-            st = client.put_block(f"{cfg['PREFIX']}/{slug}/{me}/files/{rel}", data)
+            st = client.put_block(comrade_path(cfg["PREFIX"], slug, me, f"files/{rel}"), data)
         if st != 201:
             raise BlobError(st, b"publish upload failed")
 
@@ -1573,7 +1858,7 @@ def cmd_unpublish(args):
     """Delete a previously-published file blob and announce the withdrawal.
     Uses the same path that was given to publish."""
     cfg = resolve_config()
-    client = BlobClient(cfg["ACCOUNT"], cfg["CONTAINER"], cfg["SAS"])
+    client = make_backend(cfg)
     slug = slugify(args.cell)
     me = comrade_id()
     log = setup_logging(cfg, slug, me, sys.argv)
@@ -1581,7 +1866,7 @@ def cmd_unpublish(args):
     with subcommand_footer(log):
         src = Path(os.path.abspath(os.path.expanduser(args.path)))
         rel = str(src).lstrip("/")
-        client.request("DELETE", f"{cfg['PREFIX']}/{slug}/{me}/files/{rel}")  # 404 ok
+        client.delete(comrade_path(cfg["PREFIX"], slug, me, f"files/{rel}"))  # 404 ok
         d = {"type": "filesystem", "op": "unpublish", "ts": now_iso(), "from": me,
              "to": args.to if args.to else ["*"], "path": f"files/{rel}"}
         append_dispatch(client, cfg["PREFIX"], slug, me, d)
@@ -1597,7 +1882,7 @@ def cmd_pull(args):
     # A fetch, not a participation event; the log path uses the bare user@host
     # (no session id required, exact id immaterial).
     log = setup_logging(cfg, slug, base_comrade_id(), sys.argv)
-    client = BlobClient(cfg["ACCOUNT"], cfg["CONTAINER"], cfg["SAS"], log=log)
+    client = make_backend(cfg, log=log)
     prefix = cfg["PREFIX"]
 
     with subcommand_footer(log):
@@ -1695,10 +1980,94 @@ def cmd_unalias(args):
     print(f"cleared {args.name}")
 
 
+# ---------- backend selection ----------
+
+def validate_backend(cfg, network=False):
+    """Read-only health check of the resolved backend. Returns (ok, detail) and
+    never mutates anything. local-fs checks its data dir is writable; azure-blob
+    checks the required params are present, and with network=True also does one
+    cheap container LIST to confirm the SAS actually reaches the hub."""
+    backend = cfg["BACKEND"]
+    if backend == "local-fs":
+        probe = plugin_data_dir()
+        while not probe.exists() and probe != probe.parent:
+            probe = probe.parent
+        if os.access(probe, os.W_OK):
+            return True, "ready"
+        return False, f"data dir not writable: {plugin_data_dir()}"
+    if backend == "azure-blob":
+        params = cfg["PARAMS"]
+        missing = [k.upper() for k in ("account", "container", "sas")
+                   if not params.get(k)]
+        if missing:
+            return False, "missing " + ", ".join(missing)
+        if not network:
+            return True, "configured"
+        try:
+            AzureBlobBackend(params["account"], params["container"], params["sas"]) \
+                .list(cell_head(cfg["PREFIX"], "__cccp_healthcheck__"))
+            return True, "ready"
+        except Exception as e:
+            return False, f"cannot reach container ({type(e).__name__})"
+    return False, f"unknown backend {backend!r}"
+
+
+def _write_setting(key, value):
+    """Set KEY=value in the global settings file, preserving other lines/comments."""
+    path = settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    out, replaced = [], False
+    if path.exists():
+        for line in path.read_text().splitlines():
+            s = line.strip()
+            if s and not s.startswith("#") and s.split("=", 1)[0].strip() == key:
+                out.append(f"{key}={value}")
+                replaced = True
+            else:
+                out.append(line)
+    if not replaced:
+        out.append(f"{key}={value}")
+    path.write_text("\n".join(out) + "\n")
+
+
+def _backend_use(name):
+    """Validate `name` as the active backend, then persist it to settings. Refuses
+    to switch to a backend that isn't ready - it never leaves the user pointed at a
+    broken store, and never silently downgrades."""
+    if name not in BACKENDS:
+        sys.exit(f"error: unknown backend {name!r}; known: "
+                 f"{', '.join(sorted(BACKENDS))}")
+    current = resolve_config()["BACKEND"]
+    os.environ["CCCP_ACTIVE_BACKEND"] = name   # force resolution of the target
+    ok, detail = validate_backend(resolve_config(), network=True)
+    if not ok:
+        sys.exit(f"error: {name!r} is not ready: {detail}. Active backend "
+                 f"unchanged ({current}). See docs/backend.md.")
+    _write_setting("CCCP_ACTIVE_BACKEND", name)
+    print(f"Active backend set to {name} ({detail}).")
+
+
+def cmd_backend(args):
+    """Show the active backend and health, or `use <name>` to switch it."""
+    if getattr(args, "action", None) == "use":
+        _backend_use(args.name)
+        return
+    cfg = resolve_config()
+    active = cfg["BACKEND"]
+    ok, detail = validate_backend(cfg, network=True)
+    print(f"Active backend: {active}  [{'OK' if ok else 'NOT READY - ' + detail}]")
+    print()
+    for name, spec in BACKENDS.items():
+        mark = "->" if name == active else "  "
+        print(f" {mark} {name:<11} {spec['summary']}")
+    print()
+    print("Switch: cccp backend use <name>   Details: docs/backend.md")
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="cccp",
-        description="Claude-to-Claude Communication Protocol (v2, Azure Blob).",
+        description="Claude-to-Claude Communication Protocol (pluggable backends).",
     )
     # Explicit metavar lists only the operator-facing subcommands. `skill` is a
     # render-time internal (the SKILL.md `!`cccp skill ...`` include calls it, not
@@ -1707,7 +2076,7 @@ def build_parser():
     # shows in top-level `cccp --help`.
     sub = p.add_subparsers(
         dest="cmd", required=True,
-        metavar="{dispatch,watchtower,wake,read,rm,publish,unpublish,pull,"
+        metavar="{backend,dispatch,watchtower,wake,read,rm,publish,unpublish,pull,"
                 "aliases,alias,unalias}")
 
     # No `help=` kwarg: argparse only emits a subcommand's detail line when a
@@ -1725,6 +2094,14 @@ def build_parser():
                          "skills/<part>/body.template.md is concatenated base-first.")
     sk.add_argument("extra", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
     sk.set_defaults(func=cmd_skill)
+
+    bk = sub.add_parser("backend",
+                        help="Show or switch the active data backend.")
+    bk_sub = bk.add_subparsers(dest="action", metavar="{use}")
+    bk_use = bk_sub.add_parser("use", help="Switch the active backend and persist it.")
+    bk_use.add_argument("name", help="Backend to activate (see `cccp backend`).")
+    bk.set_defaults(func=cmd_backend, action=None, name=None)
+    bk_use.set_defaults(func=cmd_backend, action="use")
 
     disp = sub.add_parser("dispatch", help="Send a message to a cell.")
     disp.add_argument("cell", help="Cell slug.")

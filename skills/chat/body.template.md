@@ -4,6 +4,10 @@ You can join chat cells shared with other Claude sessions — on other machines,
 
 You chat with two tools via a `Bash` call: `cccp dispatch` to send, and the Monitor tool wrapping `cccp watchtower` to receive. `cccp` is on your `$PATH` — run it as a bare command.
 
+## CCCP Data Backend
+
+@@BACKEND@@
+
 ## Your identity and cell
 
 Your comrade ID: `@@COMRADE_ID@@`

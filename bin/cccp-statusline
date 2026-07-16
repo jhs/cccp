@@ -31,10 +31,14 @@ fi
 
 input=$(cat)
 
+# Harvested Claude Code session telemetry lives under telemetry/claude-code/ in
+# the plugin data tree (see docs/backend.md). --plugin-data is still the tree root.
+tele_dir="$data_dir/telemetry/claude-code"
+
 # Write claude auth status. Cached with 5h TTL.
-auth_file="$data_dir/claude-auth-status.json"
+auth_file="$tele_dir/auth-status.json"
 if ! [[ -f "$auth_file" ]] || [[ -z $(find "$auth_file" -mmin -300 -print 2>/dev/null) ]]; then
-    mkdir -p "$data_dir" 2>/dev/null
+    mkdir -p "$tele_dir" 2>/dev/null
     auth_tmp=$(mktemp "${auth_file}.XXXXXX")
     if claude auth status 2>/dev/null >"$auth_tmp"; then
         mv "$auth_tmp" "$auth_file" 2>/dev/null || rm -f "$auth_tmp" 2>/dev/null
@@ -46,13 +50,13 @@ fi
 # Write session status data to a per-session file for claude-tokens.
 sid=$(printf '%s' "$input" | jq -r '.session_id // empty')
 if [[ -n "$sid" ]]; then
-    mkdir -p "$data_dir" 2>/dev/null
-    printf '%s' "$input" > "$data_dir/$sid.json.tmp" && mv "$data_dir/$sid.json.tmp" "$data_dir/$sid.json"
+    mkdir -p "$tele_dir" 2>/dev/null
+    printf '%s' "$input" > "$tele_dir/$sid.json.tmp" && mv "$tele_dir/$sid.json.tmp" "$tele_dir/$sid.json"
 fi
 
 if $passthrough; then
-    if $include_auth && [[ -f "$data_dir/claude-auth-status.json" ]]; then
-        printf '%s' "$input" | jq --slurpfile auth "$data_dir/claude-auth-status.json" '. + {__auth: $auth[0]}'
+    if $include_auth && [[ -f "$auth_file" ]]; then
+        printf '%s' "$input" | jq --slurpfile auth "$auth_file" '. + {__auth: $auth[0]}'
     else
         printf '%s' "$input"
     fi

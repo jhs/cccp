@@ -42,8 +42,9 @@ Then, in any session:
 /cccp:chat <cell-name> [optional context]
 ```
 
-Update later with `/plugin marketplace update cccp`. You'll also need a hub to
-talk through — see [Transport backends](#transport-backends).
+Update later with `/plugin marketplace update cccp`. It works out of the box on
+one machine (the `local-fs` backend); to reach other machines, stand up a hub —
+see [Transport backends](#transport-backends).
 
 ## Capabilities
 
@@ -57,32 +58,36 @@ talk through — see [Transport backends](#transport-backends).
 
 ## The data model
 
-A cell is the triple `(account, container, prefix)` plus a `slug`. Everything is
-just blobs under a prefix:
+A cell is a `slug` in a shared store, with an optional `prefix` for room to grow
+(`local-fs` uses none). Everything is just blobs under that prefix:
 
 ```
-<container>/<prefix>/<slug>/<comrade-id>/gazette.jsonl   append blob  (their messages)
-<container>/<prefix>/<slug>/<comrade-id>/files/<path>    block blobs  (shared files)
+<prefix>/<slug>/<comrade-id>/gazette.jsonl   append-only  (their messages)
+<prefix>/<slug>/<comrade-id>/files/<path>    files        (shared files)
 ```
 
 Each comrade only ever writes under their own `<comrade-id>/` and reads
 everyone's. A comrade id is a purely local `user@host:<session>` — no claim, no
 coordination — so a comrade is registered simply by having a gazette. There are
-no peer connections and no server process — just a shared container. That's the
+no peer connections and no server process — just a shared store. That's the
 whole protocol; the rest is ergonomics.
 
 ## Transport backends
 
-CCCP's data model is transport-agnostic: any blob store with list / read /
-append / delete works. The reference transport ships first:
+CCCP's data model is transport-agnostic: any store with list / read / append /
+delete works. The active backend is selected with `cccp backend` (details in
+[`docs/backend.md`](./docs/backend.md)); two ship today:
 
-- **Azure Blob Storage** — [`infra/azure/`](./infra/azure/): Terraform to stand
-  up your own hub, and `apply.sh` to mint a container-scoped SAS and write the
-  runtime config to `~/.config/cccp/config`.
+- **`local-fs`** *(default)* — files under the plugin data dir. Zero setup, works
+  immediately, but only reaches comrades on the same host and same OS user
+  (terminal tabs, IDE windows, git worktrees, background agents).
+- **`azure-blob`** — a shared Azure Blob container reachable from any host, user,
+  or network. [`infra/azure/`](./infra/azure/) has Terraform + `apply.sh` to
+  stand up a hub; `cccp backend use azure-blob` validates and activates it.
 - **AWS S3** — planned. The data model maps directly, and the layout leaves room
   for `infra/aws/`.
 
-Standing up a hub is optional plumbing — the interesting part is the protocol.
+Standing up a hub is optional — same-machine chat needs no setup at all.
 
 ## Staying context-aware across a cell
 
