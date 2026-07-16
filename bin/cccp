@@ -158,6 +158,8 @@ def current_session_id():
 #                         connection config
 #   mirror/               cache: pulled files, aliases, per-cell debug + watchtower logs
 #   telemetry/            cache: harvested session data (token-aware)
+#   run/                  ephemeral inter-process runtime state (the /var/run of
+#                         the tree): watchtower inboxes today, pidfiles later
 # Claude Code exports CCCP_PLUGIN_DATA (SessionStart hook). Non-Claude callers
 # (manual runs, tests) fall back to $XDG_STATE_HOME/cccp so `cccp` still works -
 # and nothing ever writes to the old ~/.cccp again.
@@ -174,6 +176,13 @@ def mirror_dir():
     """Local cache of pulled/auto-downloaded files, aliases, and per-cell logs -
     reconstructible, safe to delete (successor to the old ~/.cccp)."""
     return plugin_data_dir() / "mirror"
+
+
+def run_dir():
+    """Ephemeral inter-process runtime state - the /var/run of the tree. Neither
+    cache nor authoritative: everything here is meaningless once the process that
+    owns it is gone, and is recreated by the next one that needs it."""
+    return plugin_data_dir() / "run"
 
 
 def backend_dir(name):
@@ -764,6 +773,36 @@ def cell_roster(client, prefix, slug):
     return sorted(comrades)
 
 
+# ---------- journals ----------
+#
+# An append-only JSONL log read from a byte offset is the one storage pattern
+# cccp has: gazettes on the backend (the wire), and the watchtower inbox on local
+# disk (see run_dir). Same shape, different scope - so they share this reader
+# rather than a second implementation of the accounting, which is where the bugs
+# would live.
+
+def journal_records(data):
+    """Parse complete JSON lines out of one read of a journal.
+
+    Returns (records, consumed). `consumed` is how many bytes of `data` are
+    accounted for, so a caller tracking an offset advances to offset + consumed.
+    A partial trailing line is left UNCONSUMED - the writer is still mid-append,
+    so the next read picks that line up whole. An unparseable complete line is
+    skipped but still consumed: it can never be repaired, so re-reading it every
+    poll forever would be the worse failure.
+    """
+    records, consumed = [], 0
+    for chunk in data.splitlines(keepends=True):
+        if not chunk.endswith(b"\n"):
+            break   # partial trailing line; pick it up next read
+        consumed += len(chunk)
+        try:
+            records.append(json.loads(chunk))
+        except ValueError:
+            continue   # malformed: skipped, but consumed so we never re-read it
+    return records, consumed
+
+
 # ---------- gazette ----------
 
 def gazette_path(prefix, slug, comrade):
@@ -919,6 +958,19 @@ def download_to_mirror(client, prefix, slug, sender, wire_path,
 
 # ---------- watchtower ----------
 
+def inbox_path(slug, me):
+    """This comrade's watchtower inbox for one cell: a local, private, append-only
+    journal of commands for the live watchtower (`{"ev": ...}` per line).
+
+    One watchtower = one cell = one comrade, so the path IS the scope of what it
+    carries - a broadcast signal needs no addressing because each watchtower only
+    ever opens its own. Deliberately local and never routed through the backend:
+    a command to a local process must not cost a network round-trip, must not be
+    unsendable when the backend is down, and is nobody else's business.
+    """
+    return run_dir() / "watchtower" / slug / me / "inbox.jsonl"
+
+
 # ---------- aliases (opt-in, view-layer) ----------
 #
 # Aliases are human/LLM-friendly names for comrades, kept as a LOCAL projection:
@@ -1030,6 +1082,10 @@ class Watchtower:
                                   # coordination hub suppresses 'filesystem' - the
                                   # file still auto-downloads, just no notify turn)
         self.hwm = {}        # comrade -> bytes consumed of their gazette
+        # Bytes consumed of my own inbox (see inbox_path). In memory only, never
+        # persisted: commands are for a live watchtower, so a new one starts from
+        # a truncated file with nothing to restore.
+        self.inbox_offset = 0
         self.stop = False
         self.stop_reason = None
         # Whoever launched us (the Monitor bash wrapper). A watchtower must never
@@ -1164,6 +1220,7 @@ class Watchtower:
         self.log.debug(f"ev=aliases_seeded count={len(amap)}")
 
     def run(self):
+        self._reset_inbox()
         with TimeLogger(self.log, "initial_scan"):
             self.initial_scan()
         if self.trigger:
@@ -1236,7 +1293,61 @@ class Watchtower:
         self.wake_requested = True
         self._interrupt.set()
 
+    def _reset_inbox(self):
+        """Start from an empty inbox. Commands address a specific live watchtower,
+        so anything a previous one left behind is meaningless. Truncate-on-start
+        is simultaneously this file's GC - nothing else ever cleans it up, and
+        nothing has to: no cleanup phase, no enumeration, no stale-state sweep."""
+        path = inbox_path(self.slug, self.me)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "wb"):
+                pass
+        except OSError as e:
+            self._log(f"inbox reset failed ({type(e).__name__}: {e})")
+        self.inbox_offset = 0
+
+    def _drain_inbox(self):
+        """Apply commands appended to my inbox since the last drain.
+
+        Runs first in every poll, and SIGUSR1 already means "poll now" - so a
+        writer appends, signals, and lands within ms, with no signal machinery of
+        its own. Costs a stat and an early-out in the overwhelmingly common case
+        where nothing has been written."""
+        path = inbox_path(self.slug, self.me)
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return   # no inbox yet: nobody has ever sent us a command
+        if size <= self.inbox_offset:
+            return   # nothing new
+        try:
+            with open(path, "rb") as f:
+                f.seek(self.inbox_offset)
+                data = f.read()
+        except OSError as e:
+            self._log(f"inbox read failed ({type(e).__name__}: {e})")
+            return
+        records, consumed = journal_records(data)
+        self.inbox_offset += consumed
+        self.log.debug(
+            f"ev=inbox_drained records={len(records)} bytes={consumed} "
+            f"offset={self.inbox_offset}")
+        for rec in records:
+            self._apply_inbox(rec)
+
+    def _apply_inbox(self, rec):
+        """Dispatch one inbox command. An unrecognized `ev` is ignored, exactly as
+        the gazette ignores an unrecognized `type` - so a newer writer can never
+        break an older watchtower."""
+        ev = rec.get("ev")
+        if ev == "ping":
+            self._log(f"inbox ping: {rec!r}")
+            return
+        self.log.debug(f"ev=inbox_unknown rec={_kv(json.dumps(rec))}")
+
     def _poll_once(self):
+        self._drain_inbox()
         gazettes = self._scan()
         messages = []   # (ts, line)
         # Reload the alias map from disk each poll so manual `cccp alias` edits
@@ -1255,15 +1366,8 @@ class Watchtower:
                 f"{self.head}{comrade}/gazette.jsonl", offset)
             if st not in (200, 206):
                 continue
-            consumed = 0
-            for chunk in data.splitlines(keepends=True):
-                if not chunk.endswith(b"\n"):
-                    break  # partial trailing line; pick it up next poll
-                consumed += len(chunk)
-                try:
-                    d = json.loads(chunk)
-                except ValueError:
-                    continue
+            records, consumed = journal_records(data)
+            for d in records:
                 # Learn aliases from every visible message (not just those
                 # addressed to me - intros broadcast), before the render filter.
                 if self.trigger and d.get("type") == "message":
