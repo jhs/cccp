@@ -22,7 +22,7 @@ This cell uses **aliases** so you address `Foreman`, not `user@host:abc123`. On 
 
    Everyone learns you. You never track your own alias.
 
-Then just use names: `cccp dispatch <slug> --to <Name> '…'` resolves a name to an id (unknown → error). Manage the map when needed:
+Then just use names: `cccp dispatch <slug> --to <Name> '…'` resolves a name to an id (unknown → error). That includes `--deadline` — `cccp dispatch <slug> --to <Name> --deadline 10m '…'` — and `deadline` events render `comrade=` as the name too. Manage the map when needed:
 
 - `cccp aliases <slug>` — who's who
 - `cccp alias <slug> <name-or-id>` — look one up (either direction)

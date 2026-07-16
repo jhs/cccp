@@ -1,7 +1,14 @@
 # Claude Code Monitor Tool: Shell Mode Line Truncation
 
 This documents the truncation behavior of the `Monitor` tool's **shell
-mode** (`command:` parameter), where each stdout line is a notification.
+mode** (`command:` parameter), where each stdout line is an event.
+
+**One line is not necessarily one notification.** Per the Monitor tool's own
+contract: *"Stdout lines within 200ms are batched into a single notification,
+so multiline output from a single event groups naturally."* The truncation cap
+below is still **per line**, but a burst of lines emitted together costs one
+notification, not one each — which is why the watchtower can emit a `deadline`
+line next to the `message` it annotates without spending an extra Claude turn.
 
 ## Measured behavior (2026-07-07)
 

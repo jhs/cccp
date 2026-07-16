@@ -104,6 +104,40 @@ TEXT_EXTENSIONS = {
 
 # ---------- identity & misc helpers ----------
 
+_DURATION_FULL = re.compile(r"(?:\d+[smh])+")
+_DURATION_PART = re.compile(r"(\d+)([smh])")
+_UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600}
+
+
+def parse_duration(text):
+    """A compact duration -> whole seconds: '180s', '10m', '3h30m'. Returns None
+    for anything not well-formed, so a caller can reject the raw input rather
+    than silently misread it (a mistyped deadline must not become a wrong one)."""
+    if not text or not _DURATION_FULL.fullmatch(text):
+        return None
+    return sum(int(n) * _UNIT_SECONDS[u] for n, u in _DURATION_PART.findall(text))
+
+
+def format_duration(seconds):
+    """Seconds -> the compact form events use, inverse of parse_duration: 45s,
+    3m7s, 10m, 1h7s, 3h29m58s.
+
+    Every non-zero component is kept, even seconds at hour scale. Rounding them
+    off would look tidier but breaks the arithmetic a reader checks against:
+    with limit=3h30m and took=2s, an early= of '3h29m' does not reconcile, and a
+    reader who cannot make the numbers add up has to stop and work out why -
+    which is worse than not pre-computing them at all."""
+    seconds = max(0, int(round(seconds)))
+    if seconds < 60:
+        return f"{seconds}s"
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    out = f"{h}h" if h else ""
+    out += f"{m}m" if m else ""
+    out += f"{s}s" if s else ""
+    return out or "0s"
+
+
 def now_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
@@ -971,6 +1005,48 @@ def inbox_path(slug, me):
     return run_dir() / "watchtower" / slug / me / "inbox.jsonl"
 
 
+def inbox_send(slug, me, records):
+    """Append command records to my own watchtower's inbox, then wake it.
+
+    One complete JSON line each, O_APPEND, written in a single call - the same
+    atomicity bet the local-fs backend already makes for gazettes, and it keeps a
+    batch in order without the reader needing to know a batch happened.
+
+    The wake is what makes this prompt: SIGUSR1 means only "poll now", and a poll
+    drains the inbox first, so the record lands within ms instead of at the next
+    rung of the ladder."""
+    path = inbox_path(slug, me)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    blob = b"".join((json.dumps(r, separators=(",", ":")) + "\n").encode("utf-8")
+                    for r in records)
+    with open(path, "ab") as f:
+        f.write(blob)
+    wake_watchtowers(slug)
+
+
+def wake_watchtowers(slug):
+    """SIGUSR1 every local watchtower for `slug` - "poll now". Returns the completed
+    pkill process: rc 0 = at least one signalled, 1 = none running (which is NOT an
+    error - an inbox record simply waits for a watchtower that may never come).
+
+    Shared by `cccp wake` and by anything that drops a record in an inbox. See
+    cmd_wake for the sibling-session caveat."""
+    # Anchored regex, load-bearing twice over:
+    #  1. cccp watchtower foo must not match cccp watchtower foo-bar.
+    #  2. It spares the Monitor bash wrapper, which carries the command QUOTED
+    #     (`... && eval 'cccp watchtower foo' < /dev/null && ...`), so the char
+    #     after the slug is a quote - neither a space nor EOL - and the wrapper
+    #     does not match. Only the watchtower itself does, where the slug ends
+    #     the cmdline or precedes a flag. Not cosmetic: SIGUSR1's default
+    #     disposition is Term, so a matched wrapper would DIE and orphan its
+    #     watchtower child - manufacturing the #1 failure on every wake.
+    # Slugs are [a-z0-9-] only (slugify), so re.escape is belt-and-suspenders.
+    # POSIX ERE only (BSD pkill on macOS, procps pkill on Linux): literal space
+    # alternation, not \s. pkill is built-in on both, no homebrew/extra packages.
+    pattern = rf"cccp watchtower {re.escape(slug)}( |$)"
+    return subprocess.run(["pkill", "-USR1", "-f", pattern], capture_output=True)
+
+
 # ---------- aliases (opt-in, view-layer) ----------
 #
 # Aliases are human/LLM-friendly names for comrades, kept as a LOCAL projection:
@@ -1086,6 +1162,11 @@ class Watchtower:
         # persisted: commands are for a live watchtower, so a new one starts from
         # a truncated file with nothing to restore.
         self.inbox_offset = 0
+        # Armed response deadlines: comrade -> {expiry (monotonic), limit_s,
+        # limit (as typed), sent (iso)}. In memory only and never persisted, so a
+        # watchtower's death takes its timers with it - a missed alert, which is
+        # the safe direction, rather than a false one fired by a successor.
+        self.deadlines = {}
         self.stop = False
         self.stop_reason = None
         # Whoever launched us (the Monitor bash wrapper). A watchtower must never
@@ -1165,7 +1246,18 @@ class Watchtower:
         next poll. Reset (ladder_step = -1) on any activity or SIGUSR1 wake."""
         self.ladder_step = min(self.ladder_step + 1, len(POLL_LADDER) - 1)
         gap = POLL_LADDER[self.ladder_step]
-        self.log.debug(f"ev=sleep ladder_step={self.ladder_step} cadence_s={gap}")
+        # Never sleep THROUGH an armed deadline. The ladder still climbs normally;
+        # only the one sleep that would overrun an expiry gets shortened, so idle
+        # backoff is untouched and no minimum deadline is needed - a 180s deadline
+        # on a cell polling every 300s still fires at 180s.
+        clamped = None
+        if self.deadlines:
+            soonest = min(d["expiry"] for d in self.deadlines.values())
+            clamped = max(0.0, soonest - time.monotonic())
+            gap = min(gap, clamped)
+        self.log.debug(
+            f"ev=sleep ladder_step={self.ladder_step} cadence_s={gap:.1f}"
+            + (f" deadline_clamp_s={clamped:.1f}" if clamped is not None else ""))
         return gap
 
     def _scan(self):
@@ -1344,7 +1436,89 @@ class Watchtower:
         if ev == "ping":
             self._log(f"inbox ping: {rec!r}")
             return
+        if ev == "deadline":
+            self._arm_deadline(rec)
+            return
         self.log.debug(f"ev=inbox_unknown rec={_kv(json.dumps(rec))}")
+
+    def _arm_deadline(self, rec):
+        """Arm (or clear, on limit=null) one comrade's response deadline. One verb
+        - set(comrade, limit-or-null) - so last-writer-wins falls out of replay
+        order with no dedup pass, and at most one timer per comrade holds by
+        construction."""
+        to = rec.get("to")
+        if not to:
+            return
+        limit = rec.get("limit")
+        if limit is None:
+            if self.deadlines.pop(to, None) is not None:
+                self.log.debug(f"ev=deadline_disarmed comrade={_kv(to)}")
+            return
+        limit_s = parse_duration(limit)
+        if limit_s is None:
+            self.log.debug(f"ev=deadline_bad rec={_kv(json.dumps(rec))}")
+            return
+        # Anchor on the record's `ts` (our own message's, written by dispatch on
+        # this same host and therefore this same clock) rather than on arrival:
+        # subtracting the record's age keeps a late drain - a lost signal, a slow
+        # poll - from silently granting the comrade extra time. Absent for a
+        # bodyless arm, which was written milliseconds ago anyway.
+        age = 0.0
+        try:
+            sent_dt = datetime.strptime(
+                rec["ts"], "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
+            age = max(0.0, (datetime.now(timezone.utc) - sent_dt).total_seconds())
+        except (KeyError, TypeError, ValueError):
+            pass
+        self.deadlines[to] = {
+            "expiry": time.monotonic() + max(0.0, limit_s - age),
+            "limit_s": limit_s,
+            "limit": limit,
+            "ts": rec.get("ts"),   # the awaited message's id; None if armed bare
+        }
+        self.log.debug(
+            f"ev=deadline_armed comrade={_kv(to)} limit={limit} age_s={age:.1f}")
+
+    def _met_deadline(self, comrade):
+        """A message from `comrade` beat their deadline: disarm it and describe the
+        outcome, or None if none was armed.
+
+        Both endpoints are the LOCAL clock (monotonic elapsed since arming, plus
+        the record's age at arm time), deliberately not the message's `ts` - that
+        is the sender's clock on another host, and cross-comrade skew is a known
+        real effect here (see the lag_ms note in _poll_once). "How long between my
+        dispatch and my seeing the reply" needs no skew correction."""
+        d = self.deadlines.pop(comrade, None)
+        if d is None:
+            return None
+        early = max(0.0, d["expiry"] - time.monotonic())
+        took = max(0.0, d["limit_s"] - early)
+        return (self._deadline_head(comrade, d, "met")
+                + f" took={format_duration(took)} early={format_duration(early)}")
+
+    def _deadline_head(self, comrade, d, result):
+        """The fields a met and a missed event share, in the same order - so a
+        missed line is exactly a met line stopped early, and `result=` states the
+        outcome outright instead of leaving it to be inferred from which fields
+        happen to be present."""
+        name = alias_or_id(self.aliases, self.me, comrade)
+        ts = f" ts={d['ts']}" if d.get("ts") else ""
+        return f"deadline comrade={name} result={result}{ts} limit={d['limit']}"
+
+    def _expire_deadlines(self):
+        """Alert on every deadline that has passed, and disarm it. Called AFTER
+        gazette processing in a poll: a reply landing at the wire clears its timer
+        in the same poll that would otherwise have fired it, so polling-before-
+        firing actually prevents the spurious alert rather than merely timing it
+        well. Returns how many fired."""
+        now = time.monotonic()
+        due = [c for c, d in self.deadlines.items() if d["expiry"] <= now]
+        for comrade in due:
+            d = self.deadlines.pop(comrade)
+            self._emit(self._deadline_head(comrade, d, "missed"))
+            self.log.debug(f"ev=deadline_expired comrade={_kv(comrade)} "
+                           f"limit={d['limit']}")
+        return len(due)
 
     def _poll_once(self):
         self._drain_inbox()
@@ -1377,6 +1551,23 @@ class Watchtower:
                         if ev:
                             alias_dirty = True
                             messages.append((d.get("ts", now_iso()), ev))
+                # Any message from this comrade proves they are alive and answering,
+                # so it clears their deadline - even one addressed elsewhere, and
+                # even one _render filtered out.
+                #
+                # Its own line rather than appended to the message event, because
+                # `cccp read --ts` recomputes the preview cutoff from preview_budget
+                # WITHOUT knowing about deadlines: widening that header would desync
+                # the split and silently swallow body chars (see #8). Emitted just
+                # BEFORE its message so the reader gets the context ("this is the
+                # reply I was waiting on") before the content. Both land in the same
+                # _emit loop, and Monitor batches stdout within 200ms, so this is one
+                # notification of two lines - not two turns. Equal `ts` plus a stable
+                # sort keeps them adjacent and in this order.
+                met = (self._met_deadline(comrade)
+                       if d.get("type") == "message" else None)
+                if met:
+                    messages.append((d.get("ts", now_iso()), met))
                 line = self._render(d)
                 if line:
                     messages.append((d.get("ts", now_iso()), line))
@@ -1409,8 +1600,12 @@ class Watchtower:
         # is quiet, not broken, and a dispatch to it waits in the container.
         # Backoff: each idle emission doubles the interval (capped at idle_max),
         # so a long-silent cell stops nagging Claude. Activity resets to initial.
+        # Strictly after the gazette pass, so a reply at the wire disarms its timer
+        # before this could fire on it.
+        expired = self._expire_deadlines()
+
         now = time.monotonic()
-        if messages:
+        if messages or expired:
             self.last_activity = now
             self.idle_current = self.idle_initial
             self.idle_due = now + self.idle_initial
@@ -1796,6 +1991,23 @@ def cmd_dispatch(args):
     log = setup_logging(cfg, slug, me, sys.argv)
     client.log = log
     with subcommand_footer(log):
+        # A missing body is legal ONLY as a deadline-only call - the flag is what
+        # licenses it. A plain forgotten body still errors, exactly as before.
+        if args.body is None and args.deadline is None:
+            sys.exit("error: body is required (or pass --deadline to set or clear "
+                     "a deadline without sending anything)")
+        limit = None
+        if args.deadline is not None:
+            # A deadline on a broadcast is ambiguous - "everyone replies" or
+            # "someone replies"? - and per-comrade timers stay unambiguous without
+            # it, so require the caller to say who they are waiting on.
+            if not args.to or "*" in args.to:
+                sys.exit("error: --deadline requires an explicit --to")
+            if args.deadline != "none":
+                limit = args.deadline
+                if parse_duration(limit) is None:
+                    sys.exit(f"error: --deadline {args.deadline!r} is not a duration "
+                             f"(e.g. 180s, 10m, 3h30m) or 'none'")
         # Resolve any alias in --to back to a raw comrade id (the wire only ever
         # carries ids). Aliases and ids are distinguishable, so this is a no-op
         # for id/`*` recipients and errors on an unknown alias.
@@ -1810,16 +2022,44 @@ def cmd_dispatch(args):
                              f"{', '.join(sorted(amap.values())) or '(none)'}")
                 resolved.append(cid)
             to = resolved
-        d = {
-            "type": "message",
-            "ts": now_iso(),
-            "from": me,
-            "to": to,
-            "body": read_dispatch_body(args.body),
-        }
-        with TimeLogger(log, "dispatch_append", body_chars=len(args.body),
-                        to_count=len(args.to) if args.to else 0):
-            append_dispatch(client, cfg["PREFIX"], slug, me, d)
+        sent = None
+        if args.body is not None:
+            body = read_dispatch_body(args.body)
+            d = {
+                "type": "message",
+                "ts": now_iso(),
+                "from": me,
+                "to": to,
+                "body": body,
+            }
+            sent = d["ts"]
+            with TimeLogger(log, "dispatch_append", body_chars=len(body),
+                            to_count=len(args.to) if args.to else 0):
+                append_dispatch(client, cfg["PREFIX"], slug, me, d)
+
+        # Deadlines are local watchtower state - nothing about them goes on the
+        # wire. One record per recipient, so multiple --to fan out to independent
+        # timers. Armed after the send, so the clock starts when the message
+        # actually went out.
+        if args.deadline is not None:
+            # `ts` is the MESSAGE's ts, not the arm time - which makes it a real
+            # handle: `cccp read <slug> --from <me> --ts <ts>` returns the very
+            # message we are awaiting a reply to, for us after a compaction or for
+            # the comrade we are chasing. Exact-match on a stored string, so clock
+            # skew across the cell is irrelevant. It doubles as the timer's anchor,
+            # so the clock starts when the message went out rather than after the
+            # append (a network round-trip on azure-blob).
+            #
+            # Omitted entirely when there is no message: a bodyless arm may relate
+            # to something said turns ago, or to nothing at all, and cccp cannot
+            # know which. Absent beats pointing at nothing - and its absence tells
+            # the reader there is no specific message to re-read.
+            rec = {"ev": "deadline", "to": None, "limit": limit}
+            if sent:
+                rec["ts"] = sent
+            with TimeLogger(log, "deadline_send", to_count=len(to),
+                            limit=limit or "none"):
+                inbox_send(slug, me, [{**rec, "to": t} for t in to])
 
 
 def cmd_watchtower(args):
@@ -1858,20 +2098,7 @@ def cmd_wake(args):
     me = base_comrade_id()
     log = setup_logging(cfg, slug, me, sys.argv)
     with subcommand_footer(log):
-        # Anchored regex, load-bearing twice over:
-        #  1. cccp watchtower foo must not match cccp watchtower foo-bar.
-        #  2. It spares the Monitor bash wrapper, which carries the command QUOTED
-        #     (`... && eval 'cccp watchtower foo' < /dev/null && ...`), so the char
-        #     after the slug is a quote - neither a space nor EOL - and the wrapper
-        #     does not match. Only the watchtower itself does, where the slug ends
-        #     the cmdline or precedes a flag. Not cosmetic: SIGUSR1's default
-        #     disposition is Term, so a matched wrapper would DIE and orphan its
-        #     watchtower child - manufacturing the #1 failure on every wake.
-        # Slugs are [a-z0-9-] only (slugify), so re.escape is belt-and-suspenders.
-        # POSIX ERE only (BSD pkill on macOS, procps pkill on Linux): literal space
-        # alternation, not \s. pkill is built-in on both, no homebrew/extra packages.
-        pattern = rf"cccp watchtower {re.escape(slug)}( |$)"
-        r = subprocess.run(["pkill", "-USR1", "-f", pattern], capture_output=True)
+        r = wake_watchtowers(slug)
         log.debug(f"ev=wake_sent slug={_kv(slug)} pkill_rc={r.returncode}")
         if r.returncode == 0:
             print(f"woke watchtower(s) for cell {slug!r}")
@@ -2251,7 +2478,13 @@ def build_parser():
     disp.add_argument("cell", help="Cell slug.")
     disp.add_argument("--to", action="append", default=[], metavar="COMRADE",
                       help="Repeatable. Comrade id or alias; omit for broadcast.")
-    disp.add_argument("body", help="Message text, or `-` to read the body from "
+    disp.add_argument("--deadline", metavar="DURATION",
+                      help="Expect a reply from each --to within DURATION "
+                           "(180s, 10m, 3h30m); `none` clears. Local to this "
+                           "session's watchtower - nothing goes on the wire. "
+                           "May be used with no message body, to set or clear a "
+                           "deadline without sending anything.")
+    disp.add_argument("body", nargs="?", help="Message text, or `-` to read the body from "
                                    "stdin verbatim (heredoc-friendly).")
     disp.set_defaults(func=cmd_dispatch)
 
@@ -2351,7 +2584,22 @@ def build_parser():
 
 
 def main(argv=None):
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    # `dispatch` has an optional positional (body) that normally FOLLOWS optionals
+    # - `dispatch cell --to X "msg"`. argparse cannot express that: with nargs="?"
+    # it matches body against zero args at the first positional run (before --to
+    # is even seen), then reports the real message as "unrecognized". It does so
+    # deterministically, leaving the body as the sole extra, so recover it here.
+    # Deliberately narrow - one extra, on dispatch, only when body came back empty,
+    # and never something that looks like a flag (but `-` IS a body: read stdin).
+    args, extras = parser.parse_known_args(argv)
+    if (extras and len(extras) == 1
+            and getattr(args, "func", None) is cmd_dispatch
+            and getattr(args, "body", None) is None
+            and (extras[0] == "-" or not extras[0].startswith("-"))):
+        args.body, extras = extras[0], []
+    if extras:
+        parser.error(f"unrecognized arguments: {' '.join(extras)}")
     args.func(args)
 
 
