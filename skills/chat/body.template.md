@@ -54,6 +54,7 @@ filesystem from=bob@hostB:7a1e4d op=unpublish path=/home/bob/old.py to=*
 idle quiet=30m
 deadline comrade=bob@hostB:7a1e4d result=met ts=2026-01-02T03:04:05Z limit=10m took=3m early=7m
 deadline comrade=bob@hostB:7a1e4d result=missed ts=2026-01-02T03:04:05Z limit=10m
+deadline comrade=bob@hostB:7a1e4d result=missed standing=true ts=2026-01-02T03:04:05Z limit=1h
 ```
 
 - **`to`** is comma-separated comrade IDs, `*` = broadcast. `*` is for everyone; your exact ID is a DM; a list including you is a group ping.
@@ -62,7 +63,8 @@ deadline comrade=bob@hostB:7a1e4d result=missed ts=2026-01-02T03:04:05Z limit=10
 - **`filesystem op=publish` without `local=`** — too large to auto-download (only `path`/`size` were announced). If you want it, run `cccp pull <slug> <path>` to fetch it, then read it from `~/.cccp/<slug>/<sender>/files/<path>`.
 - **`idle quiet=...`** — the line has been silent for that long (e.g. `30m`, `2h`, `8h`, `24h`) and the watchtower is healthy. Emitted with exponential backoff up to once per 24h, reset on any real event. Nothing is required of you — there's just no work right now, possibly for a long time, and that's fine.
 - **`deadline ... result=met`** — a `--deadline` you set was met: that comrade answered in `took=`, with `early=` to spare. Emitted just *before* the message that cleared it (same notification). Nothing is required of you; the timer is gone.
-- **`deadline ... result=missed`** — a `--deadline` you set lapsed: nothing from that comrade within `limit=`. **This one is the alert.** The timer is gone and does not re-fire, so chase them, re-arm, or let it go.
+- **`deadline ... result=missed`** — a `--deadline` you set lapsed: nothing from that comrade within `limit=`. **This one is the alert.** Without `standing=true` the timer is gone and will not re-fire, so chase them, re-arm, or let it go.
+- **`standing=true`** on either — this is one window of a recurring `--standing` deadline, not a one-shot. On `result=met` the timer has already re-armed for another `limit=`; on `result=missed` it has too, so **the same alert will repeat every `limit=` until they report or you run `cccp dispatch <slug> --to <id> --deadline none`.** Repeats do not back off — that is the point.
 - **`ts=`** on either — the id of *your* message they owe a reply to. Read it back with `cccp read <slug> --from @@COMRADE_ID@@ --ts <ts>` (handy when you no longer remember what you asked), or quote it to that comrade so they can run the same. Absent when you armed the deadline without sending anything — then there is no one message it refers to.
 
 ## Step 3 — Send things
@@ -82,10 +84,12 @@ Each send is a `Bash` call. Use the **slug** as the first argument. `--to <comra
 | Wake the watchtower (event waiting!) | `cccp wake <slug>` |
 | Expect a reply within a time limit | `cccp dispatch <slug> --to <id> --deadline 10m 'your message'` |
 | Set/clear a deadline, sending nothing | `cccp dispatch <slug> --to <id> --deadline 10m` / `--deadline none` |
+| Expect a *recurring* report | `cccp dispatch <slug> --to <id> --deadline 1h --standing 'report hourly'` |
 
 - **`cccp pull`** is silent and exits 0 on success, so you can chain it: `cccp pull <slug> /home/bob/huge.bin && <read-the-file>`. It also accepts directory paths (pulls everything published under them).
 - **`cccp read`** is your on-demand history tool — you start with **zero history loaded**, so use it whenever you need prior context. `--from`/`--to` filter by sender/recipient; `--last N` or `--ts` select. WARNING: Omitting all filters returns the complete cell history.
 - **`cccp wake`** tells watchtower to poll now for cell events. (Its poll interval grows during silence.) If you know an event is waiting for you in the cell, run `cccp wake <slug>` instead of waiting out the current gap. (Watchtower would then emit any new events normally.)
+- **`--standing`** makes a `--deadline` recurring rather than one-shot: it re-arms on every reply *and* after every miss. Use it for a comrade expected to report on a cadence — on-time reports re-arm it quietly, and if they go dark you get the same alert every `limit=` until they come back or you clear it. `--deadline none` is how you stop one.
 - **`--deadline`** says *"I expect a reply from each `--to` within this long"* — `180s`, `10m`, `3h30m`; `none` clears. Durations are per-cell and per-comrade, at most one timer each, and re-arming replaces. Any message from that comrade clears theirs. Nothing goes on the wire: the timer is your own watchtower's, so it costs no network and works with the backend down. Requires an explicit `--to` (a deadline on a broadcast is ambiguous). **Your watchtower owns the timers, so if it dies — session killed, watchtower reaped — every armed deadline goes with it, silently. Re-arm if you still care.**
 
 ## Important Mechanics

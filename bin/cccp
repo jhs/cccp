@@ -1475,9 +1475,22 @@ class Watchtower:
             "limit_s": limit_s,
             "limit": limit,
             "ts": rec.get("ts"),   # the awaited message's id; None if armed bare
+            # A standing deadline re-arms instead of disarming, on both a reply and
+            # a miss - a cadence, not a one-shot.
+            "standing": bool(rec.get("standing")),
         }
         self.log.debug(
-            f"ev=deadline_armed comrade={_kv(to)} limit={limit} age_s={age:.1f}")
+            f"ev=deadline_armed comrade={_kv(to)} limit={limit} age_s={age:.1f} "
+            f"standing={bool(rec.get('standing'))}")
+
+    def _rearm(self, d):
+        """Restart a standing timer for another full `limit` from now. Deliberately
+        flat - no backoff. The idle heartbeat backs off because it is unsolicited
+        nagging; a standing deadline was explicitly asked for, and a comrade that
+        has stopped reporting should stay just as loud on the tenth miss as the
+        first. `ts` is kept across re-arms: it identifies the message that
+        established the expectation, which is exactly what a later miss is about."""
+        d["expiry"] = time.monotonic() + d["limit_s"]
 
     def _met_deadline(self, comrade):
         """A message from `comrade` beat their deadline: disarm it and describe the
@@ -1488,22 +1501,34 @@ class Watchtower:
         is the sender's clock on another host, and cross-comrade skew is a known
         real effect here (see the lag_ms note in _poll_once). "How long between my
         dispatch and my seeing the reply" needs no skew correction."""
-        d = self.deadlines.pop(comrade, None)
+        d = self.deadlines.get(comrade)
         if d is None:
             return None
         early = max(0.0, d["expiry"] - time.monotonic())
         took = max(0.0, d["limit_s"] - early)
-        return (self._deadline_head(comrade, d, "met")
+        line = (self._deadline_head(comrade, d, "met")
                 + f" took={format_duration(took)} early={format_duration(early)}")
+        # A standing timer re-arms here silently: the met line already says they
+        # reported, and `standing=true` on it says another window has begun. The
+        # healthy case must not cost a second event.
+        if d["standing"]:
+            self._rearm(d)
+        else:
+            del self.deadlines[comrade]
+        return line
 
     def _deadline_head(self, comrade, d, result):
         """The fields a met and a missed event share, in the same order - so a
         missed line is exactly a met line stopped early, and `result=` states the
         outcome outright instead of leaving it to be inferred from which fields
-        happen to be present."""
+        happen to be present. `standing=` sits next to `result=` because it
+        qualifies it: whether this outcome is the end of the matter or one window
+        of a cadence. Emitted only when true; absent means a one-shot."""
         name = alias_or_id(self.aliases, self.me, comrade)
+        standing = " standing=true" if d.get("standing") else ""
         ts = f" ts={d['ts']}" if d.get("ts") else ""
-        return f"deadline comrade={name} result={result}{ts} limit={d['limit']}"
+        return (f"deadline comrade={name} result={result}{standing}{ts} "
+                f"limit={d['limit']}")
 
     def _expire_deadlines(self):
         """Alert on every deadline that has passed, and disarm it. Called AFTER
@@ -1514,10 +1539,14 @@ class Watchtower:
         now = time.monotonic()
         due = [c for c, d in self.deadlines.items() if d["expiry"] <= now]
         for comrade in due:
-            d = self.deadlines.pop(comrade)
+            d = self.deadlines[comrade]
             self._emit(self._deadline_head(comrade, d, "missed"))
             self.log.debug(f"ev=deadline_expired comrade={_kv(comrade)} "
-                           f"limit={d['limit']}")
+                           f"limit={d['limit']} standing={d['standing']}")
+            if d["standing"]:
+                self._rearm(d)   # alert again on the same cadence until they report
+            else:
+                del self.deadlines[comrade]
         return len(due)
 
     def _poll_once(self):
@@ -1996,6 +2025,11 @@ def cmd_dispatch(args):
         if args.body is None and args.deadline is None:
             sys.exit("error: body is required (or pass --deadline to set or clear "
                      "a deadline without sending anything)")
+        if args.standing and args.deadline is None:
+            sys.exit("error: --standing requires --deadline")
+        if args.standing and args.deadline == "none":
+            sys.exit("error: --standing cannot be combined with --deadline none "
+                     "(`--deadline none` is how you stop a standing deadline)")
         limit = None
         if args.deadline is not None:
             # A deadline on a broadcast is ambiguous - "everyone replies" or
@@ -2057,8 +2091,10 @@ def cmd_dispatch(args):
             rec = {"ev": "deadline", "to": None, "limit": limit}
             if sent:
                 rec["ts"] = sent
+            if args.standing:
+                rec["standing"] = True
             with TimeLogger(log, "deadline_send", to_count=len(to),
-                            limit=limit or "none"):
+                            limit=limit or "none", standing=bool(args.standing)):
                 inbox_send(slug, me, [{**rec, "to": t} for t in to])
 
 
@@ -2484,6 +2520,12 @@ def build_parser():
                            "session's watchtower - nothing goes on the wire. "
                            "May be used with no message body, to set or clear a "
                            "deadline without sending anything.")
+    disp.add_argument("--standing", action="store_true",
+                      help="Make --deadline recurring: it re-arms on every reply "
+                           "and after every miss, so a comrade expected to report "
+                           "on a cadence always has a live timer. On-time replies "
+                           "re-arm it quietly; silence alerts every DURATION until "
+                           "they report or you pass --deadline none.")
     disp.add_argument("body", nargs="?", help="Message text, or `-` to read the body from "
                                    "stdin verbatim (heredoc-friendly).")
     disp.set_defaults(func=cmd_dispatch)
