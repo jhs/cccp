@@ -87,8 +87,10 @@ if [[ ${#extra_docs[@]} -gt 0 ]]; then
 fi
 if [[ -n "$foreman" ]]; then
   prompt+=" -- then introduce yourself to your Foreman at ${foreman},"
-  prompt+=" beginning with the literal prefix Intro: followed by your alias ${name}"
+else
+  prompt+=" -- then introduce yourself to the cell,"
 fi
+prompt+=" beginning with the literal prefix Intro: followed by your alias ${name}"
 
 # Escape single-quotes for the sh -c string ( ' -> '\'' ).
 esc=${prompt//\'/\'\\\'\'}
