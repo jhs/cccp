@@ -63,7 +63,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 API_VERSION = "2023-11-03"
-CCCP_VERSION = "2.4.0"     # Shown on the watchtower `ready` line (v=...) so a
+CCCP_VERSION = "2.4.1"     # Shown on the watchtower `ready` line (v=...) so a
                            # comrade's Claude can see which build it is running.
                            # Cosmetic only - nothing reads it. KEEP EQUAL to the
                            # version in .claude-plugin/plugin.json - the single
