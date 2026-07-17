@@ -740,6 +740,25 @@ class BackendConfigKeys(unittest.TestCase):
         self.assertEqual(cccp._config_keys("azure-blob"),
                          ("ACCOUNT", "CONTAINER", "SAS", "PREFIX"))
 
+    def test_no_config_backend_names_no_file(self):
+        # A backend with no keys has no config file. Naming one - especially as
+        # "(not created yet)", which promises it is coming - contradicts the very
+        # sentence it sits above.
+        with tempfile.TemporaryDirectory() as d, _isolated_env(d):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                cccp._backend_config("local-fs", [])
+            out = buf.getvalue()
+        self.assertEqual(out.strip(), "local-fs takes no configuration.")
+
+    def test_user_facing_text_never_prints_a_literal_env_var_name(self):
+        # `$CCCP_PLUGIN_DATA is writable` is unactionable: you cannot check a path
+        # you cannot see. Guidance must resolve it.
+        with tempfile.TemporaryDirectory() as d, _isolated_env(d):
+            guidance = cccp._backend_setup_guidance("local-fs")
+        self.assertIn(d, guidance)                       # the resolved path
+        self.assertNotIn("`$CCCP_PLUGIN_DATA` is set and writable", guidance)
+
 
 class SecretRedaction(unittest.TestCase):
     """A secret param is never printed - only whether it is set and how long - so

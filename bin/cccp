@@ -2000,8 +2000,11 @@ def _backend_setup_guidance(backend):
             "- **Provision your own** — run `infra/azure/apply.sh` (Terraform), "
             "which stands up a hub and writes that config for you.")
     if backend == "local-fs":
-        return ("Confirm `$CCCP_PLUGIN_DATA` is set and writable, then re-run.")
-    return "Run `cccp backend` to see available backends."
+        # The real path, not the variable's name: the whole failure is that this
+        # directory is not writable, and you cannot check a path you can't see.
+        return (f"Confirm `{plugin_data_dir()}` exists and is writable, then "
+                f"re-run. `$CCCP_PLUGIN_DATA` is what points cccp at it.")
+    return f"`{backend}` has no setup guidance; run `cccp backend` to inspect it."
 
 
 def backend_status_block():
@@ -2666,13 +2669,14 @@ def _backend_config(name, assignments):
     path = backend_dir(name) / "config"
     keys = _config_keys(name)
     if not assignments:
+        if not keys:
+            # Say only that, and name no file. A backend with no keys has no config
+            # file, so printing a path - let alone "(not created yet)", which
+            # promises one is coming - would contradict the very next word.
+            print(f"{name} takes no configuration.")
+            return
         print(f"Config file: {path}"
               f"{'' if path.exists() else '   (not created yet)'}")
-        if not keys:
-            print(f"\n{name} takes no configuration - it is ready as soon as "
-                  f"$CCCP_PLUGIN_DATA is writable. Run `cccp backend` to see the "
-                  f"data directory it will use.")
-            return
         print()
         stored = _read_kv_file(path)
         _print_config_table(
