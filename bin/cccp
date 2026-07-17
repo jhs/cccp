@@ -1094,9 +1094,11 @@ def wake_watchtowers(slug):
 # Aliases are human/LLM-friendly names for comrades, kept as a LOCAL projection:
 # the wire and the data model always carry raw user@host:hex ids. A comrade
 # declares its alias in an intro whose body starts with the watchtower's
-# --alias-trigger prefix; every other comrade learns it and translates on the way
-# in (watchtower metadata) and out (dispatch --to). Off entirely unless a trigger
-# is set, so bare `chat` is unchanged; `team` is the layer that turns it on.
+# --alias-trigger prefix; every armed comrade - including the declarer's own
+# watchtower, which reads its own gazette for exactly this - learns it and
+# translates on the way in (watchtower metadata) and out (dispatch --to). Off
+# entirely unless a trigger is set, so bare `chat` is unchanged; `team` is the
+# layer that turns it on.
 
 ALIAS_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")   # a shell-safe alias
 ALIAS_SEED_BYTES = 64 * 1024   # per-gazette cap when seeding the map at startup.
@@ -1133,11 +1135,18 @@ def save_aliases(slug, me, amap):
 
 def parse_alias(body, trigger):
     """If `body` starts with `trigger`, return the first shell-safe token after it,
-    else None. The alias is a single token, so parsing can never over-read."""
+    else None. The alias is a single token, so parsing can never over-read.
+
+    Two mis-parse classes are rejected (the `I`/`omni` garbage of issue #1): a
+    token continuing into '@' or ':' is the start of a comrade id, not a name;
+    and a single-char token is prose ("Intro: I am..."), so names are >= 2 chars."""
     if not trigger or not body.startswith(trigger):
         return None
-    m = ALIAS_TOKEN.match(body[len(trigger):].lstrip())
-    return m.group(0) if m else None
+    rest = body[len(trigger):].lstrip()
+    m = ALIAS_TOKEN.match(rest)
+    if not m or len(m.group(0)) < 2 or rest[m.end():m.end() + 1] in ("@", ":"):
+        return None
+    return m.group(0)
 
 
 def learn_alias(amap, cid, alias):
@@ -1330,9 +1339,10 @@ class Watchtower:
         holds within the seeded window."""
         amap = load_aliases(self.slug, self.me)
         decls = []   # (ts, from_id, alias)
+        # My own gazette is included: my intro lands there and nowhere else, so
+        # skipping self would resurrect a dead predecessor's mapping from backlog
+        # while my own could never be seeded at all (issue #1).
         for comrade in self._scan():
-            if comrade == self.me:
-                continue
             st, data = self.client.get_head(
                 f"{self.head}{comrade}/gazette.jsonl", ALIAS_SEED_BYTES)
             if st not in (200, 206):
@@ -1602,8 +1612,13 @@ class Watchtower:
         alias_dirty = False
 
         for comrade, size in gazettes.items():
-            if comrade == self.me:
-                continue  # don't echo my own dispatches back to me
+            # My own gazette is read for alias learning ONLY - my intro lands
+            # there and nowhere else, so an armed watchtower that skips self can
+            # never register its own alias (issue #1). Unarmed, self is skipped
+            # whole; either way my own dispatches never echo back as events.
+            is_me = comrade == self.me
+            if is_me and not self.trigger:
+                continue
             offset = self.hwm.get(comrade, 0)
             if size <= offset:
                 continue
@@ -1622,6 +1637,8 @@ class Watchtower:
                         if ev:
                             alias_dirty = True
                             messages.append((d.get("ts", now_iso()), ev))
+                if is_me:
+                    continue   # learn-only: no echo, no deadline credit
                 # Any message from this comrade proves they are alive and answering,
                 # so it clears their deadline - even one addressed elsewhere, and
                 # even one _render filtered out.

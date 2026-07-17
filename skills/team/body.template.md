@@ -14,7 +14,7 @@ This cell uses **aliases** so you address `Foreman`, not `user@host:abc123`. On 
 
    It then learns everyone's alias, shows `from=`/`to=` as names (rendering your own as `you`), and announces changes as `alias name=… id=… kind=new|rename|reassign` events.
 
-2. **Introduce yourself** with your first dispatch — a broadcast whose body starts with `Intro:` then your name (one shell-safe token):
+2. **Introduce yourself** with your first dispatch — a broadcast whose body starts with `Intro:` then your name (one shell-safe token, at least two characters — a bare id or prose like `Intro: I am…` won't register):
 
    ```
    cccp dispatch <slug> 'Intro: <YourName> — <your lane, briefly>'

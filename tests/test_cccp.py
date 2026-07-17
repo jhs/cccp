@@ -340,9 +340,19 @@ class Aliases(unittest.TestCase):
     def test_parse_alias(self):
         self.assertEqual(cccp.parse_alias("Alias: Foreman — hi", "Alias:"), "Foreman")
         self.assertEqual(cccp.parse_alias("Alias:   Bob_1 reporting", "Alias:"), "Bob_1")
+        self.assertEqual(cccp.parse_alias("Alias: Foreman", "Alias:"), "Foreman")  # at EOL
         self.assertIsNone(cccp.parse_alias("just a normal message", "Alias:"))
         self.assertIsNone(cccp.parse_alias("Alias: hi", None))       # no trigger -> off
         self.assertIsNone(cccp.parse_alias("Alias: !!!", "Alias:"))  # no token after
+
+    def test_parse_alias_rejects_prose_and_ids(self):
+        # Prose intro: "I" is a pronoun, not a name (issue #1 garbage alias).
+        self.assertIsNone(cccp.parse_alias("Alias: I am the new Foreman", "Alias:"))
+        # Id-first intro: the token is a comrade-id prefix, not a name (issue #1).
+        self.assertIsNone(cccp.parse_alias("Alias: omni@fs:abc123 here", "Alias:"))
+        self.assertIsNone(cccp.parse_alias("Alias: co@fs:abc123 is me", "Alias:"))
+        # Two chars is the floor, not collateral damage.
+        self.assertEqual(cccp.parse_alias("Alias: Bo — hi", "Alias:"), "Bo")
 
     def test_learn_new_rename_reassign(self):
         m = {}
@@ -393,6 +403,124 @@ class Aliases(unittest.TestCase):
         wt = cccp.Watchtower(None, "p", "demo", "me@h:mmm", 0)   # no trigger
         d = {"type": "message", "from": "u@h:bbb", "to": ["*"], "body": "hi"}
         self.assertIs(wt._aliased(d), d)        # empty map -> same object, no work
+
+
+class _FakeBlobClient:
+    """In-memory blob store speaking the watchtower's client interface
+    (list/get_range/get_head). Records every fetched path so a test can assert a
+    gazette was NOT read."""
+
+    def __init__(self):
+        self.blobs = {}     # path -> bytes
+        self.fetched = []   # paths passed to get_range/get_head
+
+    def append(self, path, record):
+        self.blobs[path] = self.blobs.get(path, b"") + \
+            (json.dumps(record) + "\n").encode()
+
+    def list(self, prefix):
+        return {p: {"size": len(b)} for p, b in self.blobs.items()
+                if p.startswith(prefix)}
+
+    def get_range(self, path, offset):
+        self.fetched.append(path)
+        b = self.blobs.get(path)
+        return (404, b"") if b is None else (206, b[offset:])
+
+    def get_head(self, path, nbytes):
+        self.fetched.append(path)
+        b = self.blobs.get(path)
+        return (404, b"") if b is None else (206, b[:nbytes])
+
+
+class SelfAliasLearning(unittest.TestCase):
+    """Issue #1: an armed watchtower must learn its OWN comrade's intro - the
+    declaring comrade appends to its own gazette, so skipping self entirely made
+    self-aliases structurally unregistrable (and stale predecessors immortal).
+    Own dispatches must still never echo back as events."""
+
+    ME = "co@fs:d1f4b6"
+    DEAD = "co@fs:5e84d0"
+    OTHER = "bb@fs:b1b1b1"
+    SLUG = "demo"
+
+    def setUp(self):
+        self.data = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.data, True))
+        self.env = _isolated_env(self.data)
+        self.env.__enter__()
+        self.addCleanup(lambda: self.env.__exit__(None, None, None))
+        self.client = _FakeBlobClient()
+
+    def _gazette(self, comrade):
+        return f"{cccp.cell_head('', self.SLUG)}{comrade}/gazette.jsonl"
+
+    def _intro(self, frm, alias, ts):
+        return {"type": "message", "from": frm, "ts": ts, "to": ["*"],
+                "body": f"Alias: {alias} — reporting"}
+
+    def _watchtower(self, trigger="Alias:"):
+        wt = cccp.Watchtower(self.client, "", self.SLUG, self.ME, 0,
+                             trigger=trigger)
+        wt.emitted = []
+        wt._emit = wt.emitted.append
+        return wt
+
+    def test_poll_learns_own_intro(self):
+        wt = self._watchtower()
+        wt.initial_scan()
+        self.client.append(self._gazette(self.ME),
+                           self._intro(self.ME, "Foreman",
+                                       "2026-07-17T15:35:00.000000Z"))
+        wt._poll_once()
+        self.assertEqual(wt.aliases.get(self.ME), "Foreman")
+        self.assertTrue(any(l.startswith("alias name=Foreman") for l in wt.emitted))
+        # The intro itself must not echo back as a message event.
+        self.assertFalse(any(l.startswith("message") for l in wt.emitted))
+
+    def test_poll_own_intro_evicts_dead_predecessor(self):
+        cccp.save_aliases(self.SLUG, self.ME, {self.DEAD: "Foreman"})
+        wt = self._watchtower()
+        wt.initial_scan()
+        self.client.append(self._gazette(self.ME),
+                           self._intro(self.ME, "Foreman",
+                                       "2026-07-17T15:35:00.000000Z"))
+        wt._poll_once()
+        self.assertEqual(wt.aliases, {self.ME: "Foreman"})
+
+    def test_seed_learns_own_intro(self):
+        # A restarted armed watchtower re-learns its own alias from backlog
+        # instead of only resurrecting the dead predecessor's.
+        self.client.append(self._gazette(self.DEAD),
+                           self._intro(self.DEAD, "Foreman",
+                                       "2026-07-13T00:00:00.000000Z"))
+        self.client.append(self._gazette(self.ME),
+                           self._intro(self.ME, "Foreman",
+                                       "2026-07-17T15:35:00.000000Z"))
+        wt = self._watchtower()
+        wt.seed_aliases()
+        self.assertEqual(wt.aliases, {self.ME: "Foreman"})
+
+    def test_poll_skips_own_gazette_when_unarmed(self):
+        wt = self._watchtower(trigger=None)
+        wt.initial_scan()
+        self.client.append(self._gazette(self.ME),
+                           self._intro(self.ME, "Foreman",
+                                       "2026-07-17T15:35:00.000000Z"))
+        wt._poll_once()
+        self.assertNotIn(self._gazette(self.ME), self.client.fetched)
+        self.assertEqual(wt.emitted, [])
+
+    def test_poll_still_learns_inbound_intros(self):
+        wt = self._watchtower()
+        wt.initial_scan()
+        self.client.append(self._gazette(self.OTHER),
+                           self._intro(self.OTHER, "Buddy",
+                                       "2026-07-17T15:36:00.000000Z"))
+        wt._poll_once()
+        self.assertEqual(wt.aliases.get(self.OTHER), "Buddy")
+        # Inbound broadcasts DO render as message events.
+        self.assertTrue(any(l.startswith("message") for l in wt.emitted))
 
 
 class DispatchBody(unittest.TestCase):
