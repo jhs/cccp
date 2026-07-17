@@ -52,7 +52,6 @@ import signal
 import socket
 import subprocess
 import sys
-import textwrap
 import threading
 import time
 import traceback
@@ -272,33 +271,26 @@ def _parse_cccp_env(path):
 
 DEFAULT_BACKEND = "local-fs"
 
-# Backend registry: the summary/description `cccp backend` shows, the required
-# param names, which of those are secret, and the prefix default. Every backend is
-# addressed by CCCP_<BACKEND>_<KEY> keys (name upcased, '-'->'_'), so params never
-# collide - across the tree's config files or across environment variables. A
-# backend name must not collide with a global key stem (ACTIVE_BACKEND, DEBUG).
-# `secrets` names the params `cccp backend` must never print (see _fmt_param).
-# See docs/backend.md.
+# Backend registry: the one-line summary the @@BACKEND@@ skill header shows, the
+# required param names, which of those are secret, and the prefix default. Every
+# backend is addressed by CCCP_<BACKEND>_<KEY> keys (name upcased, '-'->'_'), so
+# params never collide - across the tree's config files or across environment
+# variables. A backend name must not collide with a global key stem
+# (ACTIVE_BACKEND, DEBUG). `secrets` names the params `cccp backend` must never
+# print (see _fmt_param).
+#
+# Prose about what a backend IS lives in skills/setup/SKILL.md, not here: the CLI
+# states facts and config, and the setup skill - which no chat session ever loads -
+# is where a reader has room for the explanation. See docs/backend.md.
 BACKENDS = {
     "local-fs": {
         "summary": "Same host + same OS user only; zero setup",
-        "description": (
-            "Shared files under the plugin data dir. Zero setup, works "
-            "immediately, but only connects comrades on the same host and same "
-            "OS user (terminal tabs, IDE windows, git worktrees, background "
-            "agents). Cannot reach other users or machines."),
         "params": (),
         "secrets": (),
         "prefix_default": "",
     },
     "azure-blob": {
         "summary": "Any host, user, or network; needs Azure + SAS",
-        "description": (
-            "Centralized cloud storage (Azure Blob) reachable from any host, "
-            "user, or network. Low cost (pennies/GB-month), not free; needs an "
-            "Azure subscription. Auth is a container-scoped SAS token shared "
-            "with each comrade. Point cccp at an existing hub via config, or "
-            "provision one with infra/azure/apply.sh."),
         "params": ("ACCOUNT", "CONTAINER", "SAS"),
         "secrets": ("SAS",),
         "prefix_default": DEFAULT_PREFIX,
@@ -2590,10 +2582,10 @@ def _backend_status(cfg, ok, detail):
     """The `cccp backend` status block: what is active, whether it works, what it is,
     and every resolved param with its provenance."""
     active = cfg["BACKEND"]
+    # On success `detail` is just "ready"/"configured", which [READY - ready] would
+    # only stutter back. It carries real information solely when it is a reason.
     print(f"Active backend: {active}  "
-          f"[{'OK - ' if ok else 'NOT READY - '}{detail}]")
-    print(textwrap.fill(BACKENDS[active]["description"], width=76,
-                        initial_indent="  ", subsequent_indent="  "))
+          f"[{'READY' if ok else 'NOT READY - ' + detail}]")
     keys = _config_keys(active)
     if keys:
         print()
@@ -2676,13 +2668,17 @@ def cmd_backend(args):
     active = cfg["BACKEND"]
     ok, detail = validate_backend(cfg, network=True)
     _backend_status(cfg, ok, detail)
+    # Which backends exist is a fact, so it stays; what each one IS belongs to the
+    # setup skill. This list has to survive here even so: @@BACKEND@@ sends a
+    # chat-family session to `cccp backend`, and that session never loads the setup
+    # skill, so the CLI is the only place it can learn the names.
     print()
-    for name, spec in BACKENDS.items():
-        mark = "->" if name == active else "  "
-        print(f" {mark} {name:<11} {spec['summary']}")
+    for name in BACKENDS:
+        print(f" {'->' if name == active else '  '} {name}")
     print()
-    print("Switch: cccp backend use <name>      Configure: cccp backend config <name>")
-    print("Test:   cccp backend check [<name>]  Details:   docs/backend.md")
+    print("To test:      cccp backend check [<name>]")
+    print("To configure: cccp backend config <name>")
+    print("To switch:    cccp backend use <name>")
 
 
 def build_parser():

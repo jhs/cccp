@@ -125,7 +125,7 @@ adds no capability of its own — it only drives these:
 
 | Verb | Does |
 |---|---|
-| `cccp backend` | Active selection + health + description + resolved params (secrets redacted) with the config layer that won each, then the backend list. Setup guidance too, when the active one is not ready. |
+| `cccp backend` | Active selection + health + resolved params (secrets redacted) with the config layer that won each, then the backend names. Setup guidance too, when the active one is not ready. |
 | `cccp backend use <name>` | Validates, then writes `settings`. Refuses on failure. |
 | `cccp backend check [<name>]` | Validates **any** backend over the network without switching to it. Exits non-zero when not ready. |
 | `cccp backend config <name> [KEY=VALUE ...]` | Shows or writes `backend/<name>/config`. |
