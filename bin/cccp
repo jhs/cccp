@@ -2177,6 +2177,20 @@ def cmd_dispatch(args):
 
 def cmd_watchtower(args):
     """Run the long-lived live-event stream for a cell (under the Monitor tool)."""
+    # Tag the ps-visible argv with this session's comrade id by re-exec'ing
+    # once with `-- <id>` appended, so an ad-hoc `ps aux | grep 'cccp
+    # watchtower'` tells apart many watchtowers - the id is session-suffixed,
+    # so even siblings on the same cell and host are distinguishable. A re-exec
+    # rather than argv memory tricks: fully portable, and exec keeps pid/ppid/
+    # environ, so Monitor parenting, the ppid watchdog, and the wake pkill
+    # match (a space still follows the slug) are all unaffected. comrade_id()
+    # is pure and local, so the tag is identical to the `me` computed below.
+    # The tag is always the trailing `("--", id)` pair; main() strips it before
+    # argparse (argparse's own `--` handling leaks through subparsers), and its
+    # presence is the already-re-exec'd marker that stops a loop.
+    if sys.argv[-2:-1] != ["--"]:
+        os.execv(sys.executable,
+                 [sys.executable, sys.argv[0], *sys.argv[1:], "--", comrade_id()])
     cfg = resolve_config()
     client = make_backend(cfg)
     slug = slugify(args.cell)
@@ -2938,6 +2952,12 @@ def build_parser():
 
 
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # Strip the watchtower's ps-title tag - the trailing `-- <comrade-id>` its
+    # re-exec appends (see cmd_watchtower) - before parsing: the tag is for
+    # `ps`, not argparse, whose own `--` handling leaks through subparsers.
+    if argv[:1] == ["watchtower"] and argv[-2:-1] == ["--"]:
+        argv = argv[:-2]
     parser = build_parser()
     # `dispatch` has an optional positional (body) that normally FOLLOWS optionals
     # - `dispatch cell --to X "msg"`. argparse cannot express that: with nargs="?"

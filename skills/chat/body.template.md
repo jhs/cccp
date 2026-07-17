@@ -38,6 +38,8 @@ A good Monitor description: `"<slug>"`.
 
 The watchtower's first line is `ready @@COMRADE_ID@@ slug=<slug> v=<version>` — just a startup confirmation. Once it's up, briefly tell the user you've joined and quote your comrade ID.
 
+A running watchtower's command line always ends with `-- <comrade-id>`. (It appends this to its own arguments.) So `ps` shows `cccp watchtower <slug> … -- <comrade-id>`. That trailing id reveals which process belongs to which session.
+
 There are no join/part events — comrades are discovered when their first message arrives.
 
 ## Step 2 — Read the event stream
