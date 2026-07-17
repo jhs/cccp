@@ -2570,35 +2570,47 @@ def _fmt_param(backend, key, value):
     return value
 
 
+def _print_row(key, shown, layers, raw=None):
+    """One line of the resolved-config table: the key, its (already redacted) value,
+    and the config layer that won it. A key set in more than one layer is flagged,
+    because a stale env var shadowing a config file is the failure that wastes an
+    afternoon."""
+    # No layer set it: either a default filled it in (PREFIX) or nothing did. Saying
+    # "default" for a missing required param would imply a default exists to fall
+    # back on, and none does.
+    origin = layers[-1] if layers else ("default" if raw else "unset")
+    note = f"   <- shadows {', '.join(layers[:-1])}" if len(layers) > 1 else ""
+    print(f"  {key:<28} {shown:<20} ({origin}){note}")
+
+
 def _print_params(backend, values, sources):
-    """The resolved param table: each key, its (redacted) value, and the config layer
-    that won it. `values` maps a bare param name to its resolved value; `sources` is
-    resolve_config's SOURCES. A key set in more than one layer is flagged, because a
-    stale env var shadowing a config file is the failure that wastes an afternoon."""
+    """The resolved param table for one backend. `values` maps a bare param name to
+    its resolved value; `sources` is resolve_config's SOURCES."""
     for key in _config_keys(backend):
         qualified = _backend_key(backend, key)
-        layers = sources.get(qualified, [])
         raw = values.get(key)
-        # No layer set it: either the registry's own default filled it in (PREFIX)
-        # or nothing did. Saying "default" for a missing required param would imply
-        # a default exists to fall back on, and none does.
-        origin = layers[-1] if layers else ("default" if raw else "unset")
-        note = f"   <- shadows {', '.join(layers[:-1])}" if len(layers) > 1 else ""
-        print(f"  {qualified:<28} {_fmt_param(backend, key, raw):<20} "
-              f"({origin}){note}")
+        _print_row(qualified, _fmt_param(backend, key, raw),
+                   sources.get(qualified, []), raw=raw)
 
 
 def _backend_status(cfg, ok, detail):
-    """The `cccp backend` status block: what is active, whether it works, what it is,
-    and every resolved param with its provenance."""
+    """The `cccp backend` status block: what is active, whether it works, and every
+    resolved config value with its provenance."""
     active = cfg["BACKEND"]
     # On success `detail` is just "ready"/"configured", which [READY - ready] would
     # only stutter back. It carries real information solely when it is a reason.
     print(f"Active backend: {active}  "
           f"[{'READY' if ok else 'NOT READY - ' + detail}]")
+    print()
+    # CCCP_PLUGIN_DATA leads the table: it is a config key like any other, just
+    # global rather than backend-scoped. Its layer is always `env` - every file in
+    # the merge lives inside it, so nothing below the environment could name it.
+    # It also earns the row twice over: it IS the whole of local-fs's config (which
+    # otherwise has no params and so printed no table at all, leaving the default
+    # backend showing nothing), and it is the value most likely to surprise.
+    _print_row("CCCP_PLUGIN_DATA", str(plugin_data_dir()), ["env"])
     keys = _config_keys(active)
     if keys:
-        print()
         values = {k: cfg["PARAMS"].get(k.lower()) for k in keys}
         values["PREFIX"] = cfg["PREFIX"]
         _print_params(active, values, cfg["SOURCES"])

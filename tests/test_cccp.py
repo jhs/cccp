@@ -611,6 +611,48 @@ class ConfigProvenance(unittest.TestCase):
         self.assertNotIn("CCCP_AZURE_BLOB_ACCOUNT", cfg["SOURCES"])
 
 
+class BackendStatusTable(unittest.TestCase):
+    """`cccp backend` must print a provenance table on EVERY backend - the setup
+    skill tells Claude to read that column before believing anything. local-fs has no
+    params, so it once printed no table at all: the default backend, showing nothing,
+    against a skill promising a column."""
+
+    def setUp(self):
+        self.data = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.data, True))
+
+    def _status(self, **env):
+        with _isolated_env(self.data, **env):
+            cfg = cccp.resolve_config()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                cccp._backend_status(cfg, True, "ready")
+            return buf.getvalue()
+
+    def test_local_fs_still_gets_a_provenance_row(self):
+        out = self._status()
+        self.assertIn("CCCP_PLUGIN_DATA", out)
+        self.assertIn(self.data, out)          # the actual data root, not a guess
+        self.assertIn("(env)", out)            # ...with its layer, like any key
+
+    def test_data_dir_row_leads_every_backend(self):
+        out = self._status(CCCP_ACTIVE_BACKEND="azure-blob",
+                           CCCP_AZURE_BLOB_ACCOUNT="a",
+                           CCCP_AZURE_BLOB_CONTAINER="c",
+                           CCCP_AZURE_BLOB_SAS="s")
+        rows = [l for l in out.splitlines() if l.startswith("  CCCP_")]
+        self.assertTrue(rows[0].startswith("  CCCP_PLUGIN_DATA"), rows)
+        self.assertIn("CCCP_AZURE_BLOB_ACCOUNT", out)
+
+    def test_secret_stays_redacted_in_the_table(self):
+        out = self._status(CCCP_ACTIVE_BACKEND="azure-blob",
+                           CCCP_AZURE_BLOB_ACCOUNT="a",
+                           CCCP_AZURE_BLOB_CONTAINER="c",
+                           CCCP_AZURE_BLOB_SAS="sig-do-not-print")
+        self.assertNotIn("sig-do-not-print", out)
+        self.assertIn("<set, 16 chars>", out)
+
+
 class BackendConfigWrite(unittest.TestCase):
     """_write_kv is the one writer behind both `settings` and backend/<name>/config:
     it preserves unrelated lines and comments, removes on None, and keeps the file

@@ -42,9 +42,9 @@ join, and joining is where you should start.
 
 ## 1. Look before you touch
 
-Run this first, always. It prints the active backend, its health, every resolved
-param (secrets redacted), and — critically — the config layer each value came
-from:
+Run this first, always. It prints the active backend, its health, and every
+resolved config value (secrets redacted) tagged with — critically — the layer it
+came from:
 
 ```bash
 cccp backend
@@ -55,6 +55,12 @@ Read the provenance column before believing anything. Config merges
 var silently wins over the file. A value tagged `(env) <- shadows config` is
 almost always the bug: the file is right and a stale env var is overriding it.
 Fix the environment, not the file.
+
+`CCCP_PLUGIN_DATA` heads the table on every backend — it is where all cell data
+and config actually live, and it is always `(env)`, since every config file sits
+inside it. On `local-fs` it is the *only* row: that backend takes no parameters,
+so the data directory is the whole of its configuration. A one-row table there is
+correct, not a fault.
 
 If `cccp` exits with an error instead of a report, read the error rather than
 working around it — it carries its own fix. `CCCP_PLUGIN_DATA is not set` means
