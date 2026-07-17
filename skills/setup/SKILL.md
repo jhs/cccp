@@ -28,8 +28,8 @@ one the user is actually asking for:
 - **Joining** a cell means acquiring some values and putting them in config.
   Cheap, no infrastructure, nothing to operate. You can do this for the user.
 - **Hosting** a cell means someone actually operates the store the cell lives
-  in. That is infrastructure: it costs money, it is the user's to own, and it
-  is not something to do on their behalf without asking.
+  in. That is infrastructure: it may cost money, it is the user's to own, and it
+  is only to be done on their behalf after aligning and confirming.
 
 A user who says "set up cccp on azure" may mean either. **Ask which**, unless
 it is obvious. Most people who want to talk to an existing cell only need to
@@ -37,33 +37,28 @@ join, and joining is where you should start.
 
 | Backend | Description | Requirements to Join a Cell | Requirements to Host a Cell |
 |---|---|---|---|
-| `local-fs` | Files under the plugin data dir. The zero-setup default; always works, but reaches only the same host **and** same OS user — terminal tabs, IDE windows, git worktrees, background agents. Cannot reach another user or machine. | None. | None — hosting *is* using it. |
-| `azure-blob` | Centralized cloud storage (Azure Blob), reachable from any host, user, or network. Low cost (pennies/GB-month), not free. Auth is a container-scoped SAS token shared with each comrade. | An Azure storage account name, a container name, and a SAS token — set with `cccp backend config azure-blob`. Nothing to deploy. | Operate an Azure Blob container: either run the included Terraform reference (`infra/azure/apply.sh`), or provision one yourself (portal, CLI, existing infra) and hand over the three values above. Needs an Azure subscription and spends the user's money. |
+| `local-fs` | Files under the plugin data dir. The zero-setup default; always works, but reaches only the same host **and** same OS user — terminal tabs, IDE windows, git worktrees, background agents. Cannot reach another user or machine. | None | None — no hosting |
+| `azure-blob` | Centralized cloud storage (Azure Blob), reachable from any host, user, or network. Low cost. Auth is a shared container-scoped SAS token. | An Azure storage account name, a container name, and a SAS token — set with `cccp backend config azure-blob`. | Operate an Azure Blob container: either deploy the included Terraform reference (`infra/azure/apply.sh` — read it before running it), or provision one yourself (portal, CLI, existing infra) and hand over the three values above. Needs an Azure subscription and may spend the user's money. |
 
-## 1. Look before you touch
-
-Each verb answers exactly one question. Reach for the one you actually need:
+## How to See Backend Settings
 
 | Question | Command | Notes |
 |---|---|---|
 | Which backend am I on? | `cccp backend` | Prints the bare name. No network. |
 | What is its config? | `cccp backend config [<name>]` | Resolved values + where each came from. Defaults to the active backend. |
 | Does it work? | `cccp backend check [<name>]` | Hits the network. Prints setup guidance on failure. |
-| Switch to another | `cccp backend use <name>` | Validates first; refuses if not ready. |
 
 Start with `cccp backend config` — it answers "what am I actually using" in one
-shot:
+shot.
 
-```bash
-cccp backend config
-```
-
-Read the **`Set by`** column before believing anything — it names the config
+The **`Set by`** column in `cccp backend config` output names the config
 layer each value actually came from. Config merges `settings` <
-`backend/<name>/config` < **process env**, so an exported `CCCP_*` var silently
-wins over the file. A row reading `env   <- shadows config` is almost always the
-bug: the file is right and a stale env var is overriding it. Fix the
-environment, not the file.
+`backend/<name>/config` < **process env**. A row reading `env <- shadows config` means
+the environment variable is overriding a config file value.
+
+`CCCP_PLUGIN_DATA` heads the table on every backend — it is where all cell data
+and config actually live, and it is always `env`, since every config file sits
+inside it.
 
 `cccp backend config <name>` works for a backend you are **not** on, and its
 values look identical to the active one's — so check the `[active]` /
@@ -71,31 +66,14 @@ values look identical to the active one's — so check the `[active]` /
 while `local-fs` is active is a real thing to do (it is the whole setup flow),
 but so is doing it by accident and wondering why nothing changed.
 
-`CCCP_PLUGIN_DATA` heads the table on every backend — it is where all cell data
-and config actually live, and it is always `env`, since every config file sits
-inside it. On `local-fs` it is the *only* row: that backend has no parameters of
-its own, so the data directory is the whole of its configuration. A one-row table
-there is correct, not a fault.
-
-None of these list the available backends — that roster is the table at the top
+The roster of available backends is the table at the top
 of this skill. Don't ask the CLI for it.
 
-If `cccp` exits with an error instead of a report, read the error rather than
-working around it — it carries its own fix. `CCCP_PLUGIN_DATA is not set` means
-the plugin's SessionStart hook did not run; cccp refuses to guess a data
-directory, because the wrong one silently splits the user's cells and config
-from the ones the plugin actually uses.
+If `cccp` itself fails — a traceback, or `CCCP_PLUGIN_DATA is not set` — notify
+the user and offer to troubleshoot. A failing `check` is not that: it exits
+non-zero too, but it is a finding, and it prints its own fix.
 
-## 2. Explain and confirm
-
-Answer the user's question from what those commands printed. If they're already
-on a healthy backend that meets their needs, say so and stop — the most common
-correct outcome here is "you're fine, nothing to do".
-
-Reach for `azure-blob` only when the user actually needs to cross a machine,
-user, or network boundary.
-
-## 3. Configure a backend
+## How to Configure a Backend
 
 `cccp backend config <name> KEY=VALUE ...` writes config; the same command with
 no assignments reads it back. Keys take either spelling (`SAS` or
@@ -108,8 +86,8 @@ cccp backend config azure-blob ACCOUNT=hub CONTAINER=cells
 
 Writes always land in that backend's config file, but reads show the **resolved**
 merge — so a value you just wrote can come back tagged `env`, meaning the
-environment is overriding what you wrote. That is the `Set by` column earning its
-place: the write succeeded and is still being ignored.
+environment is overriding what you wrote, revealed by the `Set by` column:
+the write succeeded and is still being ignored.
 
 **Never put a secret in a command line.** A SAS in `argv` lands in shell history
 and in this transcript. Read it from stdin with `-` instead, and let the user
@@ -122,7 +100,7 @@ read -rs SAS && printf '%s' "$SAS" | cccp backend config azure-blob SAS=-
 Never echo a SAS back to the user, and never `cat` the config file — `cccp
 backend config` redacts secrets precisely so you don't have to.
 
-## 4. Test it, then switch
+## How to Test and Change Backends
 
 `check` validates any backend over the network **without** switching to it; `use`
 validates and only then persists. Neither will ever leave the user pointed at a
@@ -133,12 +111,9 @@ cccp backend check azure-blob    # test without committing
 cccp backend use azure-blob      # switch (refuses if not ready)
 ```
 
-When a check fails, `cccp backend check` prints backend-specific setup
-guidance — follow that rather than guessing. Provisioning
-a new Azure hub is the **host** path from the table above: `infra/azure/apply.sh`
-(Terraform), which deploys real infrastructure and spends the user's money. Ask
-first, always. If you need to go deeper than these verbs, read `bin/cccp` — it is
-a single stdlib-only file, and it is the only authority on how backends resolve.
+When a check fails, `cccp backend check` prints backend-specific setup guidance;
+follow it rather than guessing. To go deeper than these verbs, read `bin/cccp` —
+one stdlib-only file, and the only authority on how backends resolve.
 
 ## Your instructions
 

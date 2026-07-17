@@ -800,6 +800,24 @@ class BackendConfigKeys(unittest.TestCase):
         self.assertNotIn("not created yet", out)
         self.assertIn("CCCP_PLUGIN_DATA", out)
 
+    def test_guidance_names_the_command_to_run(self):
+        # This is the one place a stuck reader looks, so "set them using the cccp
+        # command" is a dead end - it must name the command, and the command must
+        # be one that exists.
+        with tempfile.TemporaryDirectory() as d, _isolated_env(d):
+            guidance = cccp._backend_setup_guidance("azure-blob")
+        self.assertIn("cccp backend config azure-blob", guidance)
+        self.assertNotIn("  ", guidance)      # no double space from concatenation
+
+    def test_guidance_flags_the_cost_of_provisioning(self):
+        # This text renders into @@BACKEND@@ for every chat session - a reader that
+        # never loads the setup skill and so never sees its join-vs-host framing.
+        # "run apply.sh" must not reach them without the caveat attached.
+        with tempfile.TemporaryDirectory() as d, _isolated_env(d):
+            guidance = cccp._backend_setup_guidance("azure-blob")
+        self.assertIn("apply.sh", guidance)
+        self.assertIn("confirm with the user first", guidance)
+
     def test_user_facing_text_never_prints_a_literal_env_var_name(self):
         # `$CCCP_PLUGIN_DATA is writable` is unactionable: you cannot check a path
         # you cannot see. Guidance must resolve it.

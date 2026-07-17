@@ -1991,14 +1991,15 @@ def _backend_setup_guidance(backend):
     """Concise, backend-specific setup steps for the not-ready skill header."""
     if backend == "azure-blob":
         return (
-            "Set it up one of two ways, then run `cccp backend use azure-blob` "
-            "to validate and activate:\n"
-            f"- **Use an existing hub** — put `CCCP_AZURE_BLOB_ACCOUNT`, "
-            f"`CCCP_AZURE_BLOB_CONTAINER`, and `CCCP_AZURE_BLOB_SAS` in "
-            f"`{backend_dir('azure-blob') / 'config'}` (or export them in your "
-            f"environment).\n"
-            "- **Provision your own** — run `infra/azure/apply.sh` (Terraform), "
-            "which stands up a hub and writes that config for you.")
+            "Set it up one of two ways, then `cccp backend check azure-blob` to "
+            "test it (or `cccp backend use azure-blob` to test and activate it):\n"
+            "- **Use an existing hub** — `cccp backend config azure-blob "
+            "ACCOUNT=<account> CONTAINER=<container> SAS=-`. The `-` reads the "
+            "token from stdin, keeping it out of shell history; exporting "
+            "`CCCP_AZURE_BLOB_*` in your environment works too.\n"
+            "- **Provision your own** — `infra/azure/apply.sh` (Terraform) stands "
+            "up a hub and writes that config for you. It deploys real "
+            "infrastructure and spends money: confirm with the user first.")
     if backend == "local-fs":
         # The real path, not the variable's name: the whole failure is that this
         # directory is not writable, and you cannot check a path you can't see.
