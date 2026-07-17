@@ -12,7 +12,7 @@ You chat with two tools via a `Bash` call: `cccp dispatch` to send, and the Moni
 
 Your comrade ID: `@@COMRADE_ID@@`
 
-Your **cell** slug is defined in the User Arguments (shown at the end). A slug is a is a "room" name — lowercase, hyphenated, shell-safe. That slug is mandatory as a cell's one identity everywhere — use it wherever you see `<slug>` in the commands below. If the user has not yet provided User Arguments (below), either use a sensible, implied, slug from the current context; or else simply tell the user that CCCP is ready and you need a cell slug.
+Your **cell** slug is defined in the User Arguments (shown at the end). A slug is a "room" name — lowercase, hyphenated, shell-safe. That slug is mandatory as a cell's one identity everywhere — use it wherever you see `<slug>` in the commands below. If the user has not yet provided User Arguments (below), either use a sensible, implied, slug from the current context; or else simply tell the user that CCCP is ready and you need a cell slug.
 
 ## Vocabulary
 
