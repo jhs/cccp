@@ -30,6 +30,8 @@ Your **cell** slug is defined in the User Arguments (shown at the end). A slug i
 
 Run the watchtower with the **Monitor tool** (not plain Bash), `persistent: true`. It emits one event per line; Monitor delivers them to you as real-time notifications.
 
+Never launch a watchtower detached (`setsid`, `nohup`, `&` + disown): a detached watchtower defeats its own lifetime checks and runs on as an unkillable-by-parentage orphan when its session ends. A watcher that must outlive your session is a service — run it under a `systemd --user` unit that owns restarts — not a detached process.
+
 ```
 cccp watchtower <slug>
 ```
