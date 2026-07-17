@@ -25,9 +25,9 @@ reference the implementation checks against.
 
 ## Plugin data directory
 
-One namespace, `$CCCP_PLUGIN_DATA` (`~/.claude/plugins/data/cccp-CCCP` — version-
-stable, survives plugin upgrades), split by **role** the way XDG / `/var` split
-data from cache. The load-bearing line is `backend/` vs. everything else:
+One namespace, `$CCCP_PLUGIN_DATA` (`~/.claude/plugins/data/cccp-<marketplace>` —
+version-stable, survives plugin upgrades), split by **role** the way XDG / `/var`
+split data from cache. The load-bearing line is `backend/` vs. everything else:
 
 ```
 $CCCP_PLUGIN_DATA/
@@ -53,6 +53,17 @@ $CCCP_PLUGIN_DATA/
 
 Pidfiles/locks that coordinate one backend's tools live in `backend/<name>/`.
 A cross-tool `run/` dir is deferred — no pressure for it yet.
+
+**`$CCCP_PLUGIN_DATA` has no default, and must not grow one.** Claude Code
+exports it from the SessionStart hook, so it is always set in a session. When it
+is unset, `cccp` exits with the fix rather than falling back to a guessed root —
+`backend/local-fs/` *is* the authoritative cell store, so a wrong root sends
+messages to a store nobody reads and writes config where the plugin will never
+look, silently and looking exactly like success. That is the same failure
+["never silently downgrade"](#selection--validation) forbids, one level down.
+There is also no right value to guess: the directory name carries the marketplace
+the plugin was installed from. `bin/claude-tokens` has always behaved this way;
+`bin/cccp` used to fall back to `$XDG_STATE_HOME/cccp` and no longer does.
 
 ## Config model
 
@@ -194,11 +205,10 @@ continues to grow underneath it.
 
 No data migration anywhere — everything relocated is a cache or re-derivable.
 
-- **`~/.cccp` retired.** `LOCAL_MIRROR` → `$CCCP_PLUGIN_DATA/mirror` (fallback
-  `$XDG_STATE_HOME/cccp` for non-Claude callers where the env var is unset). The
-  mirror is a cache; `mv ~/.cccp <backup>` and forget it. The only non-
-  reconstructible item there is `aliases.json` — losing it just resets aliases
-  to auto-generated.
+- **`~/.cccp` retired.** `LOCAL_MIRROR` → `$CCCP_PLUGIN_DATA/mirror`. The mirror
+  is a cache; `mv ~/.cccp <backup>` and forget it. The only non-reconstructible
+  item there is `aliases.json` — losing it just resets aliases to
+  auto-generated.
 - **`~/.config/cccp/*` retired.** Azure config → `backend/azure-blob/config`.
 - **statusline files** → `telemetry/claude-code/`; `claude-auth-status.json` →
   `auth-status.json` (the `claude-` prefix is redundant under the folder).

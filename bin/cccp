@@ -195,16 +195,39 @@ def current_session_id():
 #   telemetry/            cache: harvested session data (token-aware)
 #   run/                  ephemeral inter-process runtime state (the /var/run of
 #                         the tree): watchtower inboxes today, pidfiles later
-# Claude Code exports CCCP_PLUGIN_DATA (SessionStart hook). Non-Claude callers
-# (manual runs, tests) fall back to $XDG_STATE_HOME/cccp so `cccp` still works -
-# and nothing ever writes to the old ~/.cccp again.
+# Claude Code exports CCCP_PLUGIN_DATA (the SessionStart hook in hooks/), so it is
+# always set inside a session. When it is missing, cccp stops rather than guessing.
 
 def plugin_data_dir():
+    """The root every path in this tree hangs off. There is deliberately NO default.
+
+    Guessing a root is not a convenience here, it is data loss with a friendly
+    face: backend/local-fs/ IS the authoritative cell store, so a wrong root sends
+    messages to a store nobody reads and writes config where the plugin will never
+    look - silently, and looking exactly like success. It is the same failure the
+    backend rules already forbid ('never silently downgrade'), one level down.
+
+    Nor is there a right value to guess: the data dir's name carries the
+    marketplace the plugin was installed from (cccp-<marketplace>), which this
+    script cannot know. So an unset var is a hard error carrying the fix, matching
+    what bin/claude-tokens already does."""
     d = os.environ.get("CCCP_PLUGIN_DATA")
-    if d:
-        return Path(d)
-    xdg = os.environ.get("XDG_STATE_HOME")
-    return (Path(xdg) if xdg else Path.home() / ".local" / "state") / "cccp"
+    if not d:
+        sys.exit(
+            "error: CCCP_PLUGIN_DATA is not set, so cccp has no data directory.\n"
+            "\n"
+            "Inside a Claude Code session the cccp plugin's SessionStart hook "
+            "exports it. If you are seeing this there, the plugin is not enabled "
+            "- check `/plugin`.\n"
+            "\n"
+            "Running cccp by hand outside a session? Point it at the plugin's "
+            "data dir first (the suffix is the marketplace it came from):\n"
+            "    ls -d ~/.claude/plugins/data/cccp-*        # find yours\n"
+            "    export CCCP_PLUGIN_DATA=~/.claude/plugins/data/cccp-<marketplace>\n"
+            "\n"
+            "cccp will not guess a default: the wrong root silently splits your "
+            "cells and config from the ones the plugin actually uses.")
+    return Path(d)
 
 
 def mirror_dir():
@@ -1991,7 +2014,13 @@ def backend_status_block():
         cfg = resolve_config()
         backend = cfg["BACKEND"]
         ok, detail = validate_backend(cfg)   # cheap, no network
-    except (SystemExit, Exception):
+    except SystemExit as e:
+        # A hard config error (an unset CCCP_PLUGIN_DATA, an unknown backend name)
+        # already exits carrying the fix. Pass that text through verbatim rather
+        # than flattening it to a generic line: this block is the only place the
+        # reader will ever see it, since the skill body replaces the failure.
+        return f"**NOT READY.** Chat will not work until this is fixed.\n\n{e}"
+    except Exception:
         return ("Your CCCP config could not be resolved. Run `cccp backend` to "
                 "inspect it, then fix it or escalate to the user.")
     summary = BACKENDS.get(backend, {}).get("summary", "")

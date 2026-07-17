@@ -511,6 +511,66 @@ class MakeBackend(unittest.TestCase):
             cccp.make_backend({"BACKEND": "azure-blob", "PARAMS": {}})
 
 
+class PluginDataDir(unittest.TestCase):
+    """$CCCP_PLUGIN_DATA has no default and must never grow one. backend/local-fs/ IS
+    the authoritative cell store, so a guessed root silently sends messages to a
+    store nobody reads - failure wearing success's face. The name also encodes the
+    marketplace the plugin came from, so there is nothing correct to guess."""
+
+    @contextlib.contextmanager
+    def _no_plugin_data(self, **extra):
+        saved = {k: v for k, v in os.environ.items()
+                 if k.startswith("CCCP_") or k == "XDG_STATE_HOME"}
+        for k in list(os.environ):
+            if k.startswith("CCCP_") or k == "XDG_STATE_HOME":
+                del os.environ[k]
+        os.environ.update(extra)
+        try:
+            yield
+        finally:
+            for k in list(os.environ):
+                if k.startswith("CCCP_") or k == "XDG_STATE_HOME":
+                    del os.environ[k]
+            os.environ.update(saved)
+
+    def test_unset_exits_rather_than_guessing(self):
+        with self._no_plugin_data():
+            with self.assertRaises(SystemExit) as cm:
+                cccp.plugin_data_dir()
+        self.assertIn("CCCP_PLUGIN_DATA", str(cm.exception))
+
+    def test_never_falls_back_to_xdg_or_home(self):
+        # The old behaviour invented $XDG_STATE_HOME/cccp (or ~/.local/state/cccp).
+        # Neither may ever come back: both are roots the plugin does not read.
+        with self._no_plugin_data(XDG_STATE_HOME="/tmp/should-never-be-used"):
+            with self.assertRaises(SystemExit) as cm:
+                cccp.plugin_data_dir()
+        msg = str(cm.exception)
+        self.assertNotIn("should-never-be-used", msg)
+        self.assertNotIn(".local/state", msg)
+
+    def test_error_carries_the_fix(self):
+        with self._no_plugin_data():
+            with self.assertRaises(SystemExit) as cm:
+                cccp.plugin_data_dir()
+        msg = str(cm.exception)
+        self.assertIn("export CCCP_PLUGIN_DATA", msg)   # how to fix it by hand
+        self.assertIn("SessionStart", msg)              # why it is normally set
+
+    def test_skill_header_surfaces_the_error_to_claude(self):
+        # @@BACKEND@@ is the only place a chat session would ever see this, so the
+        # actionable text must survive into the skill body rather than flatten to a
+        # generic line. Rendering must still not raise.
+        with self._no_plugin_data():
+            block = cccp.backend_status_block()
+        self.assertIn("NOT READY", block)
+        self.assertIn("CCCP_PLUGIN_DATA", block)
+
+    def test_set_is_used_verbatim(self):
+        with self._no_plugin_data(CCCP_PLUGIN_DATA="/tmp/explicit-root"):
+            self.assertEqual(cccp.plugin_data_dir(), Path("/tmp/explicit-root"))
+
+
 class ConfigProvenance(unittest.TestCase):
     """SOURCES records every layer that set a key, low -> high, so `cccp backend` can
     name the winner and flag a shadowed one. It must stay in lockstep with the merge
