@@ -93,7 +93,8 @@ Four verbs cover the whole backend: `cccp backend` shows the active one with its
 health and resolved config (secrets redacted, each value tagged with the layer it
 came from), `cccp backend config <name>` sets a backend's params,
 `cccp backend check <name>` tests one without switching, and
-`cccp backend use <name>` switches only after it validates.
+`cccp backend use <name>` switches only after it validates. `/cccp:setup` is the
+same conversation with a Claude driving it.
 
 ## Staying context-aware across a cell
 
@@ -115,7 +116,7 @@ which the skill walks through on first use.
 bin/cccp              the single-file implementation (on $PATH as bare `cccp` while the plugin is enabled)
 bin/cccp-statusline   side-writes session JSON for claude-tokens; no visible output (see Staying context-aware)
 bin/claude-tokens     token-aware's CLI (on $PATH as bare `claude-tokens`)
-skills/               the /cccp:* skills — chat, team, … stacked at render time by `cccp skill`, plus token-aware for context-budget awareness
+skills/               the /cccp:* skills — chat, team, … stacked at render time by `cccp skill`, plus standalone setup (backends) and token-aware (context budget)
 infra/azure/          Terraform + apply.sh for an Azure Blob hub
 examples/             minimal standalone references (e.g. azure-rest-spike.py)
 tests/                stdlib-only unit tests (python3 tests/test_cccp.py)

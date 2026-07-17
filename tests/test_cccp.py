@@ -653,6 +653,32 @@ class AsActiveBackend(unittest.TestCase):
             self.assertNotIn("CCCP_ACTIVE_BACKEND", os.environ)
 
 
+class SetupSkillFile(unittest.TestCase):
+    """The setup skill is deliberately standalone: it must NOT join the chat family's
+    stack, or it would drag in cells, comrades and the watchtower - the exact
+    opposite of a skill whose only job is the backend."""
+
+    def _skill(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        return Path(here, os.pardir, "skills", "setup", "SKILL.md")
+
+    def test_ships(self):
+        self.assertTrue(self._skill().is_file())
+
+    def test_not_in_the_chat_stack(self):
+        self.assertNotIn("setup", cccp.SKILL_STACK)
+
+    def test_is_static_no_render_time_include(self):
+        # It must not call `cccp skill setup` (there is no such renderer), and it
+        # must not `!`-include the network healthcheck - a 30s urlopen timeout would
+        # block skill render. It tells Claude to run `cccp backend` instead.
+        text = self._skill().read_text()
+        self.assertNotIn("cccp skill setup", text)
+        self.assertNotIn("!`", text)
+        self.assertIn("cccp backend", text)
+        self.assertIn("$ARGUMENTS", text)
+
+
 class LocalFilesRoundTrip(unittest.TestCase):
     """LocalFilesBackend returns Azure-shaped status codes so every caller branches
     identically. Exercises the whole verb set on one gazette."""

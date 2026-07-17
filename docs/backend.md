@@ -170,6 +170,26 @@ outro is no longer a special case either — it renders as an **implied final pa
 of every stack, through the same `render_skill_body` substitution as the body
 templates.
 
+## The `setup` skill
+
+`@@BACKEND@@` and the `setup` skill are the **reactive and proactive halves of the
+same job**, not an overlap. `@@BACKEND@@` catches you mid-`chat` when the store is
+already broken; `/cccp:setup` is where you land when you want to inspect or change
+a backend *before* joining anything — in practice, the `local-fs` → `azure-blob`
+move. Both point at the same `cccp backend`.
+
+It is deliberately **not** in `SKILL_STACK`. Every entry there stacks the `chat`
+base, which would drag in cells, comrades, and the watchtower — the exact opposite
+of a skill whose only job is the backend. So it is a standalone static `SKILL.md`,
+shaped like `token-aware` rather than `chat`, and it carries **no `!`-include**: a
+render-time `cccp backend` would fire the network healthcheck behind a 30s urlopen
+timeout and block skill render. It tells Claude to run `cccp backend` as its first
+action instead, which costs one turn and cannot hang a render.
+
+The skill holds no backend knowledge of its own — it only knows which verbs to run
+and how to read them. That is what keeps it correct as the backend framework
+continues to grow underneath it.
+
 ## Migration
 
 No data migration anywhere — everything relocated is a cache or re-derivable.
