@@ -2630,8 +2630,13 @@ def _show_backend_config(name):
 
     It resolves rather than dumping the file, because the file is one layer of three
     and the environment outranks it - printing the file alone would show values cccp
-    is not using. The `Set by` column is what makes that safe to read. The file is
-    still named, since it is where writes land.
+    is not using. The `Set by` column is what makes that safe to read.
+
+    The file's path is deliberately never printed. This command IS the interface to
+    it: a reader who wants the literal path is about to hand-edit the file, which
+    skips validation and races this command's own writes. Anyone who genuinely needs
+    it is already reading bin/cccp, and `Set by` already names the layer without
+    spelling out where the layer lives.
 
     A backend you are not on resolves perfectly well, and its values look identical
     to the active one's - so the header says which it is, or you are one glance away
@@ -2639,16 +2644,10 @@ def _show_backend_config(name):
     active = resolve_config()["BACKEND"]
     print(f"Backend: {name}  "
           f"[{'active' if name == active else f'not active; active is {active}'}]")
-    keys = _config_keys(name)
-    if not keys:
-        # No params of its own, so no config file will ever exist for it. Say that
-        # rather than naming a path that is never created - but the data root still
-        # decides where its cells land, so the table below is not empty.
+    if not _config_keys(name):
+        # The data root still decides where its cells land, so the table below is
+        # not empty even with no params of its own.
         print(f"\n{name} has no parameters of its own.")
-    else:
-        path = backend_dir(name) / "config"
-        print(f"Config file: {path}"
-              f"{'' if path.exists() else '   (not created yet)'}")
     print()
     with _as_active(name) as cfg:
         _print_config_table(_config_rows(cfg))
@@ -2677,7 +2676,10 @@ def _backend_config(name, assignments):
     With no assignments it shows the resolved config (see _show_backend_config).
     Each KEY=VALUE writes one key: a VALUE of `-` reads the value from stdin (the
     `cccp dispatch` idiom - it keeps a SAS out of shell history and out of the
-    transcript), and an empty VALUE removes the key."""
+    transcript), and an empty VALUE removes the key.
+
+    Which file the write lands in is this command's business, not the caller's, so
+    the path is never printed - see _show_backend_config."""
     _require_backend(name)
     path = backend_dir(name) / "config"
     keys = _config_keys(name)
@@ -2696,7 +2698,7 @@ def _backend_config(name, assignments):
             if not value:
                 sys.exit(f"error: no value for {key} on stdin.")
         _write_kv(path, key, value or None)
-        print(f"{'Set' if value else 'Cleared'} {key} in {path}")
+        print(f"{'Set' if value else 'Cleared'} {key}")
     print(f"\nValidate it with: cccp backend check {name}")
 
 

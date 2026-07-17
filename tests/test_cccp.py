@@ -716,6 +716,24 @@ class BackendConfigTable(unittest.TestCase):
         self.assertNotIn("from-file", row)
         self.assertIn("shadows config", row)    # ...and that the file lost
 
+    def test_never_prints_the_config_file_path(self):
+        # `cccp backend config` IS the interface to that file. Printing its path
+        # invites hand-editing, which skips validation and races this command's own
+        # writes. Anyone who truly needs it is already reading bin/cccp.
+        out = self._show("azure-blob", CCCP_AZURE_BLOB_ACCOUNT="a",
+                         CCCP_AZURE_BLOB_CONTAINER="c", CCCP_AZURE_BLOB_SAS="s")
+        self.assertNotIn("backend/azure-blob/config", out)
+        self.assertNotIn("Config file:", out)
+
+    def test_writes_confirm_the_key_not_the_path(self):
+        with _isolated_env(self.data):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                cccp._backend_config("azure-blob", ["ACCOUNT=hub"])
+            out = buf.getvalue()
+        self.assertIn("Set CCCP_AZURE_BLOB_ACCOUNT", out)
+        self.assertNotIn("backend/azure-blob/config", out)
+
     def test_says_whether_this_backend_is_the_active_one(self):
         # A backend you are not on resolves identically to one you are. Without this
         # you are one glance from tuning azure-blob while every message goes to
