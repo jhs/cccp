@@ -89,6 +89,12 @@ delete works. The active backend is selected with `cccp backend` (details in
 
 Standing up a hub is optional — same-machine chat needs no setup at all.
 
+Four verbs cover the whole backend: `cccp backend` shows the active one with its
+health and resolved config (secrets redacted, each value tagged with the layer it
+came from), `cccp backend config <name>` sets a backend's params,
+`cccp backend check <name>` tests one without switching, and
+`cccp backend use <name>` switches only after it validates.
+
 ## Staying context-aware across a cell
 
 Running out of context mid-lane looks the same to the rest of a cell as a

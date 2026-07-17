@@ -511,6 +511,148 @@ class MakeBackend(unittest.TestCase):
             cccp.make_backend({"BACKEND": "azure-blob", "PARAMS": {}})
 
 
+class ConfigProvenance(unittest.TestCase):
+    """SOURCES records every layer that set a key, low -> high, so `cccp backend` can
+    name the winner and flag a shadowed one. It must stay in lockstep with the merge
+    that produces the values - the two are built from one ordered layer list."""
+
+    def setUp(self):
+        self.data = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.data, True))
+
+    def _write(self, path, text):
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text)
+
+    def _azure(self, account="file-acct"):
+        self._write(f"{self.data}/settings", "CCCP_ACTIVE_BACKEND=azure-blob\n")
+        self._write(f"{self.data}/backend/azure-blob/config",
+                    f"CCCP_AZURE_BLOB_ACCOUNT={account}\n"
+                    "CCCP_AZURE_BLOB_CONTAINER=cont\nCCCP_AZURE_BLOB_SAS=s\n")
+
+    def test_single_layer_reports_that_layer(self):
+        self._azure()
+        with _isolated_env(self.data):
+            cfg = cccp.resolve_config()
+        self.assertEqual(cfg["SOURCES"]["CCCP_AZURE_BLOB_ACCOUNT"], ["config"])
+
+    def test_env_shadowing_records_both_layers_in_order(self):
+        self._azure()
+        with _isolated_env(self.data, CCCP_AZURE_BLOB_ACCOUNT="env-acct"):
+            cfg = cccp.resolve_config()
+        # Winner last, shadowed first - and the winner agrees with the merged value.
+        self.assertEqual(cfg["SOURCES"]["CCCP_AZURE_BLOB_ACCOUNT"], ["config", "env"])
+        self.assertEqual(cfg["PARAMS"]["account"], "env-acct")
+
+    def test_unset_key_has_no_source(self):
+        with _isolated_env(self.data):
+            cfg = cccp.resolve_config()
+        self.assertNotIn("CCCP_AZURE_BLOB_ACCOUNT", cfg["SOURCES"])
+
+
+class BackendConfigWrite(unittest.TestCase):
+    """_write_kv is the one writer behind both `settings` and backend/<name>/config:
+    it preserves unrelated lines and comments, removes on None, and keeps the file
+    owner-only because an azure config holds a SAS."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.path = Path(self._tmp.name) / "backend" / "azure-blob" / "config"
+
+    def test_creates_parents_and_writes(self):
+        cccp._write_kv(self.path, "CCCP_AZURE_BLOB_ACCOUNT", "acct")
+        self.assertEqual(cccp._read_kv_file(self.path),
+                         {"CCCP_AZURE_BLOB_ACCOUNT": "acct"})
+
+    def test_file_is_owner_only(self):
+        cccp._write_kv(self.path, "CCCP_AZURE_BLOB_SAS", "sig")
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+
+    def test_replace_preserves_comments_and_other_keys(self):
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text("# hand-written\nCCCP_AZURE_BLOB_ACCOUNT=old\n"
+                             "CCCP_AZURE_BLOB_CONTAINER=cont\n")
+        cccp._write_kv(self.path, "CCCP_AZURE_BLOB_ACCOUNT", "new")
+        text = self.path.read_text()
+        self.assertIn("# hand-written", text)
+        self.assertIn("CCCP_AZURE_BLOB_CONTAINER=cont", text)
+        self.assertEqual(cccp._read_kv_file(self.path)["CCCP_AZURE_BLOB_ACCOUNT"],
+                         "new")
+        self.assertNotIn("old", text)
+
+    def test_none_removes_only_that_key(self):
+        cccp._write_kv(self.path, "CCCP_AZURE_BLOB_ACCOUNT", "acct")
+        cccp._write_kv(self.path, "CCCP_AZURE_BLOB_CONTAINER", "cont")
+        cccp._write_kv(self.path, "CCCP_AZURE_BLOB_ACCOUNT", None)
+        self.assertEqual(cccp._read_kv_file(self.path),
+                         {"CCCP_AZURE_BLOB_CONTAINER": "cont"})
+
+
+class BackendConfigKeys(unittest.TestCase):
+    """`cccp backend config` accepts either spelling of a key and refuses unknown
+    ones - a typo'd key is invisible until the backend mysteriously fails to
+    validate. local-fs is isolated by its own root dir, so it has no keys at all."""
+
+    def test_bare_and_qualified_spellings_agree(self):
+        self.assertEqual(cccp._config_key("azure-blob", "SAS"), "CCCP_AZURE_BLOB_SAS")
+        self.assertEqual(cccp._config_key("azure-blob", "CCCP_AZURE_BLOB_SAS"),
+                         "CCCP_AZURE_BLOB_SAS")
+        self.assertEqual(cccp._config_key("azure-blob", "sas"), "CCCP_AZURE_BLOB_SAS")
+
+    def test_unknown_key_exits(self):
+        with self.assertRaises(SystemExit):
+            cccp._config_key("azure-blob", "ACCONT")
+
+    def test_local_fs_has_nothing_to_configure(self):
+        self.assertEqual(cccp._config_keys("local-fs"), ())
+        self.assertEqual(cccp._config_keys("azure-blob"),
+                         ("ACCOUNT", "CONTAINER", "SAS", "PREFIX"))
+
+
+class SecretRedaction(unittest.TestCase):
+    """A secret param is never printed - only whether it is set and how long - so
+    `cccp backend` output is safe to paste into an issue or leave in a transcript."""
+
+    def test_sas_value_never_rendered(self):
+        out = cccp._fmt_param("azure-blob", "SAS", "sig-abcdef123456")
+        self.assertNotIn("sig-abcdef", out)
+        self.assertEqual(out, "<set, 16 chars>")
+
+    def test_non_secret_shown_verbatim(self):
+        self.assertEqual(cccp._fmt_param("azure-blob", "ACCOUNT", "hub"), "hub")
+
+    def test_missing_marked_not_redacted(self):
+        self.assertEqual(cccp._fmt_param("azure-blob", "SAS", None), "<missing>")
+
+    def test_every_declared_secret_is_a_real_param(self):
+        # A typo in `secrets` would silently un-redact the key it meant to protect.
+        for name, spec in cccp.BACKENDS.items():
+            for key in spec.get("secrets", ()):
+                self.assertIn(key, spec["params"], f"{name}: {key} is not a param")
+
+
+class AsActiveBackend(unittest.TestCase):
+    """`check` and `use` both resolve a backend they have not switched to by
+    overriding the env selector - the highest-precedence layer. It must restore the
+    previous value, or one check leaks into the next resolution."""
+
+    def test_restores_previous_selector(self):
+        with tempfile.TemporaryDirectory() as d, _isolated_env(d,
+                                                CCCP_ACTIVE_BACKEND="local-fs"):
+            with cccp._as_active("azure-blob") as cfg:
+                self.assertEqual(cfg["BACKEND"], "azure-blob")
+            self.assertEqual(os.environ["CCCP_ACTIVE_BACKEND"], "local-fs")
+            self.assertEqual(cccp.resolve_config()["BACKEND"], "local-fs")
+
+    def test_unsets_when_there_was_no_selector(self):
+        with tempfile.TemporaryDirectory() as d, _isolated_env(d):
+            with cccp._as_active("azure-blob"):
+                pass
+            self.assertNotIn("CCCP_ACTIVE_BACKEND", os.environ)
+
+
 class LocalFilesRoundTrip(unittest.TestCase):
     """LocalFilesBackend returns Azure-shaped status codes so every caller branches
     identically. Exercises the whole verb set on one gazette."""

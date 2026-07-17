@@ -108,9 +108,32 @@ under `~/.claude/plugins/data/`, outside any repo).
   with setup guidance — cccp does not fall back to `local-fs`. The implicit
   `local-fs` default validates its data dir is writable; there is nothing below
   it to downgrade to, so no surprise is possible.
-- `cccp backend` lists backends + descriptions + current selection + health.
-- `cccp backend use <name>` validates, then writes `settings`. This is what the
-  setup flow calls on success.
+
+The four management verbs are the whole operator surface, and the `setup` skill
+adds no capability of its own — it only drives these:
+
+| Verb | Does |
+|---|---|
+| `cccp backend` | Active selection + health + description + resolved params (secrets redacted) with the config layer that won each, then the backend list. Setup guidance too, when the active one is not ready. |
+| `cccp backend use <name>` | Validates, then writes `settings`. Refuses on failure. |
+| `cccp backend check [<name>]` | Validates **any** backend over the network without switching to it. Exits non-zero when not ready. |
+| `cccp backend config <name> [KEY=VALUE ...]` | Shows or writes `backend/<name>/config`. |
+
+- **Params print with their provenance.** Each value is tagged with the layer that
+  won it (`settings` / `config` / `env`, or `default` / `unset`), and a key set in
+  more than one layer is flagged as shadowed. An exported `CCCP_*` silently
+  outranking a config file is the failure mode the merge makes possible, so the
+  status output names it rather than leaving it to be discovered.
+- **Secrets are never printed** — only whether a param is set, and its length.
+  `secrets` in the registry names them (`SAS` today), so `cccp backend` output is
+  safe to paste into an issue. Config files are written `0600`.
+- **`config` takes either key spelling** (`SAS` or `CCCP_AZURE_BLOB_SAS`) and
+  refuses an unknown one — a typo'd key is invisible until the backend
+  mysteriously fails to validate. A `VALUE` of `-` reads the value from stdin
+  (the `cccp dispatch` idiom), keeping a SAS out of shell history and out of an
+  agent's transcript; an empty `VALUE` removes the key.
+- **`local-fs` has no config keys at all.** It is isolated by its own root dir
+  rather than a prefix, which is what makes it the zero-setup default.
 
 ## Backend abstraction
 

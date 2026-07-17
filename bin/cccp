@@ -27,7 +27,7 @@ one-off needs the REST logic (e.g. the large-file staging fallback), read this
 file as a reference implementation rather than importing it.
 
 Subcommands:
-    backend     Show or switch the active data backend.
+    backend     Show, switch, test, or configure the data backend.
     skill       Emit a skill's body (SKILL.md render-time helper; hidden).
     dispatch    Send a message to a cell.
     watchtower  Stream live cell events (run under the Monitor tool).
@@ -52,6 +52,7 @@ import signal
 import socket
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 import traceback
@@ -249,11 +250,12 @@ def _parse_cccp_env(path):
 DEFAULT_BACKEND = "local-fs"
 
 # Backend registry: the summary/description `cccp backend` shows, the required
-# param names, and the prefix default. Every backend is addressed by
-# CCCP_<BACKEND>_<KEY> keys (name upcased, '-'->'_'), so params never collide -
-# across the tree's config files or across environment variables. A backend name
-# must not collide with a global key stem (ACTIVE_BACKEND, DEBUG). See
-# docs/backend.md.
+# param names, which of those are secret, and the prefix default. Every backend is
+# addressed by CCCP_<BACKEND>_<KEY> keys (name upcased, '-'->'_'), so params never
+# collide - across the tree's config files or across environment variables. A
+# backend name must not collide with a global key stem (ACTIVE_BACKEND, DEBUG).
+# `secrets` names the params `cccp backend` must never print (see _fmt_param).
+# See docs/backend.md.
 BACKENDS = {
     "local-fs": {
         "summary": "Same host + same OS user only; zero setup",
@@ -263,6 +265,7 @@ BACKENDS = {
             "OS user (terminal tabs, IDE windows, git worktrees, background "
             "agents). Cannot reach other users or machines."),
         "params": (),
+        "secrets": (),
         "prefix_default": "",
     },
     "azure-blob": {
@@ -274,6 +277,7 @@ BACKENDS = {
             "with each comrade. Point cccp at an existing hub via config, or "
             "provision one with infra/azure/apply.sh."),
         "params": ("ACCOUNT", "CONTAINER", "SAS"),
+        "secrets": ("SAS",),
         "prefix_default": DEFAULT_PREFIX,
     },
 }
@@ -312,7 +316,10 @@ def resolve_config():
     merge for the CCCP_<BACKEND>_* params. The active backend is never inferred
     from stray credentials and never silently downgraded: a selected-but-broken
     backend fails loudly in make_backend, not here. Returns
-    {BACKEND, PARAMS, PREFIX, DEBUG}.
+    {BACKEND, PARAMS, PREFIX, DEBUG, SOURCES}, where SOURCES maps each key any layer
+    set to the list of layers that set it, low -> high precedence. The last entry is
+    the layer that won; earlier ones are shadowed. `cccp backend` prints both, so an
+    env var quietly overriding a config file is visible rather than merely puzzling.
     """
     env = _env_layer()
     settings = _read_kv_file(settings_path())
@@ -324,9 +331,18 @@ def resolve_config():
         sys.exit(f"error: unknown backend {backend!r} (from CCCP_ACTIVE_BACKEND); "
                  f"known: {', '.join(sorted(BACKENDS))}")
 
-    # Backend params: settings < backend/<active>/config < process env.
+    # Backend params: settings < backend/<active>/config < process env. One ordered
+    # layer list drives both the merge and the provenance map, so the two can never
+    # disagree about which layer won a key: later layers overwrite earlier ones in
+    # lockstep, exactly as {**settings, **backend_file, **env} would.
     backend_file = _read_kv_file(backend_dir(backend) / "config")
-    merged = {**settings, **backend_file, **env}
+    merged, sources = {}, {}
+    for layer_name, layer in (("settings", settings),
+                              ("config", backend_file),
+                              ("env", env)):
+        merged.update(layer)
+        for k in layer:
+            sources.setdefault(k, []).append(layer_name)
     params = {k.lower(): merged.get(_backend_key(backend, k)) for k in spec["params"]}
     prefix = merged.get(_backend_key(backend, "PREFIX")) or spec["prefix_default"]
 
@@ -335,6 +351,7 @@ def resolve_config():
         "PARAMS": params,
         "PREFIX": prefix,
         "DEBUG": merged.get("CCCP_DEBUG"),
+        "SOURCES": sources,
     }
 
 
@@ -2419,56 +2436,224 @@ def validate_backend(cfg, network=False):
     return False, f"unknown backend {backend!r}"
 
 
-def _write_setting(key, value):
-    """Set KEY=value in the global settings file, preserving other lines/comments."""
-    path = settings_path()
+def _write_kv(path, key, value):
+    """Set KEY=value in a flat KEY=value config file, preserving every other line
+    and comment; `value=None` removes the key instead. Creates the file and its
+    parents if absent, and keeps it owner-only - a backend config may hold a SAS.
+
+    Shared by the global settings file and every backend/<name>/config, so the two
+    keep identical dotenv semantics and neither grows a writer of its own."""
     path.parent.mkdir(parents=True, exist_ok=True)
     out, replaced = [], False
     if path.exists():
         for line in path.read_text().splitlines():
             s = line.strip()
             if s and not s.startswith("#") and s.split("=", 1)[0].strip() == key:
-                out.append(f"{key}={value}")
+                if value is not None:
+                    out.append(f"{key}={value}")
                 replaced = True
             else:
                 out.append(line)
-    if not replaced:
+    if not replaced and value is not None:
         out.append(f"{key}={value}")
-    path.write_text("\n".join(out) + "\n")
+    path.write_text("\n".join(out) + "\n" if out else "")
+    path.chmod(0o600)
+
+
+def _write_setting(key, value):
+    """Set KEY=value in the global settings file - cccp's global state."""
+    _write_kv(settings_path(), key, value)
+
+
+@contextlib.contextmanager
+def _as_active(name):
+    """Resolve config as if `name` were the active backend, without persisting that
+    choice - what `use` and `check` both need to validate a backend before (or
+    without) switching to it. Process env is the highest-precedence layer, so
+    overriding the selector there is exactly how a caller would have selected it.
+    The previous value is restored on exit, so one check can never leak into the
+    next resolution in the same process."""
+    prev = os.environ.get("CCCP_ACTIVE_BACKEND")
+    os.environ["CCCP_ACTIVE_BACKEND"] = name
+    try:
+        yield resolve_config()
+    finally:
+        if prev is None:
+            os.environ.pop("CCCP_ACTIVE_BACKEND", None)
+        else:
+            os.environ["CCCP_ACTIVE_BACKEND"] = prev
+
+
+def _require_backend(name):
+    """Exit unless `name` is a known backend."""
+    if name not in BACKENDS:
+        sys.exit(f"error: unknown backend {name!r}; known: "
+                 f"{', '.join(sorted(BACKENDS))}")
 
 
 def _backend_use(name):
     """Validate `name` as the active backend, then persist it to settings. Refuses
     to switch to a backend that isn't ready - it never leaves the user pointed at a
     broken store, and never silently downgrades."""
-    if name not in BACKENDS:
-        sys.exit(f"error: unknown backend {name!r}; known: "
-                 f"{', '.join(sorted(BACKENDS))}")
+    _require_backend(name)
     current = resolve_config()["BACKEND"]
-    os.environ["CCCP_ACTIVE_BACKEND"] = name   # force resolution of the target
-    ok, detail = validate_backend(resolve_config(), network=True)
+    with _as_active(name) as cfg:
+        ok, detail = validate_backend(cfg, network=True)
     if not ok:
         sys.exit(f"error: {name!r} is not ready: {detail}. Active backend "
-                 f"unchanged ({current}). See docs/backend.md.")
+                 f"unchanged ({current}).\n\n{_backend_setup_guidance(name)}")
     _write_setting("CCCP_ACTIVE_BACKEND", name)
     print(f"Active backend set to {name} ({detail}).")
 
 
+def _backend_check(name):
+    """Validate any backend, active or not, without switching to it - the 'test it
+    before I commit to it' verb. Exits non-zero when it is not ready, so a caller
+    can branch on it."""
+    _require_backend(name)
+    with _as_active(name) as cfg:
+        ok, detail = validate_backend(cfg, network=True)
+    if ok:
+        print(f"{name}: OK ({detail}).")
+        return
+    sys.exit(f"{name}: NOT READY - {detail}.\n\n{_backend_setup_guidance(name)}")
+
+
+def _config_keys(backend):
+    """The keys `cccp backend config` will write for a backend: its required params,
+    plus PREFIX where the backend uses one. local-fs is isolated by its own root dir
+    and so exposes no prefix key (docs/backend.md), leaving it with nothing to
+    configure at all - which is the whole point of it being the zero-setup default."""
+    spec = BACKENDS[backend]
+    return tuple(spec["params"]) + (("PREFIX",) if spec["prefix_default"] else ())
+
+
+def _fmt_param(backend, key, value):
+    """One param's display value. A secret is never printed - only whether it is set,
+    and how long - so `cccp backend` output stays safe to paste into an issue or
+    leave sitting in a transcript. The value is on disk if you truly need it."""
+    if not value:
+        return "<missing>"
+    if key in BACKENDS[backend].get("secrets", ()):
+        return f"<set, {len(value)} chars>"
+    return value
+
+
+def _print_params(backend, values, sources):
+    """The resolved param table: each key, its (redacted) value, and the config layer
+    that won it. `values` maps a bare param name to its resolved value; `sources` is
+    resolve_config's SOURCES. A key set in more than one layer is flagged, because a
+    stale env var shadowing a config file is the failure that wastes an afternoon."""
+    for key in _config_keys(backend):
+        qualified = _backend_key(backend, key)
+        layers = sources.get(qualified, [])
+        raw = values.get(key)
+        # No layer set it: either the registry's own default filled it in (PREFIX)
+        # or nothing did. Saying "default" for a missing required param would imply
+        # a default exists to fall back on, and none does.
+        origin = layers[-1] if layers else ("default" if raw else "unset")
+        note = f"   <- shadows {', '.join(layers[:-1])}" if len(layers) > 1 else ""
+        print(f"  {qualified:<28} {_fmt_param(backend, key, raw):<20} "
+              f"({origin}){note}")
+
+
+def _backend_status(cfg, ok, detail):
+    """The `cccp backend` status block: what is active, whether it works, what it is,
+    and every resolved param with its provenance."""
+    active = cfg["BACKEND"]
+    print(f"Active backend: {active}  "
+          f"[{'OK - ' if ok else 'NOT READY - '}{detail}]")
+    print(textwrap.fill(BACKENDS[active]["description"], width=76,
+                        initial_indent="  ", subsequent_indent="  "))
+    keys = _config_keys(active)
+    if keys:
+        print()
+        values = {k: cfg["PARAMS"].get(k.lower()) for k in keys}
+        values["PREFIX"] = cfg["PREFIX"]
+        _print_params(active, values, cfg["SOURCES"])
+    if not ok:
+        print()
+        print(_backend_setup_guidance(active))
+
+
+def _config_key(backend, key):
+    """Normalize one `cccp backend config` key to its fully-qualified form. Accepts
+    the bare param name (`SAS`) or the qualified key (`CCCP_AZURE_BLOB_SAS`) - the
+    file stores the qualified form and `cccp backend` prints it, so both spellings a
+    reader might copy land in the same place. An unknown key is refused rather than
+    written: a typo'd key in a config file is invisible until the backend
+    mysteriously fails to validate."""
+    keys = _config_keys(backend)
+    bare = key.strip().upper().replace("-", "_")
+    for param in keys:
+        if bare in (param, _backend_key(backend, param)):
+            return _backend_key(backend, param)
+    sys.exit(f"error: {key!r} is not a config key for {backend!r}; known: "
+             f"{', '.join(keys) or '(none)'}")
+
+
+def _backend_config(name, assignments):
+    """Show or write backend/<name>/config - the 'set up a backend' and 'reconfigure
+    a backend' verb. With no assignments it prints the file's keys (secrets
+    redacted). Each KEY=VALUE writes one key: a VALUE of `-` reads the value from
+    stdin (the `cccp dispatch` idiom - it keeps a SAS out of shell history and out of
+    the transcript), and an empty VALUE removes the key."""
+    _require_backend(name)
+    path = backend_dir(name) / "config"
+    keys = _config_keys(name)
+    if not assignments:
+        print(f"Config file: {path}"
+              f"{'' if path.exists() else '   (not created yet)'}")
+        if not keys:
+            print(f"\n{name} takes no configuration - it is ready as soon as "
+                  f"$CCCP_PLUGIN_DATA is writable.")
+            return
+        print()
+        stored = _read_kv_file(path)
+        _print_params(name, {k: stored.get(_backend_key(name, k)) for k in keys},
+                      {k: ["config"] for k in stored})
+        return
+    if not keys:
+        sys.exit(f"error: {name!r} takes no configuration.")
+    for item in assignments:
+        if "=" not in item:
+            sys.exit(f"error: expected KEY=VALUE, got {item!r}.")
+        raw, value = item.split("=", 1)
+        key = _config_key(name, raw)
+        if value == "-":
+            value = sys.stdin.read().strip()
+            if not value:
+                sys.exit(f"error: no value for {key} on stdin.")
+        _write_kv(path, key, value or None)
+        print(f"{'Set' if value else 'Cleared'} {key} in {path}")
+    print(f"\nValidate it with: cccp backend check {name}")
+
+
 def cmd_backend(args):
-    """Show the active backend and health, or `use <name>` to switch it."""
-    if getattr(args, "action", None) == "use":
+    """Show the active backend, its health and resolved config; or `use <name>` to
+    switch, `check <name>` to validate without switching, `config <name>` to set a
+    backend's params."""
+    action = getattr(args, "action", None)
+    if action == "use":
         _backend_use(args.name)
+        return
+    if action == "check":
+        _backend_check(args.name or resolve_config()["BACKEND"])
+        return
+    if action == "config":
+        _backend_config(args.name, args.assignments)
         return
     cfg = resolve_config()
     active = cfg["BACKEND"]
     ok, detail = validate_backend(cfg, network=True)
-    print(f"Active backend: {active}  [{'OK' if ok else 'NOT READY - ' + detail}]")
+    _backend_status(cfg, ok, detail)
     print()
     for name, spec in BACKENDS.items():
         mark = "->" if name == active else "  "
         print(f" {mark} {name:<11} {spec['summary']}")
     print()
-    print("Switch: cccp backend use <name>   Details: docs/backend.md")
+    print("Switch: cccp backend use <name>      Configure: cccp backend config <name>")
+    print("Test:   cccp backend check [<name>]  Details:   docs/backend.md")
 
 
 def build_parser():
@@ -2503,12 +2688,30 @@ def build_parser():
     sk.set_defaults(func=cmd_skill)
 
     bk = sub.add_parser("backend",
-                        help="Show or switch the active data backend.")
-    bk_sub = bk.add_subparsers(dest="action", metavar="{use}")
+                        help="Show, switch, test, or configure the data backend.")
+    bk_sub = bk.add_subparsers(dest="action", metavar="{use,check,config}")
+
     bk_use = bk_sub.add_parser("use", help="Switch the active backend and persist it.")
     bk_use.add_argument("name", help="Backend to activate (see `cccp backend`).")
+
+    bk_check = bk_sub.add_parser(
+        "check", help="Validate a backend without switching to it.")
+    bk_check.add_argument("name", nargs="?", default=None,
+                          help="Backend to test; omit for the active one.")
+
+    bk_config = bk_sub.add_parser(
+        "config", help="Show or set one backend's config params.")
+    bk_config.add_argument("name", help="Backend to configure.")
+    bk_config.add_argument("assignments", nargs="*", metavar="KEY=VALUE",
+                           help="Set a param. A VALUE of `-` reads the value from "
+                                "stdin (keeping a secret out of shell history); an "
+                                "empty VALUE removes the key. Omit every assignment "
+                                "to show the current config.")
+
     bk.set_defaults(func=cmd_backend, action=None, name=None)
     bk_use.set_defaults(func=cmd_backend, action="use")
+    bk_check.set_defaults(func=cmd_backend, action="check")
+    bk_config.set_defaults(func=cmd_backend, action="config")
 
     disp = sub.add_parser("dispatch", help="Send a message to a cell.")
     disp.add_argument("cell", help="Cell slug.")
