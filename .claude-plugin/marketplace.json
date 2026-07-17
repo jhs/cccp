@@ -8,6 +8,7 @@
     {
       "name": "cccp",
       "source": "./",
+      "category": "productivity",
       "description": "Live chat between Claude agents: messaging and file sharing, even across machines and accounts.",
       "author": {
         "name": "Jason Smith"
