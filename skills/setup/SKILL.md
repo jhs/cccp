@@ -42,12 +42,20 @@ join, and joining is where you should start.
 
 ## 1. Look before you touch
 
-Run this first, always. It prints the active backend, its health, and every
-resolved config value (secrets redacted) tagged with — critically — the layer it
-came from:
+Each verb answers exactly one question. Reach for the one you actually need:
+
+| Question | Command | Notes |
+|---|---|---|
+| Which backend am I on? | `cccp backend` | Prints the bare name. No network. |
+| What is its config? | `cccp backend config [<name>]` | Resolved values + where each came from. Defaults to the active backend. |
+| Does it work? | `cccp backend check [<name>]` | Hits the network. Prints setup guidance on failure. |
+| Switch to another | `cccp backend use <name>` | Validates first; refuses if not ready. |
+
+Start with `cccp backend config` — it answers "what am I actually using" in one
+shot:
 
 ```bash
-cccp backend
+cccp backend config
 ```
 
 Read the **`Set by`** column before believing anything — it names the config
@@ -57,14 +65,20 @@ wins over the file. A row reading `env   <- shadows config` is almost always the
 bug: the file is right and a stale env var is overriding it. Fix the
 environment, not the file.
 
+`cccp backend config <name>` works for a backend you are **not** on, and its
+values look identical to the active one's — so check the `[active]` /
+`[not active; active is ...]` marker in the header. Configuring `azure-blob`
+while `local-fs` is active is a real thing to do (it is the whole setup flow),
+but so is doing it by accident and wondering why nothing changed.
+
 `CCCP_PLUGIN_DATA` heads the table on every backend — it is where all cell data
 and config actually live, and it is always `env`, since every config file sits
-inside it. On `local-fs` it is the *only* row: that backend takes no parameters,
-so the data directory is the whole of its configuration. A one-row table there is
-correct, not a fault.
+inside it. On `local-fs` it is the *only* row: that backend has no parameters of
+its own, so the data directory is the whole of its configuration. A one-row table
+there is correct, not a fault.
 
-`cccp backend` reports **this session's state**, not a catalog — the backends it
-can switch to are the table at the top of this skill. Don't ask it to list them.
+None of these list the available backends — that roster is the table at the top
+of this skill. Don't ask the CLI for it.
 
 If `cccp` exits with an error instead of a report, read the error rather than
 working around it — it carries its own fix. `CCCP_PLUGIN_DATA is not set` means
@@ -74,7 +88,7 @@ from the ones the plugin actually uses.
 
 ## 2. Explain and confirm
 
-Answer the user's question from what `cccp backend` printed. If they're already
+Answer the user's question from what those commands printed. If they're already
 on a healthy backend that meets their needs, say so and stop — the most common
 correct outcome here is "you're fine, nothing to do".
 
@@ -83,14 +97,19 @@ user, or network boundary.
 
 ## 3. Configure a backend
 
-`cccp backend config <name>` shows one backend's config file;
-`cccp backend config <name> KEY=VALUE ...` writes it. Keys take either spelling
-(`SAS` or `CCCP_AZURE_BLOB_SAS`); an empty value removes a key.
+`cccp backend config <name> KEY=VALUE ...` writes config; the same command with
+no assignments reads it back. Keys take either spelling (`SAS` or
+`CCCP_AZURE_BLOB_SAS`); an empty value removes a key.
 
 ```bash
-cccp backend config azure-blob                          # show it
+cccp backend config azure-blob                          # read it
 cccp backend config azure-blob ACCOUNT=hub CONTAINER=cells
 ```
+
+Writes always land in that backend's config file, but reads show the **resolved**
+merge — so a value you just wrote can come back tagged `env`, meaning the
+environment is overriding what you wrote. That is the `Set by` column earning its
+place: the write succeeded and is still being ignored.
 
 **Never put a secret in a command line.** A SAS in `argv` lands in shell history
 and in this transcript. Read it from stdin with `-` instead, and let the user
@@ -114,8 +133,8 @@ cccp backend check azure-blob    # test without committing
 cccp backend use azure-blob      # switch (refuses if not ready)
 ```
 
-When a check fails, `cccp backend` and `cccp backend check` both print
-backend-specific setup guidance — follow that rather than guessing. Provisioning
+When a check fails, `cccp backend check` prints backend-specific setup
+guidance — follow that rather than guessing. Provisioning
 a new Azure hub is the **host** path from the table above: `infra/azure/apply.sh`
 (Terraform), which deploys real infrastructure and spends the user's money. Ask
 first, always. If you need to go deeper than these verbs, read `bin/cccp` — it is
@@ -124,7 +143,7 @@ a single stdlib-only file, and it is the only authority on how backends resolve.
 ## Your instructions
 
 The next paragraph begins `User Arguments:` then appends the user's prompt.
-If defined, respond to the User Arguments; if empty, run `cccp backend` and
-report what you find.
+If defined, respond to the User Arguments; if empty, run `cccp backend config`
+and report what you find.
 
 User Arguments: $ARGUMENTS

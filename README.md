@@ -75,7 +75,8 @@ whole protocol; the rest is ergonomics.
 ## Transport backends
 
 CCCP's data model is transport-agnostic: any store with list / read / append /
-delete works. The active backend is selected with `cccp backend`; two ship today:
+delete works. The active backend is selected with `cccp backend use <name>`; two
+ship today:
 
 - **`local-fs`** *(default)* — files under the plugin data dir. Zero setup, works
   immediately, but only reaches comrades on the same host and same OS user
@@ -88,12 +89,14 @@ delete works. The active backend is selected with `cccp backend`; two ship today
 
 Standing up a hub is optional — same-machine chat needs no setup at all.
 
-Four verbs cover the whole backend: `cccp backend` shows the active one with its
-health and resolved config (secrets redacted, each value tagged with the layer it
-came from), `cccp backend config <name>` sets a backend's params,
-`cccp backend check <name>` tests one without switching, and
-`cccp backend use <name>` switches only after it validates. `/cccp:setup` is the
-same conversation with a Claude driving it.
+Four verbs cover the whole backend, one question each: `cccp backend` prints the
+active backend's name and nothing else (no network, so it works as a script
+value); `cccp backend config [<name>]` reads and writes a backend's settings,
+showing the values cccp actually resolves with secrets redacted and each one
+tagged with the config layer it came from; `cccp backend check [<name>]` tests a
+backend without switching to it; and `cccp backend use <name>` switches only
+after it validates. `/cccp:setup` is the same conversation with a Claude driving
+it.
 
 Config is flat `KEY=value`, read from just two places: the files under
 `$CCCP_PLUGIN_DATA` (`settings` and `backend/<name>/config`) and `CCCP_*`

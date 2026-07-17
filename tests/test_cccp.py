@@ -611,51 +611,74 @@ class ConfigProvenance(unittest.TestCase):
         self.assertNotIn("CCCP_AZURE_BLOB_ACCOUNT", cfg["SOURCES"])
 
 
-class BackendStatusTable(unittest.TestCase):
-    """`cccp backend` must print a provenance table on EVERY backend - the setup
-    skill tells Claude to read that column before believing anything. local-fs has no
-    params, so it once printed no table at all: the default backend, showing nothing,
-    against a skill promising a column."""
+class BarePlumbing(unittest.TestCase):
+    """`cccp backend` is plumbing: the active name on stdout and nothing else, so
+    $(cccp backend) is a value a script can branch on. It must also stay off the
+    network - `which backend am I on` should never wait on a container LIST."""
 
     def setUp(self):
         self.data = tempfile.mkdtemp()
         self.addCleanup(lambda: __import__("shutil").rmtree(self.data, True))
 
-    def _status(self, **env):
+    def _bare(self, **env):
+        args = cccp.build_parser().parse_args(["backend"])
         with _isolated_env(self.data, **env):
-            cfg = cccp.resolve_config()
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
-                cccp._backend_status(cfg, True, "ready")
+                cccp.cmd_backend(args)
             return buf.getvalue()
 
-    def _header(self, **env):
-        """The table's header line, wherever it sits under the status line."""
-        for line in self._status(**env).splitlines():
+    def test_prints_only_the_name(self):
+        self.assertEqual(self._bare(), "local-fs\n")
+
+    def test_names_a_selected_backend_without_validating_it(self):
+        # azure-blob with no credentials at all: still just the name. Health is
+        # `check`'s job, and this must not probe (or fail) to answer the question.
+        with mock.patch.object(cccp, "validate_backend",
+                               side_effect=AssertionError("must not validate")):
+            self.assertEqual(self._bare(CCCP_ACTIVE_BACKEND="azure-blob"),
+                             "azure-blob\n")
+
+
+class BackendConfigTable(unittest.TestCase):
+    """`cccp backend config` is the config authority: it resolves the merge rather
+    than dumping one file, and tags each value with the layer that won it. The setup
+    skill tells Claude to read that column before believing anything."""
+
+    def setUp(self):
+        self.data = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.data, True))
+
+    def _show(self, name="local-fs", **env):
+        with _isolated_env(self.data, **env):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                cccp._show_backend_config(name)
+            return buf.getvalue()
+
+    def _header(self, **kw):
+        """The table's header line, wherever it sits under the preamble."""
+        for line in self._show(**kw).splitlines():
             if "Config key" in line:
                 return line
         self.fail("no table header printed")
 
     def test_local_fs_still_gets_a_provenance_row(self):
-        out = self._status()
-        row = [l for l in out.splitlines() if "CCCP_PLUGIN_DATA" in l][0]
+        row = [l for l in self._show().splitlines() if "CCCP_PLUGIN_DATA" in l][0]
         self.assertIn(self.data, row)          # the actual data root, not a guess
         self.assertIn("env", row)              # ...with its layer, like any key
 
     def test_data_dir_row_leads_every_backend(self):
-        out = self._status(CCCP_ACTIVE_BACKEND="azure-blob",
-                           CCCP_AZURE_BLOB_ACCOUNT="a",
-                           CCCP_AZURE_BLOB_CONTAINER="c",
-                           CCCP_AZURE_BLOB_SAS="s")
+        out = self._show("azure-blob", CCCP_AZURE_BLOB_ACCOUNT="a",
+                         CCCP_AZURE_BLOB_CONTAINER="c", CCCP_AZURE_BLOB_SAS="s")
         rows = [l for l in out.splitlines() if l.startswith("  CCCP_")]
         self.assertTrue(rows[0].startswith("  CCCP_PLUGIN_DATA"), rows)
         self.assertIn("CCCP_AZURE_BLOB_ACCOUNT", out)
 
     def test_secret_stays_redacted_in_the_table(self):
-        out = self._status(CCCP_ACTIVE_BACKEND="azure-blob",
-                           CCCP_AZURE_BLOB_ACCOUNT="a",
-                           CCCP_AZURE_BLOB_CONTAINER="c",
-                           CCCP_AZURE_BLOB_SAS="sig-do-not-print")
+        out = self._show("azure-blob", CCCP_AZURE_BLOB_ACCOUNT="a",
+                         CCCP_AZURE_BLOB_CONTAINER="c",
+                         CCCP_AZURE_BLOB_SAS="sig-do-not-print")
         self.assertNotIn("sig-do-not-print", out)
         self.assertIn("<set, 16 chars>", out)
 
@@ -679,6 +702,28 @@ class BackendStatusTable(unittest.TestCase):
         # A data-dir path can run 90+ chars. Any column after it would be shoved off
         # the edge, and every short value padded out to match.
         self.assertTrue(self._header().rstrip().endswith("Value"), self._header())
+
+    def test_resolves_the_merge_not_the_file(self):
+        # The file is one layer of three and env outranks it. Dumping the file would
+        # show a value cccp is not using; the Set by column is what makes the
+        # difference legible.
+        Path(self.data, "backend", "azure-blob").mkdir(parents=True)
+        Path(self.data, "backend", "azure-blob", "config").write_text(
+            "CCCP_AZURE_BLOB_CONTAINER=from-file\n")
+        out = self._show("azure-blob", CCCP_AZURE_BLOB_CONTAINER="from-env")
+        row = [l for l in out.splitlines() if "CONTAINER" in l][0]
+        self.assertIn("from-env", row)          # what cccp actually resolves
+        self.assertNotIn("from-file", row)
+        self.assertIn("shadows config", row)    # ...and that the file lost
+
+    def test_says_whether_this_backend_is_the_active_one(self):
+        # A backend you are not on resolves identically to one you are. Without this
+        # you are one glance from tuning azure-blob while every message goes to
+        # local-fs.
+        self.assertIn("[active]", self._show("local-fs").splitlines()[0])
+        head = self._show("azure-blob").splitlines()[0]
+        self.assertIn("not active", head)
+        self.assertIn("local-fs", head)         # ...and which one is
 
 
 class BackendConfigWrite(unittest.TestCase):
@@ -742,14 +787,18 @@ class BackendConfigKeys(unittest.TestCase):
 
     def test_no_config_backend_names_no_file(self):
         # A backend with no keys has no config file. Naming one - especially as
-        # "(not created yet)", which promises it is coming - contradicts the very
-        # sentence it sits above.
+        # "(not created yet)", which promises it is coming - would contradict the
+        # sentence right beside it. The data root still shows: it decides where
+        # local-fs's cells land, so the view is not empty.
         with tempfile.TemporaryDirectory() as d, _isolated_env(d):
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 cccp._backend_config("local-fs", [])
             out = buf.getvalue()
-        self.assertEqual(out.strip(), "local-fs takes no configuration.")
+        self.assertIn("local-fs has no parameters of its own.", out)
+        self.assertNotIn("Config file:", out)
+        self.assertNotIn("not created yet", out)
+        self.assertIn("CCCP_PLUGIN_DATA", out)
 
     def test_user_facing_text_never_prints_a_literal_env_var_name(self):
         # `$CCCP_PLUGIN_DATA is writable` is unactionable: you cannot check a path
