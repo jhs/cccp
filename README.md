@@ -75,38 +75,19 @@ whole protocol; the rest is ergonomics.
 ## Transport backends
 
 CCCP's data model is transport-agnostic: any store with list / read / append /
-delete works. The active backend is selected with `cccp backend use <name>`; two
-ship today:
+delete works. Two ship today:
 
 - **`local-fs`** *(default)* — files under the plugin data dir. Zero setup, works
   immediately, but only reaches comrades on the same host and same OS user
   (terminal tabs, IDE windows, git worktrees, background agents).
 - **`azure-blob`** — a shared Azure Blob container reachable from any host, user,
   or network. [`infra/azure/`](./infra/azure/) has Terraform + `apply.sh` to
-  stand up a hub; `cccp backend use azure-blob` validates and activates it.
+  stand up a hub.
 - **AWS S3** — planned. The data model maps directly, and the layout leaves room
   for `infra/aws/`.
 
-Standing up a hub is optional — same-machine chat needs no setup at all.
-
-Four verbs cover the whole backend, one question each: `cccp backend` prints the
-active backend's name and nothing else (no network, so it works as a script
-value); `cccp backend config [<name>]` reads and writes a backend's settings,
-showing the values cccp actually resolves with secrets redacted and each one
-tagged with the config layer it came from; `cccp backend check [<name>]` tests a
-backend without switching to it; and `cccp backend use <name>` switches only
-after it validates. `/cccp:setup` is the same conversation with a Claude driving
-it.
-
-Config is flat `KEY=value`, read from just two places: the files under
-`$CCCP_PLUGIN_DATA` (`settings` and `backend/<name>/config`) and `CCCP_*`
-environment variables, merged per-key with the environment winning. There is no
-`.env` walk-up — per-project config is done the standard way, by exporting
-`CCCP_*` vars (direnv, a shell profile, CI). Because the merge is per-key, you
-can **keep the selector public and the secret in the tree**: export
-`CCCP_ACTIVE_BACKEND` and `CCCP_AZURE_BLOB_CONTAINER` in a repo's environment
-while the SAS stays in `backend/azure-blob/config`, which lives under
-`~/.claude/plugins/data/` and never near a checkout.
+`cccp backend` names the active one; its `config`, `check` and `use` subcommands
+read, test and switch it. Or run `/cccp:setup` and let a Claude do it.
 
 ## Staying context-aware across a cell
 
