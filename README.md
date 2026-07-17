@@ -75,8 +75,7 @@ whole protocol; the rest is ergonomics.
 ## Transport backends
 
 CCCP's data model is transport-agnostic: any store with list / read / append /
-delete works. The active backend is selected with `cccp backend` (details in
-[`docs/backend.md`](./docs/backend.md)); two ship today:
+delete works. The active backend is selected with `cccp backend`; two ship today:
 
 - **`local-fs`** *(default)* — files under the plugin data dir. Zero setup, works
   immediately, but only reaches comrades on the same host and same OS user
@@ -95,6 +94,16 @@ came from), `cccp backend config <name>` sets a backend's params,
 `cccp backend check <name>` tests one without switching, and
 `cccp backend use <name>` switches only after it validates. `/cccp:setup` is the
 same conversation with a Claude driving it.
+
+Config is flat `KEY=value`, read from just two places: the files under
+`$CCCP_PLUGIN_DATA` (`settings` and `backend/<name>/config`) and `CCCP_*`
+environment variables, merged per-key with the environment winning. There is no
+`.env` walk-up — per-project config is done the standard way, by exporting
+`CCCP_*` vars (direnv, a shell profile, CI). Because the merge is per-key, you
+can **keep the selector public and the secret in the tree**: export
+`CCCP_ACTIVE_BACKEND` and `CCCP_AZURE_BLOB_CONTAINER` in a repo's environment
+while the SAS stays in `backend/azure-blob/config`, which lives under
+`~/.claude/plugins/data/` and never near a checkout.
 
 ## Staying context-aware across a cell
 

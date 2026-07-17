@@ -32,7 +32,7 @@ fi
 input=$(cat)
 
 # Harvested Claude Code session telemetry lives under telemetry/claude-code/ in
-# the plugin data tree (see docs/backend.md). --plugin-data is still the tree root.
+# the plugin data tree (see the map in bin/cccp). --plugin-data is still the tree root.
 tele_dir="$data_dir/telemetry/claude-code"
 
 # Write claude auth status. Cached with 5h TTL.

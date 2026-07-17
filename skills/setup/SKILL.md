@@ -108,8 +108,8 @@ When a check fails, `cccp backend` and `cccp backend check` both print
 backend-specific setup guidance — follow that rather than guessing. Provisioning
 a new Azure hub is the **host** path from the table above: `infra/azure/apply.sh`
 (Terraform), which deploys real infrastructure and spends the user's money. Ask
-first, always. `docs/backend.md` is the design reference if you need to go
-deeper.
+first, always. If you need to go deeper than these verbs, read `bin/cccp` — it is
+a single stdlib-only file, and it is the only authority on how backends resolve.
 
 ## Your instructions
 

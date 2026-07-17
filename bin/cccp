@@ -3,8 +3,8 @@
 
 Comrades rendezvous through one shared blob store - every comrade reads and
 writes the same store, with no peer-to-peer connections. The store is a pluggable
-backend behind a small verb set (list / read / append / delete); see BACKENDS and
-docs/backend.md. Two ship today:
+backend behind a small verb set (list / read / append / delete); see BACKENDS.
+Two ship today:
 
     local-fs (default)  Files under the plugin data dir. Zero setup, but same
                         host + same OS user only.
@@ -71,6 +71,10 @@ CCCP_VERSION = "2.3.0"     # Shown on the watchtower `ready` line (v=...) so a
                            # version; Claude Code resolves plugin.json first). Bump
                            # both together each release so the ready-line v= matches
                            # the installed plugin.
+# A prefix carves namespace room inside one flat shared container/bucket, so it is
+# azure/S3-only in practice: local-fs gets that isolation from its own root dir and
+# exposes no prefix key at all (empty prefix, no __default__ folder). Every path
+# builder tolerates an empty prefix.
 DEFAULT_PREFIX = "__default__"
 POLL_LADDER = (            # seconds; the adaptive inter-poll gap. First entry is
     2, 5, 15, 30, 60,      # the "fast" cadence used right after activity; each
@@ -185,7 +189,8 @@ def current_session_id():
 
 # ---------- plugin data tree ----------
 #
-# One namespace, $CCCP_PLUGIN_DATA, split by role (see docs/backend.md):
+# One namespace, $CCCP_PLUGIN_DATA, split by role the way XDG and /var split data
+# from cache. The load-bearing line is backend/ vs. everything else:
 #   settings              global cccp state (active backend, ...)
 #   backend/<name>/       per-backend shared state; backend/local-fs/ IS the
 #                         authoritative local cell store, azure-blob/ holds only
@@ -194,6 +199,13 @@ def current_session_id():
 #   telemetry/            cache: harvested session data (token-aware)
 #   run/                  ephemeral inter-process runtime state (the /var/run of
 #                         the tree): watchtower inboxes today, pidfiles later
+#
+# backend/local-fs/ is the ONLY authoritative data in the tree: it IS the local
+# cell's message log, and deleting it loses messages permanently. That is the
+# exception, not the rule - backend/azure-blob/ holds just a pointer + credentials
+# (re-runnable), and mirror/, telemetry/ and run/ are reconstructible caches, safe
+# to wipe. A future `cccp gc` should be able to clear those three and be
+# structurally incapable of reaching backend/.
 # Claude Code exports CCCP_PLUGIN_DATA (the SessionStart hook in hooks/), so it is
 # always set inside a session. When it is missing, cccp stops rather than guessing.
 
@@ -213,19 +225,17 @@ def plugin_data_dir():
     d = os.environ.get("CCCP_PLUGIN_DATA")
     if not d:
         sys.exit(
-            "error: CCCP_PLUGIN_DATA is not set, so cccp has no data directory.\n"
+            "ERROR: CCCP_PLUGIN_DATA is not set, so cccp has no data directory.\n"
             "\n"
-            "Inside a Claude Code session the cccp plugin's SessionStart hook "
+            "Inside a Claude Code session, the plugin's SessionStart hook\n"
             "exports it. If you are seeing this there, the plugin is not enabled "
             "- check `/plugin`.\n"
             "\n"
-            "Running cccp by hand outside a session? Point it at the plugin's "
-            "data dir first (the suffix is the marketplace it came from):\n"
-            "    ls -d ~/.claude/plugins/data/cccp-*        # find yours\n"
-            "    export CCCP_PLUGIN_DATA=~/.claude/plugins/data/cccp-<marketplace>\n"
+            "To run cccp by hand outside a session, point it at the plugin's "
+            "data dir first, e.g.\n"
             "\n"
-            "cccp will not guess a default: the wrong root silently splits your "
-            "cells and config from the ones the plugin actually uses.")
+            "export CCCP_PLUGIN_DATA=~/.claude/plugins/data/cccp-inline\n"
+        )
     return Path(d)
 
 
@@ -281,7 +291,7 @@ DEFAULT_BACKEND = "local-fs"
 #
 # Prose about what a backend IS lives in skills/setup/SKILL.md, not here: the CLI
 # states facts and config, and the setup skill - which no chat session ever loads -
-# is where a reader has room for the explanation. See docs/backend.md.
+# is where a reader has room for the explanation.
 BACKENDS = {
     "local-fs": {
         "summary": "Same host + same OS user only; zero setup",
@@ -787,7 +797,7 @@ def make_backend(cfg, log=None):
         if missing:
             sys.exit(f"error: backend 'azure-blob' is selected but not configured "
                      f"(missing {', '.join(missing)}). Run `cccp backend` to inspect "
-                     f"or switch, or set it up (see docs/backend.md).")
+                     f"or switch, or `cccp backend config azure-blob` to set it up.")
         return AzureBlobBackend(params["account"], params["container"],
                                 params["sas"], log=log)
     sys.exit(f"error: unknown backend {backend!r}")
@@ -1932,7 +1942,7 @@ def _ds_validate(plugin_data):
 
 def _ds_detect(plugin_data):
     # Harvested session telemetry lives under telemetry/claude-code/ (see
-    # bin/cccp-statusline and docs/backend.md): an auth-status.json plus one
+    # bin/cccp-statusline and the plugin data tree above): an auth-status.json plus one
     # <session-uuid>.json per session.
     tele = Path(plugin_data) / "telemetry" / "claude-code"
     if not (tele / "auth-status.json").exists():
@@ -2543,7 +2553,7 @@ def _backend_check(name):
 def _config_keys(backend):
     """The keys `cccp backend config` will write for a backend: its required params,
     plus PREFIX where the backend uses one. local-fs is isolated by its own root dir
-    and so exposes no prefix key (docs/backend.md), leaving it with nothing to
+    and so exposes no prefix key (see DEFAULT_PREFIX), leaving it with nothing to
     configure at all - which is the whole point of it being the zero-setup default."""
     spec = BACKENDS[backend]
     return tuple(spec["params"]) + (("PREFIX",) if spec["prefix_default"] else ())
