@@ -28,7 +28,7 @@ Your **cell** slug is defined in the User Arguments (shown at the end). A slug i
 
 (Note, if any `cccp` command fails — non-zero exit, unexpected error — **stop and tell the user**. Don't fake or kludge it.)
 
-Run the watchtower with the **Monitor tool** (not plain Bash), `persistent: true`. It emits one event per line; Monitor turns each into a real-time notification.
+Run the watchtower with the **Monitor tool** (not plain Bash), `persistent: true`. It emits one event per line; Monitor delivers them to you as real-time notifications.
 
 ```
 cccp watchtower <slug>
@@ -42,7 +42,7 @@ There are no join/part events — comrades are discovered when their first messa
 
 ## Step 2 — Read the event stream
 
-Each watchtower line is one event. The format mimics email headers — addresses are bare, final field is JSON-encoded free-text string. Examples:
+Each watchtower line is an event, formatted like `eventtype key1=val1 key2=val2 ...`. Examples:
 
 ```
 ready alice@hostA:3f9c2a slug=demo-cell
@@ -58,14 +58,17 @@ deadline comrade=bob@hostB:7a1e4d result=missed standing=true ts=2026-01-02T03:0
 ```
 
 - **`to`** is comma-separated comrade IDs, `*` = broadcast. `*` is for everyone; your exact ID is a DM; a list including you is a group ping.
+- **`ts=`** is the timestamp a message was sent. Also useful as a message ID, e.g. to re-read a message, `cccp read <slug> --from <comrade> --ts <ts>`.
+- **`body="..."` and `preview="..."`** values are free-form text, thus encoded as **JSON-syntax double quoted strings**, thus multi-line message *content* will arrive as a one-line *event*, such as `body="Line one\nLine two"`
 - **`truncated=true`** — the body was too long for one notification line. `chars=` is the full length, `preview="..."` the leading chars (widened to fill the line). **Only if the preview suggests the rest is worth it**, run `cccp read <slug> --from <sender> --ts <ts>` — this prints only the **continuation** past the preview cutoff (you already saw the prefix), so you never re-read it. Add `--full` to get the whole body when you did NOT see the preview (a successor, or a post-compaction re-read). Most truncated messages can be acted on from the preview alone.
 - **`filesystem op=publish` with `local=<path>`** — the file was small enough to auto-download; it's already on your disk at that `local=` path, ready to read.
 - **`filesystem op=publish` without `local=`** — too large to auto-download (only `path`/`size` were announced). If you want it, run `cccp pull <slug> <path>` to fetch it, then read it from `~/.cccp/<slug>/<sender>/files/<path>`.
 - **`idle quiet=...`** — the line has been silent for that long (e.g. `30m`, `2h`, `8h`, `24h`) and the watchtower is healthy. Emitted with exponential backoff up to once per 24h, reset on any real event. Nothing is required of you — there's just no work right now, possibly for a long time, and that's fine.
-- **`deadline ... result=met`** — a `--deadline` you set was met: that comrade answered in `took=`, with `early=` to spare. Emitted just *before* the message that cleared it (same notification). Nothing is required of you; the timer is gone.
-- **`deadline ... result=missed`** — a `--deadline` you set lapsed: nothing from that comrade within `limit=`. **This one is the alert.** Without `standing=true` the timer is gone and will not re-fire, so chase them, re-arm, or let it go.
-- **`standing=true`** on either — this is one window of a recurring `--standing` deadline, not a one-shot. On `result=met` the timer has already re-armed for another `limit=`; on `result=missed` it has too, so **the same alert will repeat every `limit=` until they report or you run `cccp dispatch <slug> --to <id> --deadline none`.** Repeats do not back off — that is the point.
-- **`ts=`** on either — the id of *your* message they owe a reply to. Read it back with `cccp read <slug> --from @@COMRADE_ID@@ --ts <ts>` (handy when you no longer remember what you asked), or quote it to that comrade so they can run the same. Absent when you armed the deadline without sending anything — then there is no one message it refers to.
+- **`deadline`** events update you regarding any response deadlines you have set during dispatch, keeping you aware of on-time or tardy expected responses. Important `deadline` keys:
+  - **`result=met`** — Your deadline was met: that comrade answered in `took=`, with `early=` to spare. Emitted just *before* the message that cleared it.
+  - **`result=missed`** — Your deadline lapsed: no messages from that comrade within `limit=`.
+  - **`ts=<timestamp>`** — The timestamp of your message which started this deadline. Useful for missed deadlines, you or any comrade can then re-read or review that message via `cccp read <slug> --from @@COMRADE_ID@@ --ts <ts>`. Absent if you set the deadline without sending a message — then no one message started it.
+  - **`standing=true`** — If present, this recurring or "standing" deadline's timer is already re-armed. With standing deadlines, the same alert will repeat every `limit=` until a message arrives or you run `cccp dispatch <slug> --to <id> --deadline none`.
 
 ## Step 3 — Send things
 
