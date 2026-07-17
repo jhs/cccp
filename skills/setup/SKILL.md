@@ -89,16 +89,75 @@ merge — so a value you just wrote can come back tagged `env`, meaning the
 environment is overriding what you wrote, revealed by the `Set by` column:
 the write succeeded and is still being ignored.
 
-**Never put a secret in a command line.** A SAS in `argv` lands in shell history
-and in this transcript. Read it from stdin with `-` instead, and let the user
-paste it:
+Set non-confidential values yourself, several at once — account names, container
+names, prefixes all go straight in as above. Secrets do not.
+
+## How to Set a Secret
+
+A SAS token, a key, a password: **you cannot set these, and must not try.**
+
+- **You cannot read the user's keyboard.** Commands you run do not share the
+  user's stdin. `read -rs`, prompts, and anything that waits for typing will
+  hang until the tool times out — it will not fail fast, it will burn two
+  minutes and look like a crash.
+- **You must not receive the secret at all.** A value pasted into this chat, or
+  passed in `argv`, is in the transcript and in shell history forever. Do not
+  ask for it.
+
+So hand the job to the user, in a terminal you are not in. Give them all four of
+these, in this order:
+
+**1. What and why.** One or two lines: they are about to paste a SAS straight
+into cccp, and they are doing it rather than you because a secret you can see is
+a secret in the transcript.
+
+**2. How to get a shell.** Name your best guess and commit to it — a new tab
+(`Cmd-T` on macOS Terminal/iTerm, `Ctrl-Shift-T` on most Linux terminals), a new
+tmux window (`prefix c`), or another terminal window. Guess from their OS
+(`uname`) and what you have seen of their setup. Being wrong is cheap; being
+vague makes them do the thinking.
+
+**3. One copy-pastable command.** That shell has none of this session's
+environment, so build it complete:
+
+- prepend every `CCCP_*` var it needs — at minimum `CCCP_PLUGIN_DATA=<value>`,
+  since cccp refuses to guess a data directory and will otherwise just error
+- use the **absolute path** to the cccp binary; bare `cccp` is on `$PATH` only
+  inside a Claude session
+- end with `<KEY>=-`, so the value arrives on stdin and never touches `argv`
+
+Read the real values first (`echo "$CCCP_PLUGIN_DATA"`, `command -v cccp`) and
+substitute them — never hand over a command with placeholders in it:
 
 ```bash
-read -rs SAS && printf '%s' "$SAS" | cccp backend config azure-blob SAS=-
+CCCP_PLUGIN_DATA=/home/u/.claude/plugins/data/cccp-inline \
+  /home/u/.claude/plugins/cache/cccp/cccp/2.3.0/bin/cccp \
+  backend config azure-blob SAS=-
 ```
 
-Never echo a SAS back to the user, and never `cat` the config file — `cccp
-backend config` redacts secrets precisely so you don't have to.
+**4. How to paste and end input**, for their OS:
+
+- **Paste:** `Cmd-V` (macOS), `Ctrl-Shift-V` (most Linux terminals), `Ctrl-V` or
+  right-click (Windows Terminal).
+- **Then press Enter, then `Ctrl-D`.** Both, in that order. `Ctrl-D` only means
+  end-of-input at the start of an empty line: pressed right after the pasted
+  text it merely flushes that text and nothing happens, so without the Enter
+  first they need it twice and will think it has hung. (Windows `cmd` or
+  PowerShell: `Ctrl-Z` then Enter.)
+
+The paste is visible in their terminal — that is their scrollback, not this
+transcript, which is the entire point.
+
+Then have them tell you it is done, and verify it yourself. The value is theirs;
+the checking is yours:
+
+```bash
+cccp backend config azure-blob     # SAS should read <set, N chars>
+cccp backend check azure-blob
+```
+
+Never echo a secret back, and never `cat` the config file — `cccp backend
+config` redacts secrets precisely so you never have to hold one.
 
 ## How to Test and Change Backends
 

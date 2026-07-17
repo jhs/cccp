@@ -827,6 +827,27 @@ class BackendConfigKeys(unittest.TestCase):
         self.assertIn("cccp backend config azure-blob", guidance)
         self.assertNotIn("  ", guidance)      # no double space from concatenation
 
+    def test_empty_stdin_explains_why_an_agent_cannot_supply_it(self):
+        # An agent running `SAS=-` gets an empty read, because its stdin is not the
+        # user's keyboard. Not-a-tty proves nobody could have typed, so say that
+        # here rather than let it look like a mysterious empty pipe.
+        with tempfile.TemporaryDirectory() as d, _isolated_env(d), \
+                mock.patch.object(cccp.sys, "stdin", io.StringIO("")):
+            with self.assertRaises(SystemExit) as cm:
+                cccp._backend_config("azure-blob", ["SAS=-"])
+        msg = str(cm.exception)
+        self.assertIn("not a terminal", msg)
+        self.assertIn("run this command themselves", msg)
+
+    def test_guidance_hands_the_secret_to_the_user(self):
+        # The guidance renders into @@BACKEND@@, where the reader is an agent that
+        # cannot type into stdin. Telling it to run `SAS=-` itself would send it
+        # into a read that hangs until the tool times out.
+        with tempfile.TemporaryDirectory() as d, _isolated_env(d):
+            guidance = cccp._backend_setup_guidance("azure-blob")
+        self.assertIn("SAS=-", guidance)
+        self.assertIn("hand them that command", guidance)
+
     def test_guidance_flags_the_cost_of_provisioning(self):
         # This text renders into @@BACKEND@@ for every chat session - a reader that
         # never loads the setup skill and so never sees its join-vs-host framing.

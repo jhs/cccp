@@ -1994,9 +1994,11 @@ def _backend_setup_guidance(backend):
             "Set it up one of two ways, then `cccp backend check azure-blob` to "
             "test it (or `cccp backend use azure-blob` to test and activate it):\n"
             "- **Use an existing hub** — `cccp backend config azure-blob "
-            "ACCOUNT=<account> CONTAINER=<container> SAS=-`. The `-` reads the "
-            "token from stdin, keeping it out of shell history; exporting "
-            "`CCCP_AZURE_BLOB_*` in your environment works too.\n"
+            "ACCOUNT=<account> CONTAINER=<container>`, then the token with "
+            "`cccp backend config azure-blob SAS=-`, where `-` reads it from "
+            "stdin so it never reaches argv. Only the user can type it: an "
+            "agent's stdin is not their keyboard, so hand them that command "
+            "rather than running it. `/cccp:setup` walks through it.\n"
             "- **Provision your own** — `infra/azure/apply.sh` (Terraform) stands "
             "up a hub and writes that config for you. It deploys real "
             "infrastructure and spends money: confirm with the user first.")
@@ -2696,7 +2698,16 @@ def _backend_config(name, assignments):
         if value == "-":
             value = sys.stdin.read().strip()
             if not value:
-                sys.exit(f"error: no value for {key} on stdin.")
+                # Not a terminal means nobody could have typed anything: the caller
+                # is a script or an agent, and an agent's stdin is not the user's
+                # keyboard. That is the whole reason this path exists, so say so
+                # here rather than let it read as a mysterious empty pipe.
+                hint = "" if sys.stdin.isatty() else (
+                    " stdin is not a terminal, so nothing could be typed into it. "
+                    "An agent cannot read the user's keyboard: have the user run "
+                    "this command themselves, in their own terminal, with "
+                    "CCCP_PLUGIN_DATA set and cccp's full path.")
+                sys.exit(f"error: no value for {key} on stdin.{hint}")
         _write_kv(path, key, value or None)
         print(f"{'Set' if value else 'Cleared'} {key}")
     print(f"\nValidate it with: cccp backend check {name}")
