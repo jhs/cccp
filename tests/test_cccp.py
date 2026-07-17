@@ -629,11 +629,18 @@ class BackendStatusTable(unittest.TestCase):
                 cccp._backend_status(cfg, True, "ready")
             return buf.getvalue()
 
+    def _header(self, **env):
+        """The table's header line, wherever it sits under the status line."""
+        for line in self._status(**env).splitlines():
+            if "Config key" in line:
+                return line
+        self.fail("no table header printed")
+
     def test_local_fs_still_gets_a_provenance_row(self):
         out = self._status()
-        self.assertIn("CCCP_PLUGIN_DATA", out)
-        self.assertIn(self.data, out)          # the actual data root, not a guess
-        self.assertIn("(env)", out)            # ...with its layer, like any key
+        row = [l for l in out.splitlines() if "CCCP_PLUGIN_DATA" in l][0]
+        self.assertIn(self.data, row)          # the actual data root, not a guess
+        self.assertIn("env", row)              # ...with its layer, like any key
 
     def test_data_dir_row_leads_every_backend(self):
         out = self._status(CCCP_ACTIVE_BACKEND="azure-blob",
@@ -651,6 +658,27 @@ class BackendStatusTable(unittest.TestCase):
                            CCCP_AZURE_BLOB_SAS="sig-do-not-print")
         self.assertNotIn("sig-do-not-print", out)
         self.assertIn("<set, 16 chars>", out)
+
+    def test_columns_are_labelled(self):
+        # One unlabelled row is unreadable: a bare "(env)" says nothing about what
+        # it is. The setup skill sends Claude here to read a named column.
+        head = self._header()
+        self.assertIn("Config key", head)
+        self.assertIn("Set by", head)
+        self.assertIn("Value", head)
+
+    def test_skill_names_the_column_the_cli_prints(self):
+        # The skill says to read the `Set by` column. If the header is ever renamed,
+        # the instruction silently becomes a lie - this is what catches that.
+        here = os.path.dirname(os.path.abspath(__file__))
+        skill = Path(here, os.pardir, "skills", "setup", "SKILL.md").read_text()
+        self.assertIn("`Set by`", skill)
+        self.assertIn("Set by", self._header())
+
+    def test_value_column_is_last_so_long_paths_cannot_misalign(self):
+        # A data-dir path can run 90+ chars. Any column after it would be shoved off
+        # the edge, and every short value padded out to match.
+        self.assertTrue(self._header().rstrip().endswith("Value"), self._header())
 
 
 class BackendConfigWrite(unittest.TestCase):

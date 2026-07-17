@@ -2026,15 +2026,19 @@ def backend_status_block():
         return ("Your CCCP config could not be resolved. Run `cccp backend` to "
                 "inspect it, then fix it or escalate to the user.")
     summary = BACKENDS.get(backend, {}).get("summary", "")
+    # Neither line offers to list the backends: `cccp backend` reports this session's
+    # state, and the roster lives in the setup skill, which this reader has not
+    # loaded. Point at that skill instead of promising output that no longer exists.
     if ok:
         return (f"Current backend: `{backend}` — {summary}. "
-                f"To list all backends or switch, run `cccp backend`.")
+                f"To inspect or change it, run `cccp backend`; `/cccp:setup` is the "
+                f"skill for backend setup.")
     return (f"**NOT READY — `{backend}`: {detail}.** Chat will not work until this "
             f"is fixed.\n\n"
             f"{_backend_setup_guidance(backend)}\n\n"
-            f"To list every backend or switch, run `cccp backend` "
-            f"(`cccp backend use <name>` to change it). If you can't resolve it, "
-            f"escalate to the user.")
+            f"Run `cccp backend` to inspect it, or `cccp backend use <name>` to "
+            f"change it. If you can't resolve it, escalate to the user and point "
+            f"them at `/cccp:setup`, the skill for backend setup.")
 
 
 def cmd_skill(args):
@@ -2570,27 +2574,55 @@ def _fmt_param(backend, key, value):
     return value
 
 
-def _print_row(key, shown, layers, raw=None):
-    """One line of the resolved-config table: the key, its (already redacted) value,
-    and the config layer that won it. A key set in more than one layer is flagged,
-    because a stale env var shadowing a config file is the failure that wastes an
-    afternoon."""
-    # No layer set it: either a default filled it in (PREFIX) or nothing did. Saying
-    # "default" for a missing required param would imply a default exists to fall
-    # back on, and none does.
-    origin = layers[-1] if layers else ("default" if raw else "unset")
-    note = f"   <- shadows {', '.join(layers[:-1])}" if len(layers) > 1 else ""
-    print(f"  {key:<28} {shown:<20} ({origin}){note}")
+def _config_rows(cfg):
+    """Every resolved config value for the active backend, as
+    (key, display value, layers that set it, raw value) rows: the global data root
+    first, then the backend's own params."""
+    active = cfg["BACKEND"]
+    root = str(plugin_data_dir())
+    rows = [("CCCP_PLUGIN_DATA", root, ["env"], root)]
+    for key in _config_keys(active):
+        qualified = _backend_key(active, key)
+        raw = cfg["PREFIX"] if key == "PREFIX" else cfg["PARAMS"].get(key.lower())
+        rows.append((qualified, _fmt_param(active, key, raw),
+                     cfg["SOURCES"].get(qualified, []), raw))
+    return rows
 
 
-def _print_params(backend, values, sources):
-    """The resolved param table for one backend. `values` maps a bare param name to
-    its resolved value; `sources` is resolve_config's SOURCES."""
-    for key in _config_keys(backend):
-        qualified = _backend_key(backend, key)
-        raw = values.get(key)
-        _print_row(qualified, _fmt_param(backend, key, raw),
-                   sources.get(qualified, []), raw=raw)
+def _print_config_table(rows, show_source=True):
+    """Print config values as an aligned, labelled table.
+
+    Columns are named and widths come from the content, because this output has to
+    be unambiguous to a reader who sees only one row: a bare `(env)` hanging off a
+    lone line says nothing about what it is. `Set by` is the whole point of the
+    status view - it names the layer that won each key - so it is a labelled column,
+    and a key set in more than one layer is flagged there. The config-file view
+    passes show_source=False: everything it prints came from the one file it just
+    named, so the column would only ever repeat itself.
+
+    Value goes LAST because it is the one unbounded column - a data-dir path can run
+    90 characters and would otherwise shove `Set by` off the right edge, padding
+    every short value out to match. Last, it just trails off and nothing after it
+    needs to line up. It also reads as a sentence: <key>, set by <layer>, is
+    <value>."""
+    kw = max(len(r[0]) for r in rows)
+    if not show_source:
+        print(f"  {'Config key':<{kw}}  Value")
+        for key, shown, _, _ in rows:
+            print(f"  {key:<{kw}}  {shown}".rstrip())
+        return
+    out = []
+    for key, shown, layers, raw in rows:
+        # No layer set it: either a default filled it in (PREFIX) or nothing did.
+        # Saying "default" for a missing required param would imply a default exists
+        # to fall back on, and none does.
+        origin = layers[-1] if layers else ("default" if raw else "unset")
+        note = (f"   <- shadows {', '.join(layers[:-1])}" if len(layers) > 1 else "")
+        out.append((key, origin, shown + note))
+    sw = max([len(o) for _, o, _ in out] + [len("Set by")])
+    print(f"  {'Config key':<{kw}}  {'Set by':<{sw}}  Value")
+    for key, origin, shown in out:
+        print(f"  {key:<{kw}}  {origin:<{sw}}  {shown}".rstrip())
 
 
 def _backend_status(cfg, ok, detail):
@@ -2602,18 +2634,7 @@ def _backend_status(cfg, ok, detail):
     print(f"Active backend: {active}  "
           f"[{'READY' if ok else 'NOT READY - ' + detail}]")
     print()
-    # CCCP_PLUGIN_DATA leads the table: it is a config key like any other, just
-    # global rather than backend-scoped. Its layer is always `env` - every file in
-    # the merge lives inside it, so nothing below the environment could name it.
-    # It also earns the row twice over: it IS the whole of local-fs's config (which
-    # otherwise has no params and so printed no table at all, leaving the default
-    # backend showing nothing), and it is the value most likely to surprise.
-    _print_row("CCCP_PLUGIN_DATA", str(plugin_data_dir()), ["env"])
-    keys = _config_keys(active)
-    if keys:
-        values = {k: cfg["PARAMS"].get(k.lower()) for k in keys}
-        values["PREFIX"] = cfg["PREFIX"]
-        _print_params(active, values, cfg["SOURCES"])
+    _print_config_table(_config_rows(cfg))
     if not ok:
         print()
         print(_backend_setup_guidance(active))
@@ -2649,12 +2670,20 @@ def _backend_config(name, assignments):
               f"{'' if path.exists() else '   (not created yet)'}")
         if not keys:
             print(f"\n{name} takes no configuration - it is ready as soon as "
-                  f"$CCCP_PLUGIN_DATA is writable.")
+                  f"$CCCP_PLUGIN_DATA is writable. Run `cccp backend` to see the "
+                  f"data directory it will use.")
             return
         print()
         stored = _read_kv_file(path)
-        _print_params(name, {k: stored.get(_backend_key(name, k)) for k in keys},
-                      {k: ["config"] for k in stored})
+        _print_config_table(
+            [(_backend_key(name, k), _fmt_param(name, k, stored.get(_backend_key(name, k))),
+              [], stored.get(_backend_key(name, k))) for k in keys],
+            show_source=False)
+        # This view is ONE file. The environment outranks it, so what cccp actually
+        # resolves can differ from what is printed here - `cccp backend` is the view
+        # that merges the layers and says which one won.
+        print("\nThis file is one config layer; your environment outranks it. "
+              "Run `cccp backend` for the values cccp actually resolves.")
         return
     if not keys:
         sys.exit(f"error: {name!r} takes no configuration.")
@@ -2687,16 +2716,11 @@ def cmd_backend(args):
         _backend_config(args.name, args.assignments)
         return
     cfg = resolve_config()
-    active = cfg["BACKEND"]
     ok, detail = validate_backend(cfg, network=True)
     _backend_status(cfg, ok, detail)
-    # Which backends exist is a fact, so it stays; what each one IS belongs to the
-    # setup skill. This list has to survive here even so: @@BACKEND@@ sends a
-    # chat-family session to `cccp backend`, and that session never loads the setup
-    # skill, so the CLI is the only place it can learn the names.
-    print()
-    for name in BACKENDS:
-        print(f" {'->' if name == active else '  '} {name}")
+    # No catalog of backends here. The status line already names the active one, and
+    # the roster with what each one costs belongs to skills/setup/SKILL.md. A bad
+    # name still lists the valid ones (see _require_backend), so nothing is lost.
     print()
     print("To test:      cccp backend check [<name>]")
     print("To configure: cccp backend config <name>")
@@ -2739,7 +2763,8 @@ def build_parser():
     bk_sub = bk.add_subparsers(dest="action", metavar="{use,check,config}")
 
     bk_use = bk_sub.add_parser("use", help="Switch the active backend and persist it.")
-    bk_use.add_argument("name", help="Backend to activate (see `cccp backend`).")
+    bk_use.add_argument("name", help="Backend to activate; an unknown name "
+                                     "lists the valid ones.")
 
     bk_check = bk_sub.add_parser(
         "check", help="Validate a backend without switching to it.")

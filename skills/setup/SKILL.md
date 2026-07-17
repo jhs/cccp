@@ -50,17 +50,21 @@ came from:
 cccp backend
 ```
 
-Read the provenance column before believing anything. Config merges
-`settings` < `backend/<name>/config` < **process env**, so an exported `CCCP_*`
-var silently wins over the file. A value tagged `(env) <- shadows config` is
-almost always the bug: the file is right and a stale env var is overriding it.
-Fix the environment, not the file.
+Read the **`Set by`** column before believing anything — it names the config
+layer each value actually came from. Config merges `settings` <
+`backend/<name>/config` < **process env**, so an exported `CCCP_*` var silently
+wins over the file. A row reading `env   <- shadows config` is almost always the
+bug: the file is right and a stale env var is overriding it. Fix the
+environment, not the file.
 
 `CCCP_PLUGIN_DATA` heads the table on every backend — it is where all cell data
-and config actually live, and it is always `(env)`, since every config file sits
+and config actually live, and it is always `env`, since every config file sits
 inside it. On `local-fs` it is the *only* row: that backend takes no parameters,
 so the data directory is the whole of its configuration. A one-row table there is
 correct, not a fault.
+
+`cccp backend` reports **this session's state**, not a catalog — the backends it
+can switch to are the table at the top of this skill. Don't ask it to list them.
 
 If `cccp` exits with an error instead of a report, read the error rather than
 working around it — it carries its own fix. `CCCP_PLUGIN_DATA is not set` means
