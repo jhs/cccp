@@ -679,21 +679,28 @@ class AzureBlobBackend:
         return st, (int(size) if st == 200 and size is not None else None)
 
     def list(self, prefix):
-        """List blobs under a prefix. Returns {name: {"size", "last_modified"}}."""
-        st, _, body = self.request(
-            "GET", "",
-            query=f"restype=container&comp=list&prefix={urllib.parse.quote(prefix)}")
-        if st != 200:
-            raise BlobError(st, body)
-        root = ET.fromstring(body)
+        """List blobs under a prefix, following continuation markers so a cell
+        past Azure's 5000-results-per-page cap is still seen whole. Returns
+        {name: {"size", "last_modified"}}."""
         out = {}
-        for b in root.findall(".//Blob"):
-            name = b.findtext("Name")
-            props = b.find("Properties")
-            size = props.findtext("Content-Length") if props is not None else None
-            lm = props.findtext("Last-Modified") if props is not None else None
-            out[name] = {"size": int(size) if size else 0, "last_modified": lm}
-        return out
+        marker = ""
+        while True:
+            query = f"restype=container&comp=list&prefix={urllib.parse.quote(prefix)}"
+            if marker:
+                query += f"&marker={urllib.parse.quote(marker)}"
+            st, _, body = self.request("GET", "", query=query)
+            if st != 200:
+                raise BlobError(st, body)
+            root = ET.fromstring(body)
+            for b in root.findall(".//Blob"):
+                name = b.findtext("Name")
+                props = b.find("Properties")
+                size = props.findtext("Content-Length") if props is not None else None
+                lm = props.findtext("Last-Modified") if props is not None else None
+                out[name] = {"size": int(size) if size else 0, "last_modified": lm}
+            marker = root.findtext("NextMarker") or ""
+            if not marker:
+                return out
 
     def delete(self, path):
         """DELETE a blob. Returns the status (202 deleted, 404 absent - both fine)."""

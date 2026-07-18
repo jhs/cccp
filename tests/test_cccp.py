@@ -434,6 +434,44 @@ class _FakeBlobClient:
         return (404, b"") if b is None else (206, b[:nbytes])
 
 
+class AzureListPagination(unittest.TestCase):
+    """list() must follow NextMarker: Azure caps List Blobs at 5000 results per
+    page, and a truncated view silently hides comrades past the marker."""
+
+    PAGE1 = (b'<?xml version="1.0" encoding="utf-8"?>'
+             b'<EnumerationResults><Blobs>'
+             b'<Blob><Name>cell/a/gazette.jsonl</Name><Properties>'
+             b'<Content-Length>10</Content-Length>'
+             b'<Last-Modified>Fri, 17 Jul 2026 00:00:00 GMT</Last-Modified>'
+             b'</Properties></Blob>'
+             b'</Blobs><NextMarker>tok1</NextMarker></EnumerationResults>')
+    PAGE2 = (b'<?xml version="1.0" encoding="utf-8"?>'
+             b'<EnumerationResults><Blobs>'
+             b'<Blob><Name>cell/b/gazette.jsonl</Name><Properties>'
+             b'<Content-Length>20</Content-Length>'
+             b'<Last-Modified>Fri, 17 Jul 2026 00:00:01 GMT</Last-Modified>'
+             b'</Properties></Blob>'
+             b'</Blobs><NextMarker /></EnumerationResults>')
+
+    def test_follows_next_marker(self):
+        be = cccp.AzureBlobBackend("acct", "cont", "sig=x")
+        pages = [self.PAGE1, self.PAGE2]
+        queries = []
+
+        def fake_request(method, path, query="", **kw):
+            queries.append(query)
+            return 200, {}, pages.pop(0)
+
+        be.request = fake_request
+        out = be.list("cell/")
+        self.assertEqual(
+            set(out), {"cell/a/gazette.jsonl", "cell/b/gazette.jsonl"})
+        self.assertEqual(out["cell/b/gazette.jsonl"]["size"], 20)
+        self.assertEqual(len(queries), 2)
+        self.assertNotIn("marker=", queries[0])
+        self.assertIn("marker=tok1", queries[1])
+
+
 class SelfAliasLearning(unittest.TestCase):
     """Issue #1: an armed watchtower must learn its OWN comrade's intro - the
     declaring comrade appends to its own gazette, so skipping self entirely made
