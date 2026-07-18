@@ -492,7 +492,7 @@ class SelfAliasLearning(unittest.TestCase):
         self.client = _FakeBlobClient()
 
     def _gazette(self, comrade):
-        return f"{cccp.cell_head('', self.SLUG)}{comrade}/gazette.jsonl"
+        return cccp.gazette_path("", self.SLUG, comrade)
 
     def _intro(self, frm, alias, ts):
         return {"type": "message", "from": frm, "ts": ts, "to": ["*"],
@@ -671,11 +671,16 @@ class BackendPaths(unittest.TestCase):
         self.assertEqual(cccp.cell_head("", "demo"), "demo/")
         self.assertEqual(cccp.cell_head("__default__", "demo"), "__default__/demo/")
 
-    def test_comrade_and_gazette_paths(self):
-        self.assertEqual(cccp.comrade_path("", "demo", "u@h:aaa", "files/x"),
-                         "demo/u@h:aaa/files/x")
+    def test_gazette_and_published_paths(self):
         self.assertEqual(cccp.gazette_path("__default__", "demo", "u@h:aaa"),
-                         "__default__/demo/u@h:aaa/gazette.jsonl")
+                         "__default__/demo/gazettes/u@h:aaa.jsonl")
+        self.assertEqual(cccp.gazettes_head("", "demo"), "demo/gazettes/")
+        # The wire path keeps its files/ prefix; the blob key regroups it under
+        # the cell-level files/ area, outside the polled gazettes/ prefix.
+        self.assertEqual(cccp.published_blob("", "demo", "u@h:aaa", "files/x"),
+                         "demo/files/u@h:aaa/x")
+        self.assertEqual(cccp.published_blob("p", "demo", "u@h:aaa", "files/a/b"),
+                         "p/demo/files/u@h:aaa/a/b")
 
     def test_backend_key_namespacing(self):
         self.assertEqual(cccp._backend_key("azure-blob", "SAS"), "CCCP_AZURE_BLOB_SAS")
@@ -1166,7 +1171,7 @@ class AppendDispatchReadBack(unittest.TestCase):
 
     def test_honest_store_round_trips(self):
         cccp.append_dispatch(self.b, "p", "cell", "u@h:aaa", {"type": "message"})
-        st, body = self.b.get("p/cell/u@h:aaa/gazette.jsonl")
+        st, body = self.b.get("p/cell/gazettes/u@h:aaa.jsonl")
         self.assertEqual(st, 200)
         self.assertEqual(json.loads(body), {"type": "message"})
 

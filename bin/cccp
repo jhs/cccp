@@ -15,8 +15,8 @@ Two ship today:
 
 Storage layout (a cell is a store + prefix + slug; local-fs uses no prefix):
 
-    <prefix>/<slug>/<comrade-id>/gazette.jsonl   append-only, their messages
-    <prefix>/<slug>/<comrade-id>/files/<path>    shared files
+    <prefix>/<slug>/gazettes/<comrade-id>.jsonl   append-only, their messages
+    <prefix>/<slug>/files/<comrade-id>/<path>     shared files
 
 A comrade is registered in a cell purely by having a gazette - identity is a
 local `user@host:<session>` computed offline, so there is no claim blob and no
@@ -64,7 +64,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 API_VERSION = "2023-11-03"
-CCCP_VERSION = "2.4.1"     # Shown on the watchtower `ready` line (v=...) so a
+CCCP_VERSION = "3.0.0"     # Shown on the watchtower `ready` line (v=...) so a
                            # comrade's Claude can see which build it is running.
                            # Cosmetic only - nothing reads it. KEEP EQUAL to the
                            # version in .claude-plugin/plugin.json - the single
@@ -841,9 +841,22 @@ def cell_head(prefix, slug):
     return f"{prefix}/{slug}/" if prefix else f"{slug}/"
 
 
-def comrade_path(prefix, slug, comrade, rest):
-    """A blob path in one comrade's area: '<cell-head><comrade>/<rest>'."""
-    return f"{cell_head(prefix, slug)}{comrade}/{rest}"
+def gazettes_head(prefix, slug):
+    """The blob-name prefix holding every gazette in a cell. Gazettes live under
+    their own prefix - apart from published files - so the hot path (the
+    watchtower's poll LIST, the roster) enumerates one blob per all-time comrade
+    and never pays for the cell's accumulated file blobs. 'gazettes' cannot
+    collide with a comrade id: ids always carry '@' and ':'."""
+    return f"{cell_head(prefix, slug)}gazettes/"
+
+
+def published_blob(prefix, slug, sender, wire_path):
+    """The blob key for a published file: '<cell-head>files/<sender>/<rel>'.
+    The wire path keeps its 'files/' prefix (it doubles as the mirror-relative
+    path); the blob key groups all publishes under one cell-level files/ area,
+    outside the gazettes/ prefix the poll loop lists."""
+    rel = wire_path[len("files/"):] if wire_path.startswith("files/") else wire_path
+    return f"{cell_head(prefix, slug)}files/{sender}/{rel}"
 
 
 # ---------- identity & roster ----------
@@ -868,13 +881,15 @@ def comrade_id():
 
 
 def cell_roster(client, prefix, slug):
-    """Return the sorted comrade ids registered in a cell."""
-    head = cell_head(prefix, slug)
+    """Return the sorted comrade ids registered in a cell. Gazette ownership IS
+    registration: every participation event (publish included) appends to the
+    sender's gazette, so listing gazettes/ alone sees everyone."""
+    head = gazettes_head(prefix, slug)
     comrades = set()
     for name in client.list(head):
         rest = name[len(head):]
-        if "/" in rest:
-            comrades.add(rest.split("/", 1)[0])
+        if rest.endswith(".jsonl") and "/" not in rest:
+            comrades.add(rest[:-len(".jsonl")])
     return sorted(comrades)
 
 
@@ -915,7 +930,7 @@ def journal_records(data, on_bad=None):
 # ---------- gazette ----------
 
 def gazette_path(prefix, slug, comrade):
-    return comrade_path(prefix, slug, comrade, "gazette.jsonl")
+    return f"{gazettes_head(prefix, slug)}{comrade}.jsonl"
 
 
 def append_dispatch(client, prefix, slug, me, dispatch):
@@ -1064,7 +1079,7 @@ def download_to_mirror(client, prefix, slug, sender, wire_path,
     everybody-trusts-everybody environment, so the check surfaces bugs, not
     attackers.
     """
-    st, body = client.get(comrade_path(prefix, slug, sender, wire_path))
+    st, body = client.get(published_blob(prefix, slug, sender, wire_path))
     if st != 200:
         raise BlobError(st, b"download failed")
     if expect_size is not None and len(body) != expect_size:
@@ -1255,7 +1270,6 @@ class Watchtower:
         self.prefix = prefix
         self.slug = slug
         self.me = me
-        self.head = cell_head(prefix, slug)
         # Alias support is opt-in: with no --alias-trigger, `self.trigger` is None
         # and the whole feature is inert (no seed, no learn, no translation).
         self.trigger = trigger
@@ -1367,17 +1381,17 @@ class Watchtower:
         return gap
 
     def _scan(self):
-        """List gazettes in the cell prefix: comrade -> {"size", "last_modified"}."""
+        """List the cell's gazettes: comrade -> {"size", "last_modified"}. Lists
+        only the gazettes/ prefix, so the cost is one blob per all-time comrade
+        regardless of how many files the cell has accumulated."""
         with TimeLogger(self.log, "scan") as t:
             gazettes = {}
-            blobs = self.client.list(self.head)
+            head = gazettes_head(self.prefix, self.slug)
+            blobs = self.client.list(head)
             for name, props in blobs.items():
-                rest = name[len(self.head):]
-                if "/" not in rest:
-                    continue
-                comrade, leaf = rest.split("/", 1)
-                if leaf == "gazette.jsonl":
-                    gazettes[comrade] = props
+                rest = name[len(head):]
+                if rest.endswith(".jsonl") and "/" not in rest:
+                    gazettes[rest[:-len(".jsonl")]] = props
             t.done(blobs=len(blobs), gazettes=len(gazettes))
             return gazettes
 
@@ -1414,7 +1428,7 @@ class Watchtower:
                 except (TypeError, ValueError):
                     pass
             st, data = self.client.get_head(
-                f"{self.head}{comrade}/gazette.jsonl", ALIAS_SEED_BYTES)
+                gazette_path(self.prefix, self.slug, comrade), ALIAS_SEED_BYTES)
             if st not in (200, 206):
                 continue
             for chunk in data.splitlines():
@@ -1694,7 +1708,7 @@ class Watchtower:
             if props["size"] <= offset:
                 continue
             st, data = self.client.get_range(
-                f"{self.head}{comrade}/gazette.jsonl", offset)
+                gazette_path(self.prefix, self.slug, comrade), offset)
             if st not in (200, 206):
                 continue
             records, consumed = journal_records(
@@ -2375,8 +2389,7 @@ def cmd_rm(args):
         if not blobs:
             print(f"cell {slug!r} is empty or does not exist - nothing to delete")
             return
-        comrades = sorted({n[len(head):].split("/", 1)[0]
-                           for n in blobs if "/" in n[len(head):]})
+        comrades = cell_roster(client, cfg["PREFIX"], slug)
         print(f"cell {slug!r}: {len(blobs)} blobs across {len(comrades)} comrades "
               f"({', '.join(comrades)})")
         if not args.yes:
@@ -2413,7 +2426,7 @@ def cmd_publish(args):
 
         rel = str(src).lstrip("/")
         data = src.read_bytes()
-        blob = comrade_path(cfg["PREFIX"], slug, me, f"files/{rel}")
+        blob = published_blob(cfg["PREFIX"], slug, me, f"files/{rel}")
         with TimeLogger(log, "publish_upload", path=rel, size=size):
             st = client.put_block(blob, data)
         if st != 201:
@@ -2448,7 +2461,7 @@ def cmd_unpublish(args):
     with subcommand_footer(log):
         src = Path(os.path.abspath(os.path.expanduser(args.path)))
         rel = str(src).lstrip("/")
-        client.delete(comrade_path(cfg["PREFIX"], slug, me, f"files/{rel}"))  # 404 ok
+        client.delete(published_blob(cfg["PREFIX"], slug, me, f"files/{rel}"))  # 404 ok
         d = {"type": "filesystem", "op": "unpublish", "ts": now_iso(), "from": me,
              "to": args.to if args.to else ["*"], "path": f"files/{rel}"}
         append_dispatch(client, cfg["PREFIX"], slug, me, d)

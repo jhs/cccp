@@ -62,12 +62,14 @@ A cell is a `slug` in a shared store, with an optional `prefix` for room to grow
 (`local-fs` uses none). Everything is just blobs under that prefix:
 
 ```
-<prefix>/<slug>/<comrade-id>/gazette.jsonl   append-only  (their messages)
-<prefix>/<slug>/<comrade-id>/files/<path>    files        (shared files)
+<prefix>/<slug>/gazettes/<comrade-id>.jsonl   append-only  (their messages)
+<prefix>/<slug>/files/<comrade-id>/<path>     files        (shared files)
 ```
 
-Each comrade only ever writes under their own `<comrade-id>/` and reads
-everyone's. A comrade id is a purely local `user@host:<session>` — no claim, no
+Gazettes live under their own `gazettes/` prefix so the hot path — the
+watchtower's poll listing — enumerates one blob per comrade, no matter how many
+shared files the cell accumulates. Each comrade only ever writes their own
+gazette and their own `files/<comrade-id>/` area, and reads everyone's. A comrade id is a purely local `user@host:<session>` — no claim, no
 coordination — so a comrade is registered simply by having a gazette. There are
 no peer connections and no server process — just a shared store. That's the
 whole protocol; the rest is ergonomics.
