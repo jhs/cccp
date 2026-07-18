@@ -1075,8 +1075,10 @@ class LocalFilesRoundTrip(unittest.TestCase):
         p = "demo/u@h:aaa/gazette.jsonl"
         self.assertEqual(self.b.ensure_append_blob(p), 201)
         self.assertEqual(self.b.ensure_append_blob(p), 409)      # exists now
-        self.assertEqual(self.b.append_block(p, b"line1\n"), 201)
-        self.assertEqual(self.b.append_block(p, b"line2\n"), 201)
+        self.assertEqual(self.b.append_block(p, b"line1\n"), (201, 0))
+        self.assertEqual(self.b.append_block(p, b"line2\n"), (201, 6))
+        self.assertEqual(self.b.stat(p), (200, 12))
+        self.assertEqual(self.b.stat("demo/nope"), (404, None))
         self.assertEqual(self.b.get(p), (200, b"line1\nline2\n"))
         self.assertEqual(self.b.get_range(p, 6), (206, b"line2\n"))
         self.assertEqual(self.b.get_range(p, 0), (200, b"line1\nline2\n"))
@@ -1096,6 +1098,60 @@ class LocalFilesRoundTrip(unittest.TestCase):
         p = "c/x/gazette.jsonl"
         self.b.append_block(p, b"abc")
         self.assertEqual(self.b.get_range(p, 10), (416, b""))
+
+
+class AppendDispatchReadBack(unittest.TestCase):
+    """append_dispatch must verify the line against the store, not trust the
+    write status (#7): a 201 whose bytes are not readable back is NOT delivered
+    and must raise."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.b = cccp.LocalFilesBackend(self._tmp.name)
+
+    def test_honest_store_round_trips(self):
+        cccp.append_dispatch(self.b, "p", "cell", "u@h:aaa", {"type": "message"})
+        st, body = self.b.get("p/cell/u@h:aaa/gazette.jsonl")
+        self.assertEqual(st, 200)
+        self.assertEqual(json.loads(body), {"type": "message"})
+
+    def test_forged_201_without_persist_raises(self):
+        # A store (or middlebox) that says 201 but never persists: the #7
+        # incident shape. The read-back must catch it at send time.
+        self.b.append_block = lambda path, data: (201, 0)
+        with self.assertRaises(cccp.BlobError) as ctx:
+            cccp.append_dispatch(self.b, "p", "cell", "u@h:aaa", {"t": 1})
+        self.assertIn(b"NOT delivered", ctx.exception.body)
+
+    def test_201_without_offset_raises(self):
+        self.b.append_block = lambda path, data: (201, None)
+        with self.assertRaises(cccp.BlobError):
+            cccp.append_dispatch(self.b, "p", "cell", "u@h:aaa", {"t": 1})
+
+    def test_truncated_persist_raises(self):
+        # Store keeps only a prefix of the line: read-back mismatch.
+        real = self.b.append_block
+        self.b.append_block = lambda path, data: real(path, data[: len(data) // 2])
+        with self.assertRaises(cccp.BlobError):
+            cccp.append_dispatch(self.b, "p", "cell", "u@h:aaa", {"t": 1})
+
+
+class JournalRecordsOnBad(unittest.TestCase):
+    """Malformed journal lines are skipped-but-consumed; on_bad makes the skip
+    observable so data loss and parse bugs stop looking identical (#7)."""
+
+    def test_on_bad_sees_each_malformed_line(self):
+        bad = []
+        data = b'{"a":1}\nnot json\n{"b":2}\n'
+        records, consumed = cccp.journal_records(data, on_bad=bad.append)
+        self.assertEqual(records, [{"a": 1}, {"b": 2}])
+        self.assertEqual(consumed, len(data))
+        self.assertEqual(bad, [b"not json\n"])
+
+    def test_on_bad_omitted_still_skips(self):
+        records, consumed = cccp.journal_records(b"junk\n{\"a\":1}\n")
+        self.assertEqual(records, [{"a": 1}])
 
 
 if __name__ == "__main__":

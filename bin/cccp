@@ -662,8 +662,20 @@ class AzureBlobBackend:
                                      "If-None-Match": "*"})[0]
 
     def append_block(self, path, data):
-        """Append bytes to the end of an append blob."""
-        return self.request("PUT", path, query="comp=appendblock", data=data)[0]
+        """Append bytes to the end of an append blob. Returns (status, offset):
+        the byte position the block landed at (x-ms-blob-append-offset), or None
+        when the response carries no offset - which a genuine 201 never omits."""
+        st, hdrs, _ = self.request("PUT", path, query="comp=appendblock", data=data)
+        off = next((v for k, v in hdrs.items()
+                    if k.lower() == "x-ms-blob-append-offset"), None)
+        return st, (int(off) if off is not None else None)
+
+    def stat(self, path):
+        """HEAD a blob. Returns (status, size) - size None unless status 200."""
+        st, hdrs, _ = self.request("HEAD", path)
+        size = next((v for k, v in hdrs.items()
+                     if k.lower() == "content-length"), None)
+        return st, (int(size) if st == 200 and size is not None else None)
 
     def list(self, prefix):
         """List blobs under a prefix. Returns {name: {"size", "last_modified"}}."""
@@ -746,12 +758,21 @@ class LocalFilesBackend:
             return 409
 
     def append_block(self, path, data):
-        """Append bytes to the end of the file. 201 mirrors an Azure appendblock."""
+        """Append bytes to the end of the file. Returns (201, offset), mirroring
+        an Azure appendblock and its x-ms-blob-append-offset."""
         p = self._abs(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         with open(p, "ab") as f:
+            off = f.tell()
             f.write(data)
-        return 201
+        return 201, off
+
+    def stat(self, path):
+        """The file's size. Returns (status, size) - (404, None) when absent."""
+        try:
+            return 200, self._abs(path).stat().st_size
+        except FileNotFoundError:
+            return 404, None
 
     def list(self, prefix):
         """Blobs under `prefix`. Returns {name: {"size", "last_modified"}} with
@@ -857,7 +878,7 @@ def cell_roster(client, prefix, slug):
 # rather than a second implementation of the accounting, which is where the bugs
 # would live.
 
-def journal_records(data):
+def journal_records(data, on_bad=None):
     """Parse complete JSON lines out of one read of a journal.
 
     Returns (records, consumed). `consumed` is how many bytes of `data` are
@@ -865,7 +886,9 @@ def journal_records(data):
     A partial trailing line is left UNCONSUMED - the writer is still mid-append,
     so the next read picks that line up whole. An unparseable complete line is
     skipped but still consumed: it can never be repaired, so re-reading it every
-    poll forever would be the worse failure.
+    poll forever would be the worse failure. Skipping must not be SILENT though
+    (#7: a transport where data loss and a parse bug look identical is
+    undebuggable) - `on_bad`, when given, is called with each skipped line.
     """
     records, consumed = [], 0
     for chunk in data.splitlines(keepends=True):
@@ -875,6 +898,8 @@ def journal_records(data):
         try:
             records.append(json.loads(chunk))
         except ValueError:
+            if on_bad:
+                on_bad(chunk)
             continue   # malformed: skipped, but consumed so we never re-read it
     return records, consumed
 
@@ -886,13 +911,27 @@ def gazette_path(prefix, slug, comrade):
 
 
 def append_dispatch(client, prefix, slug, me, dispatch):
-    """Append one dispatch (a JSON object) as a line to my gazette append blob."""
+    """Append one dispatch (a JSON object) as a line to my gazette append blob,
+    then read it back from the store.
+
+    The read-back is the delivery guarantee (#7): exit 0 must mean "the store
+    has it", not "the store said yes". A middlebox or store that returns 201
+    without persisting is caught here, at send time, instead of surfacing as a
+    peer's silence days later. Costs one ranged GET per send."""
     path = gazette_path(prefix, slug, me)
     client.ensure_append_blob(path)
     line = (json.dumps(dispatch, separators=(",", ":")) + "\n").encode("utf-8")
-    st = client.append_block(path, line)
+    st, offset = client.append_block(path, line)
     if st != 201:
         raise BlobError(st, b"gazette append failed")
+    if offset is None:
+        raise BlobError(st, b"gazette append returned no append offset; "
+                            b"treat the send as NOT delivered")
+    st, tail = client.get_range(path, offset)
+    if st not in (200, 206) or not tail.startswith(line):
+        raise BlobError(st, b"gazette append read-back failed: the store does "
+                            b"not have the line it accepted; the send was "
+                            b"NOT delivered")
 
 
 # ---------- event rendering ----------
@@ -1472,7 +1511,8 @@ class Watchtower:
         except OSError as e:
             self._log(f"inbox read failed ({type(e).__name__}: {e})")
             return
-        records, consumed = journal_records(data)
+        records, consumed = journal_records(
+            data, on_bad=lambda c: self._log(f"skip unparseable inbox line: {c[:120]!r}"))
         self.inbox_offset += consumed
         self.log.debug(
             f"ev=inbox_drained records={len(records)} bytes={consumed} "
@@ -1626,7 +1666,9 @@ class Watchtower:
                 f"{self.head}{comrade}/gazette.jsonl", offset)
             if st not in (200, 206):
                 continue
-            records, consumed = journal_records(data)
+            records, consumed = journal_records(
+                data, on_bad=lambda c, who=comrade: self._log(
+                    f"skip unparseable gazette line from {who}: {c[:120]!r}"))
             for d in records:
                 # Learn aliases from every visible message (not just those
                 # addressed to me - intros broadcast), before the render filter.
@@ -2257,6 +2299,8 @@ def cmd_read(args):
                 try:
                     d = json.loads(line)
                 except ValueError:
+                    print(f"cccp: warning: skipping unparseable gazette line "
+                          f"from {sender}", file=sys.stderr)
                     continue
                 if d.get("type") == "message":
                     msgs.append(d)
@@ -2338,10 +2382,19 @@ def cmd_publish(args):
 
         rel = str(src).lstrip("/")
         data = src.read_bytes()
+        blob = comrade_path(cfg["PREFIX"], slug, me, f"files/{rel}")
         with TimeLogger(log, "publish_upload", path=rel, size=size):
-            st = client.put_block(comrade_path(cfg["PREFIX"], slug, me, f"files/{rel}"), data)
+            st = client.put_block(blob, data)
         if st != 201:
             raise BlobError(st, b"publish upload failed")
+        # Read the size back from the store (#7): a 201 whose blob is absent or
+        # truncated must fail the publish, not surface as a peer's failed pull.
+        st, got = client.stat(blob)
+        if st != 200 or got != size:
+            raise BlobError(st, f"publish read-back failed: store has "
+                                f"{got if got is not None else 'no blob'}, "
+                                f"uploaded {size} bytes; the publish was "
+                                f"NOT delivered".encode())
 
         d = {"type": "filesystem", "op": "publish", "ts": now_iso(), "from": me,
              "to": args.to if args.to else ["*"], "path": f"files/{rel}", "size": size}
@@ -2396,6 +2449,8 @@ def cmd_pull(args):
                 try:
                     d = json.loads(line)
                 except ValueError:
+                    print(f"cccp: warning: skipping unparseable gazette line "
+                          f"from {sender}", file=sys.stderr)
                     continue
                 if d.get("type") != "filesystem":
                     continue
@@ -2413,7 +2468,10 @@ def cmd_pull(args):
                          or display_path(wp).startswith(e.rstrip("/") + "/")
                          for e in exprs)]
         if not wanted:
-            sys.exit(f"error: no published files match {args.expr}")
+            sys.exit(f"error: no publish announcement matches {args.expr} - "
+                     f"either it was never published, or the announce never "
+                     f"reached the store (pull only sees announcements, not "
+                     f"the files/ blobs themselves)")
         for sender, wire_path in wanted:
             meta = catalogue[(sender, wire_path)]
             try:
