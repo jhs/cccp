@@ -1185,6 +1185,27 @@ def inbox_send(slug, me, records):
     return wake_watchtowers(slug)
 
 
+def wake_pattern(slug):
+    """The pkill -f ERE matching ONLY live watchtower processes for `slug` -
+    never the Monitor bash wrapper that carries the same words quoted inside
+    its own cmdline. Getting this wrong is fatal, not cosmetic: SIGUSR1's
+    default disposition is Term, so a matched wrapper DIES and its watchtower
+    follows via the ppid watchdog.
+
+    The anchor is the ps ownership tag (cmd_watchtower's re-exec): a real
+    watchtower's cmdline always ENDS with `-- <comrade-id>`, while the
+    wrapper's continues past the quoted command into harness plumbing. The
+    previous anchor - "a quote follows the slug in the wrapper" - held only
+    for flag-less arming: with flags (e.g. --alias-trigger) a SPACE follows
+    the slug in the wrapper too, so every wake/deadline-arm broadcast beheaded
+    any same-cell watchtower armed with flags, wrapper first (the #5 churn).
+
+    The trailing space after the slug also keeps `foo` from matching
+    `foo-bar`. POSIX ERE only (BSD pkill on macOS, procps on Linux): [^ ]
+    instead of \\S, literal alternations, no PCRE."""
+    return rf"cccp watchtower {re.escape(slug)} (.* )?-- [^ ]+$"
+
+
 def wake_watchtowers(slug):
     """SIGUSR1 every local watchtower for `slug` - "poll now". Returns the completed
     pkill process: rc 0 = at least one signalled, 1 = none running (which is NOT an
@@ -1192,20 +1213,8 @@ def wake_watchtowers(slug):
 
     Shared by `cccp wake` and by anything that drops a record in an inbox. See
     cmd_wake for the sibling-session caveat."""
-    # Anchored regex, load-bearing twice over:
-    #  1. cccp watchtower foo must not match cccp watchtower foo-bar.
-    #  2. It spares the Monitor bash wrapper, which carries the command QUOTED
-    #     (`... && eval 'cccp watchtower foo' < /dev/null && ...`), so the char
-    #     after the slug is a quote - neither a space nor EOL - and the wrapper
-    #     does not match. Only the watchtower itself does, where the slug ends
-    #     the cmdline or precedes a flag. Not cosmetic: SIGUSR1's default
-    #     disposition is Term, so a matched wrapper would DIE and orphan its
-    #     watchtower child - manufacturing the #1 failure on every wake.
-    # Slugs are [a-z0-9-] only (slugify), so re.escape is belt-and-suspenders.
-    # POSIX ERE only (BSD pkill on macOS, procps pkill on Linux): literal space
-    # alternation, not \s. pkill is built-in on both, no homebrew/extra packages.
-    pattern = rf"cccp watchtower {re.escape(slug)}( |$)"
-    return subprocess.run(["pkill", "-USR1", "-f", pattern], capture_output=True)
+    return subprocess.run(["pkill", "-USR1", "-f", wake_pattern(slug)],
+                          capture_output=True)
 
 
 # ---------- aliases (opt-in, view-layer) ----------
@@ -1764,9 +1773,13 @@ class Watchtower:
         qualifies it: whether this outcome is the end of the matter or one window
         of a cadence. Emitted only when true; absent means a one-shot."""
         name = alias_or_id(self.aliases, self.me, comrade)
+        # A stale alias map can name the WRONG comrade (#13) - whenever the
+        # rendered name is not the id itself, the id rides along so the event
+        # stays attributable no matter what the map thinks.
+        ident = f" id={comrade}" if name != comrade else ""
         standing = " standing=true" if d.get("standing") else ""
         ts = f" ts={d['ts']}" if d.get("ts") else ""
-        return (f"deadline comrade={name} result={result}{standing}{ts} "
+        return (f"deadline comrade={name}{ident} result={result}{standing}{ts} "
                 f"limit={d['limit']}")
 
     def _expire_deadlines(self):
@@ -2363,7 +2376,24 @@ def cmd_dispatch(args):
                 rec["standing"] = True
             with TimeLogger(log, "deadline_send", to_count=len(to),
                             limit=limit or "none", standing=bool(args.standing)):
-                inbox_send(slug, me, [{**rec, "to": t} for t in to])
+                r = inbox_send(slug, me, [{**rec, "to": t} for t in to])
+            if r.returncode == 1:
+                # Timers are watchtower-owned, and a fresh watchtower resets
+                # its inbox - so an arm with no live watchtower is not
+                # deferred, it is DISCARDED. Fail loudly (#13) instead of the
+                # silent futility an operator only discovers from an alert
+                # that never fires.
+                sys.exit(f"error: no live watchtower for cell {slug!r} to own "
+                         f"this deadline - the record was discarded"
+                         + ("; the message itself was sent" if sent else "")
+                         + ". Arm a watchtower, then re-run.")
+            if r.returncode > 1:
+                sys.exit(f"pkill failed: "
+                         f"{r.stderr.decode().strip() or r.returncode}")
+            if limit:
+                print(f"deadline {limit} armed for {', '.join(to)}")
+            else:
+                print(f"deadline cleared for {', '.join(to)}")
 
 
 def cmd_watchtower(args):

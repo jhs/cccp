@@ -1238,6 +1238,70 @@ class InboxShutdown(unittest.TestCase):
         self.assertFalse(self.wt.stop)
 
 
+class WakePattern(unittest.TestCase):
+    """The wake pkill pattern must hit watchtowers and NEVER the Monitor bash
+    wrapper - SIGUSR1 terminates an unsuspecting bash, and the watchtower then
+    follows via the ppid watchdog. The flags-after-slug wrapper (a space, not
+    a quote, after the slug) is the exact cmdline that beheaded #5's cells on
+    every wake/deadline-arm broadcast."""
+
+    WT_BARE = "/usr/bin/python3 /x/bin/cccp watchtower demo -- u@h:aaaaaa"
+    WT_FLAGS = ("/usr/bin/python3 /x/bin/cccp watchtower demo "
+                "--alias-trigger Intro: -- u@h:aaaaaa")
+    WRAP_BARE = ("bash -c cd /x && eval 'bin/cccp watchtower demo' "
+                 "< /dev/null && echo done")
+    WRAP_FLAGS = ("bash -c cd /x && eval 'bin/cccp watchtower demo "
+                  "--alias-trigger 'Intro:'' < /dev/null && echo done")
+
+    def _hits(self, cmdline, slug="demo"):
+        import re as _re
+        return bool(_re.search(cccp.wake_pattern(slug), cmdline))
+
+    def test_matches_bare_watchtower(self):
+        self.assertTrue(self._hits(self.WT_BARE))
+
+    def test_matches_flagged_watchtower(self):
+        self.assertTrue(self._hits(self.WT_FLAGS))
+
+    def test_spares_bare_wrapper(self):
+        self.assertFalse(self._hits(self.WRAP_BARE))
+
+    def test_spares_flagged_wrapper(self):
+        self.assertFalse(self._hits(self.WRAP_FLAGS))
+
+    def test_slug_is_word_bounded(self):
+        other = self.WT_BARE.replace("watchtower demo", "watchtower demo-x")
+        self.assertFalse(self._hits(other))
+
+
+class DeadlineEventAttribution(unittest.TestCase):
+    """#13: deadline events resolve comrade= through the alias map, which can be
+    stale - so whenever the rendered name is not the raw id, the id must ride
+    along, keeping the event attributable regardless of the map."""
+
+    def setUp(self):
+        self.data = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.data, True))
+        self.env = _isolated_env(self.data)
+        self.env.__enter__()
+        self.addCleanup(lambda: self.env.__exit__(None, None, None))
+        self.wt = cccp.Watchtower(_FakeBlobClient(), "", "demo", "me@h:mmm", 0)
+
+    def test_alias_rendering_carries_id(self):
+        self.wt.aliases = {"peer@h:ppp": "Deputy"}
+        line = self.wt._deadline_head("peer@h:ppp", {"limit": "10m"}, "missed")
+        self.assertIn("comrade=Deputy id=peer@h:ppp ", line)
+
+    def test_raw_id_carries_no_id_field(self):
+        line = self.wt._deadline_head("peer@h:ppp", {"limit": "10m"}, "met")
+        self.assertIn("comrade=peer@h:ppp ", line)
+        self.assertNotIn(" id=", line)
+
+    def test_self_renders_you_with_id(self):
+        line = self.wt._deadline_head("me@h:mmm", {"limit": "5m"}, "missed")
+        self.assertIn("comrade=you id=me@h:mmm ", line)
+
+
 class WatchtowerStatus(unittest.TestCase):
     """#18: `cccp status` must distinguish alive, stopped-with-reason, and
     died-hard (stale pid record) - a dead watchtower must never be mistaken
