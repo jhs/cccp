@@ -38,33 +38,32 @@ join, and joining is where you should start.
 | Backend | Description | Requirements to Join a Cell | Requirements to Host a Cell |
 |---|---|---|---|
 | `local-fs` | Files under the plugin data dir. The zero-setup default; always works, but reaches only the same host **and** same OS user — terminal tabs, IDE windows, git worktrees, background agents. Cannot reach another user or machine. | None | None — no hosting |
-| `azure-blob` | Centralized cloud storage (Azure Blob), reachable from any host, user, or network. Low cost. Auth is a shared container-scoped SAS token. | An Azure storage account name, a container name, and a SAS token — set with `cccp backend config azure-blob`. | Operate an Azure Blob container: either deploy the included Terraform reference (`infra/azure/apply.sh` — read it before running it), or provision one yourself (portal, CLI, existing infra) and hand over the three values above. Needs an Azure subscription and may spend the user's money. |
+| `azure-blob` | Centralized cloud storage (Azure Blob), reachable from any host, user, or network. Low cost. Auth is a shared container-scoped SAS token. | An Azure storage account name, a container name, and a SAS token — set with `cccp config`. | Operate an Azure Blob container: either deploy the included Terraform reference (`infra/azure/apply.sh` — read it before running it), or provision one yourself (portal, CLI, existing infra) and hand over the three values above. Needs an Azure subscription and may spend the user's money. |
 
-## How to See Backend Settings
+## How to See the Config
 
 | Question | Command | Notes |
 |---|---|---|
 | Which backend am I on? | `cccp backend` | Prints the bare name. No network. |
-| What is its config? | `cccp backend config [<name>]` | Resolved values + where each came from. Defaults to the active backend. |
-| Does it work? | `cccp backend check [<name>]` | Hits the network. Prints setup guidance on failure. |
+| What is my whole config? | `cccp config` | The full resolved dump: globals, then every backend, `[active]`/`[inactive]`. |
+| Does a backend work? | `cccp backend check [<name>]` | Hits the network. Prints setup guidance on failure. |
 
-Start with `cccp backend config` — it answers "what am I actually using" in one
-shot.
+Start with `cccp config` — it answers "what am I actually using" in one shot,
+for every backend at once.
 
-The **`Set by`** column in `cccp backend config` output names the config
-layer each value actually came from. Config merges `settings` <
-`backend/<name>/config` < **process env**. A row reading `env <- shadows config` means
-the environment variable is overriding a config file value.
+The **`Set by`** column names the winner of each key by its config file's
+path **relative to the plugin data dir** (`config`, `backend/azure-blob/config`),
+or `env` / `default` / `unset`. Combine `CCCP_PLUGIN_DATA` with that path and
+you are at the literal file. Config merges `config` < `backend/<name>/config` <
+**process env**; a row reading `env <- shadows backend/azure-blob/config` means
+the environment is overriding that file's value.
 
-`CCCP_PLUGIN_DATA` heads the table on every backend — it is where all cell data
-and config actually live, and it is always `env`, since every config file sits
-inside it.
+`CCCP_PLUGIN_DATA` heads the dump — it is where all cell data and config
+actually live, and it is always `env`, since every config file sits inside it.
 
-`cccp backend config <name>` works for a backend you are **not** on, and its
-values look identical to the active one's — so check the `[active]` /
-`[not active; active is ...]` marker in the header. Configuring `azure-blob`
-while `local-fs` is active is a real thing to do (it is the whole setup flow),
-but so is doing it by accident and wondering why nothing changed.
+Every backend appears in the dump, tagged `[active]` or `[inactive]` — an
+inactive backend keeps its stored config, which is the whole setup flow:
+configure it while inactive, `cccp backend use` it when ready.
 
 The roster of available backends is the table at the top
 of this skill. Don't ask the CLI for it.
@@ -73,21 +72,27 @@ If `cccp` itself fails — a traceback, or `CCCP_PLUGIN_DATA is not set` — not
 the user and offer to troubleshoot. A failing `check` is not that: it exits
 non-zero too, but it is a finding, and it prints its own fix.
 
-## How to Configure a Backend
+## How to Set Config Values
 
-`cccp backend config <name> KEY=VALUE ...` writes config; the same command with
-no assignments reads it back. Keys take either spelling (`SAS` or
-`CCCP_AZURE_BLOB_SAS`); an empty value removes a key.
+`cccp config KEY=VALUE ...` writes; keys are automatically routed to the proper
+file (`CCCP_AZURE_BLOB_*` to `backend/azure-blob/config`, globals like
+`CCCP_DEBUG` to `config`), and the confirmation names the file it touched. Keys
+are the canonical `CCCP_*` names exactly as the dump prints them; an empty
+value removes a key.
 
 ```bash
-cccp backend config azure-blob                          # read it
-cccp backend config azure-blob ACCOUNT=hub CONTAINER=cells
+cccp config                                             # read everything
+cccp config CCCP_AZURE_BLOB_ACCOUNT=hub CCCP_AZURE_BLOB_CONTAINER=cells
 ```
 
-Writes always land in that backend's config file, but reads show the **resolved**
-merge — so a value you just wrote can come back tagged `env`, meaning the
-environment is overriding what you wrote, revealed by the `Set by` column:
-the write succeeded and is still being ignored.
+Two keys refuse to be set here, each pointing at the right tool:
+`CCCP_ACTIVE_BACKEND` (use `cccp backend use <name>`, which validates before
+switching) and `CCCP_PLUGIN_DATA` (environment-only; the plugin's SessionStart
+hook exports it).
+
+Reads show the **resolved** merge, and a write the environment is currently
+shadowing warns on the spot (`warning: ... shadows this write`) — so a write
+can never silently succeed-and-be-ignored.
 
 Set non-confidential values yourself, several at once — account names, container
 names, prefixes all go straight in as above. Secrets do not.
@@ -131,8 +136,8 @@ substitute them — never hand over a command with placeholders in it:
 
 ```bash
 CCCP_PLUGIN_DATA=/home/u/.claude/plugins/data/cccp-inline \
-  /home/u/.claude/plugins/cache/cccp/cccp/2.3.0/bin/cccp \
-  backend config azure-blob SAS=-
+  /home/u/.claude/plugins/cache/cccp/cccp/3.0.0/bin/cccp \
+  config CCCP_AZURE_BLOB_SAS=-
 ```
 
 **4. How to paste and end input**, for their OS:
@@ -152,12 +157,12 @@ Then have them tell you it is done, and verify it yourself. The value is theirs;
 the checking is yours:
 
 ```bash
-cccp backend config azure-blob     # SAS should read <set, N chars>
+cccp config                        # SAS should read <set, N chars>
 cccp backend check azure-blob
 ```
 
-Never echo a secret back, and never `cat` the config file — `cccp backend
-config` redacts secrets precisely so you never have to hold one.
+Never echo a secret back, and never `cat` a config file — `cccp config`
+redacts secrets precisely so you never have to hold one.
 
 ## How to Test and Change Backends
 
@@ -177,7 +182,7 @@ one stdlib-only file, and the only authority on how backends resolve.
 ## Your instructions
 
 The next paragraph begins `User Arguments:` then appends the user's prompt.
-If defined, respond to the User Arguments; if empty, run `cccp backend config`
+If defined, respond to the User Arguments; if empty, run `cccp config`
 and report what you find.
 
 User Arguments: $ARGUMENTS
