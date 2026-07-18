@@ -1125,7 +1125,7 @@ def inbox_send(slug, me, records):
                     for r in records)
     with open(path, "ab") as f:
         f.write(blob)
-    wake_watchtowers(slug)
+    return wake_watchtowers(slug)
 
 
 def wake_watchtowers(slug):
@@ -1576,6 +1576,17 @@ class Watchtower:
         if ev == "deadline":
             self._arm_deadline(rec)
             return
+        if ev == "shutdown":
+            # Deliberate, kill-free termination (#16): the inbox is keyed
+            # (cell, comrade), so only this comrade's own tooling can reach us -
+            # a shutdown can never arrive from a peer's recovery routine. The
+            # emitted event tells the stdout reader the stream is ending on
+            # purpose, not dying.
+            self._log(f"inbox shutdown: {rec!r}")
+            self._emit(f"shutdown {self.me} slug={self.slug}")
+            self.stop = True
+            self.stop_reason = "inbox_shutdown"
+            return
         self.log.debug(f"ev=inbox_unknown rec={_kv(json.dumps(rec))}")
 
     def _arm_deadline(self, rec):
@@ -1688,6 +1699,8 @@ class Watchtower:
 
     def _poll_once(self):
         self._drain_inbox()
+        if self.stop:
+            return   # an inbox shutdown ends the poll before any network I/O
         gazettes = self._scan()
         messages = []   # (ts, line)
         # Reload the alias map from disk each poll so manual `cccp alias` edits
@@ -2318,6 +2331,33 @@ def cmd_wake(args):
             print(f"woke watchtower(s) for cell {slug!r}")
         elif r.returncode == 1:
             sys.exit(f"no local watchtower found for cell {slug!r}")
+        else:
+            sys.exit(f"pkill failed: {r.stderr.decode().strip() or r.returncode}")
+
+
+def cmd_stop(args):
+    """Ask my own watchtower(s) for this cell to exit, via the inbox.
+
+    Kill-free termination (#16): the inbox is keyed (cell, comrade), so this can
+    only ever stop THIS comrade's watchtowers - never a peer's - with no pgrep
+    and no signals. Works regardless of parentage, so it also cleanly retires a
+    detached instance that the ppid watchdog cannot reach. The record is drained
+    within ms when a watchtower is alive (inbox_send wakes it); a leftover
+    record is truncated unread by the next watchtower's inbox reset, so a stale
+    stop can never kill a future one."""
+    slug = slugify(args.cell)
+    me = comrade_id()
+    cfg = resolve_config()
+    log = setup_logging(cfg, slug, me, sys.argv)
+    with subcommand_footer(log):
+        r = inbox_send(slug, me, [{"ev": "shutdown", "ts": now_iso()}])
+        log.debug(f"ev=stop_sent slug={_kv(slug)} pkill_rc={r.returncode}")
+        if r.returncode == 0:
+            print(f"stop requested; my watchtower for cell {slug!r} exits on "
+                  f"its next inbox drain (woken now)")
+        elif r.returncode == 1:
+            sys.exit(f"no local watchtower found for cell {slug!r} - nothing "
+                     f"to stop (request discarded by the next one's inbox reset)")
         else:
             sys.exit(f"pkill failed: {r.stderr.decode().strip() or r.returncode}")
 
@@ -3002,6 +3042,12 @@ def build_parser():
                              "polls immediately and resets the cadence ladder.")
     wk.add_argument("cell", help="Cell slug.")
     wk.set_defaults(func=cmd_wake)
+
+    stp = sub.add_parser("stop",
+                         help="Ask my own watchtower for this cell to exit "
+                              "cleanly, via its inbox. Never touches a peer's.")
+    stp.add_argument("cell", help="Cell slug.")
+    stp.set_defaults(func=cmd_stop)
 
     rd = sub.add_parser("read", help="Print cell message history.")
     rd.add_argument("cell", help="Cell slug.")

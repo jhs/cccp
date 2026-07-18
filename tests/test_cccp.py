@@ -1196,6 +1196,43 @@ class AppendDispatchReadBack(unittest.TestCase):
             cccp.append_dispatch(self.b, "p", "cell", "u@h:aaa", {"t": 1})
 
 
+class InboxShutdown(unittest.TestCase):
+    """#16: `cccp stop` ends a watchtower through its (cell, comrade)-keyed
+    inbox - kill-free, so it can never reach a peer's watchtower - and the
+    stdout reader sees a deliberate `shutdown` event, not a dead stream."""
+
+    def setUp(self):
+        self.data = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.data, True))
+        self.env = _isolated_env(self.data)
+        self.env.__enter__()
+        self.addCleanup(lambda: self.env.__exit__(None, None, None))
+        self.wt = cccp.Watchtower(_FakeBlobClient(), "", "demo", "me@h:mmm", 0)
+        self.wt.emitted = []
+        self.wt._emit = self.wt.emitted.append
+
+    def test_shutdown_record_stops_and_emits(self):
+        self.wt._apply_inbox({"ev": "shutdown", "ts": "2026-07-18T00:00:00Z"})
+        self.assertTrue(self.wt.stop)
+        self.assertEqual(self.wt.stop_reason, "inbox_shutdown")
+        self.assertIn("shutdown me@h:mmm slug=demo", self.wt.emitted)
+
+    def test_poll_after_shutdown_skips_network(self):
+        self.wt.client.blobs = None   # any scan would raise
+        cccp.inbox_path("demo", "me@h:mmm").parent.mkdir(parents=True,
+                                                         exist_ok=True)
+        self.wt._reset_inbox()
+        with mock.patch.object(cccp, "wake_watchtowers",
+                               lambda slug: mock.Mock(returncode=1)):
+            cccp.inbox_send("demo", "me@h:mmm", [{"ev": "shutdown"}])
+        self.wt._poll_once()   # drains, stops, and must not touch the client
+        self.assertTrue(self.wt.stop)
+
+    def test_unknown_ev_still_ignored(self):
+        self.wt._apply_inbox({"ev": "frobnicate"})
+        self.assertFalse(self.wt.stop)
+
+
 class JournalRecordsOnBad(unittest.TestCase):
     """Malformed journal lines are skipped-but-consumed; on_bad makes the skip
     observable so data loss and parse bugs stop looking identical (#7)."""
