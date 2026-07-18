@@ -37,7 +37,7 @@ join, and joining is where you should start.
 
 | Backend | Description | Requirements to Join a Cell | Requirements to Host a Cell |
 |---|---|---|---|
-| `local-fs` | Files under the plugin data dir. The zero-setup default; always works, but reaches only the same host **and** same OS user — terminal tabs, IDE windows, git worktrees, background agents. Cannot reach another user or machine. | None | None — no hosting |
+| `local-fs` | Files under a local directory. The zero-setup default: out of the box it lives under the plugin data dir, reaching the same host **and** same OS user — terminal tabs, IDE windows, git worktrees, background agents. Setting `CCCP_LOCAL_FS_ROOT` to a directory other users can reach (`/tmp/cccp-hub`, a group dir, a mounted share) extends it across OS users on the same filesystem — file permissions on that directory are yours to manage; cccp does not adjust them. Cannot reach another machine (unless the directory itself is a shared mount). | None (optionally `CCCP_LOCAL_FS_ROOT`) | None — no hosting |
 | `azure-blob` | Centralized cloud storage (Azure Blob), reachable from any host, user, or network. Low cost. Auth is a shared container-scoped SAS token. | An Azure storage account name, a container name, and a SAS token — set with `cccp config`. | Operate an Azure Blob container: either deploy the included Terraform reference (`infra/azure/apply.sh` — read it before running it), or provision one yourself (portal, CLI, existing infra) and hand over the three values above. Needs an Azure subscription and may spend the user's money. |
 
 ## How to See the Config
@@ -45,7 +45,7 @@ join, and joining is where you should start.
 | Question | Command | Notes |
 |---|---|---|
 | Which backend am I on? | `cccp backend` | Prints the bare name. No network. |
-| What is my whole config? | `cccp config` | The full resolved dump: globals, then every backend, `[active]`/`[inactive]`. |
+| What is my whole config? | `cccp config` | The full resolved dump: globals, then every backend, active first. |
 | Does a backend work? | `cccp backend check [<name>]` | Hits the network. Prints setup guidance on failure. |
 
 Start with `cccp config` — it answers "what am I actually using" in one shot,
@@ -61,7 +61,8 @@ the environment is overriding that file's value.
 `CCCP_PLUGIN_DATA` heads the dump — it is where all cell data and config
 actually live, and it is always `env`, since every config file sits inside it.
 
-Every backend appears in the dump, tagged `[active]` or `[inactive]` — an
+Every backend appears in the dump, introduced by an `Active backend:` /
+`Inactive backend:` line — an
 inactive backend keeps its stored config, which is the whole setup flow:
 configure it while inactive, `cccp backend use` it when ready.
 

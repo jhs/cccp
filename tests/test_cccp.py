@@ -627,7 +627,14 @@ class ConfigResolution(unittest.TestCase):
             cfg = cccp.resolve_config()
         self.assertEqual(cfg["BACKEND"], "local-fs")
         self.assertEqual(cfg["PREFIX"], "")          # local-fs uses no prefix
-        self.assertEqual(cfg["PARAMS"], {})
+        # ROOT is optional-with-default, so it is always resolved - never missing.
+        self.assertEqual(cfg["PARAMS"],
+                         {"root": str(Path(self.data, "backend", "local-fs"))})
+
+    def test_local_fs_root_override_reaches_params(self):
+        with _isolated_env(self.data, CCCP_LOCAL_FS_ROOT="/tmp/cccp-hub"):
+            cfg = cccp.resolve_config()
+        self.assertEqual(cfg["PARAMS"]["root"], "/tmp/cccp-hub")
 
     def test_config_file_selects_backend_and_reads_namespaced_params(self):
         self._write(f"{self.data}/config", "CCCP_ACTIVE_BACKEND=azure-blob\n")
@@ -878,11 +885,16 @@ class ConfigDump(unittest.TestCase):
 
     def test_every_backend_appears_active_first_and_tagged(self):
         out = self._dump(CCCP_ACTIVE_BACKEND="azure-blob")
-        self.assertIn("Backend azure-blob  [active]", out)
-        self.assertIn("Backend local-fs  [inactive]", out)
-        self.assertLess(out.index("azure-blob  [active]"),
-                        out.index("local-fs  [inactive]"))
-        self.assertIn("(local-fs has no parameters of its own)", out)
+        self.assertIn("Active backend: azure-blob", out)
+        self.assertIn("Inactive backend: local-fs", out)
+        self.assertLess(out.index("Active backend: azure-blob"),
+                        out.index("Inactive backend: local-fs"))
+
+    def test_local_fs_root_defaults_to_its_backend_dir(self):
+        row = [l for l in self._dump().splitlines()
+               if "CCCP_LOCAL_FS_ROOT" in l][0]
+        self.assertIn("default", row)
+        self.assertIn(str(Path(self.data, "backend", "local-fs")), row)
 
     def test_secret_stays_redacted(self):
         out = self._dump(CCCP_AZURE_BLOB_SAS="sig-do-not-print")
@@ -1031,8 +1043,8 @@ class ConfigSet(unittest.TestCase):
         self.assertIn("not a terminal", msg)
         self.assertIn("run this command themselves", msg)
 
-    def test_local_fs_has_nothing_to_configure(self):
-        self.assertEqual(cccp._config_keys("local-fs"), ())
+    def test_config_keys_cover_secrets_and_optionals(self):
+        self.assertEqual(cccp._config_keys("local-fs"), ("ROOT",))
         self.assertEqual(cccp._config_keys("azure-blob"),
                          ("ACCOUNT", "CONTAINER", "SAS", "PREFIX"))
 
@@ -1082,11 +1094,14 @@ class SecretRedaction(unittest.TestCase):
     def test_missing_marked_not_redacted(self):
         self.assertEqual(cccp._fmt_param("azure-blob", "SAS", None), "<missing>")
 
-    def test_every_declared_secret_is_a_real_param(self):
-        # A typo in `secrets` would silently un-redact the key it meant to protect.
+    def test_secrets_are_params_declared_exactly_once(self):
+        # A secret IS a param (see _backend_params); repeating it in `params`
+        # would double it in every key listing.
         for name, spec in cccp.BACKENDS.items():
             for key in spec.get("secrets", ()):
-                self.assertIn(key, spec["params"], f"{name}: {key} is not a param")
+                self.assertNotIn(key, spec["params"],
+                                 f"{name}: {key} declared twice")
+                self.assertIn(key, cccp._backend_params(spec))
 
 
 class AsActiveBackend(unittest.TestCase):
