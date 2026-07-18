@@ -1,6 +1,6 @@
 ---
 name: help
-description: Easy starting point and usage guide for users new to the CCCP plugin — concepts and how-tos. Use for phrases like "cccp help", "what can cccp do", "how do I use cccp", "get started with cccp", or when unsure which CCCP skill fits.
+description: This skill should be used when a user new to the CCCP plugin wants concepts and how-tos — phrases like "cccp help", "what can cccp do", "how do I use cccp", "get started with cccp", or when unsure which CCCP skill fits.
 ---
 
 Display the below `# CCCP Help` reference material when invoked.

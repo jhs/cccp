@@ -1,6 +1,6 @@
 ---
 name: token-aware
-description: Ascertain this session's context window token usage; also set notifications at usage milestones. Use when asked about context window fullness, tokens remaining, nearness to compaction, or to monitor token usage as work proceeds.
+description: This skill should be used when the user asks about context window fullness, tokens remaining, nearness to compaction, or wants token-usage monitoring with milestone notifications as work proceeds — phrases like "how full is your context", "tokens left", "watch your token usage".
 disable-model-invocation: false
 allowed-tools: Bash, Monitor, TaskStop
 ---
