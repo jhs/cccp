@@ -40,6 +40,7 @@ Subcommands:
 
 import argparse
 import contextlib
+import email.utils
 import json
 import logging
 import logging.handlers
@@ -59,7 +60,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 API_VERSION = "2023-11-03"
@@ -1144,6 +1145,14 @@ ALIAS_SEED_BYTES = 64 * 1024   # per-gazette cap when seeding the map at startup
                                # The declaring intro sits at a gazette's START, so
                                # a small head read finds it without scanning a
                                # months-long history.
+ALIAS_SEED_MAX_AGE_SECONDS = 7 * 24 * 3600   # skip seeding from gazettes idle
+                               # longer than this: an old cell accumulates
+                               # gazettes from long-gone comrades forever (there
+                               # is no per-comrade cleanup), and each costs a
+                               # head read at startup. A quiet-but-present
+                               # comrade skipped here renders as a raw id until
+                               # it next speaks, when live learning re-acquires
+                               # the alias - so the cutoff errs generous.
 
 
 def is_comrade_id(s):
@@ -1351,7 +1360,7 @@ class Watchtower:
         return gap
 
     def _scan(self):
-        """List gazette sizes in the cell prefix."""
+        """List gazettes in the cell prefix: comrade -> {"size", "last_modified"}."""
         with TimeLogger(self.log, "scan") as t:
             gazettes = {}
             blobs = self.client.list(self.head)
@@ -1361,15 +1370,15 @@ class Watchtower:
                     continue
                 comrade, leaf = rest.split("/", 1)
                 if leaf == "gazette.jsonl":
-                    gazettes[comrade] = props["size"]
+                    gazettes[comrade] = props
             t.done(blobs=len(blobs), gazettes=len(gazettes))
             return gazettes
 
     def initial_scan(self):
         """Fast-forward HWMs to skip existing backlog (no replay)."""
         gazettes = self._scan()
-        for comrade, size in gazettes.items():
-            self.hwm[comrade] = size
+        for comrade, props in gazettes.items():
+            self.hwm[comrade] = props["size"]
 
     def seed_aliases(self):
         """Build the baseline alias map from each gazette's HEAD (capped at
@@ -1378,10 +1387,25 @@ class Watchtower:
         holds within the seeded window."""
         amap = load_aliases(self.slug, self.me)
         decls = []   # (ts, from_id, alias)
+        cutoff = (datetime.now(timezone.utc)
+                  - timedelta(seconds=ALIAS_SEED_MAX_AGE_SECONDS))
+        stale = 0
         # My own gazette is included: my intro lands there and nowhere else, so
         # skipping self would resurrect a dead predecessor's mapping from backlog
         # while my own could never be seeded at all (issue #1).
-        for comrade in self._scan():
+        for comrade, props in self._scan().items():
+            # A gazette is append-only, so last_modified is the comrade's last
+            # word; older than the cutoff means long departed (or long quiet -
+            # live learning recovers those). Absent/unparseable stays seeded:
+            # a missing timestamp must not cost anyone their alias.
+            lm = props.get("last_modified")
+            if lm:
+                try:
+                    if email.utils.parsedate_to_datetime(lm) < cutoff:
+                        stale += 1
+                        continue
+                except (TypeError, ValueError):
+                    pass
             st, data = self.client.get_head(
                 f"{self.head}{comrade}/gazette.jsonl", ALIAS_SEED_BYTES)
             if st not in (200, 206):
@@ -1400,7 +1424,7 @@ class Watchtower:
             learn_alias(amap, cid, name)   # silent: discard the event line
         save_aliases(self.slug, self.me, amap)
         self.aliases = amap
-        self.log.debug(f"ev=aliases_seeded count={len(amap)}")
+        self.log.debug(f"ev=aliases_seeded count={len(amap)} stale_skipped={stale}")
 
     def run(self):
         self._reset_inbox()
@@ -1651,7 +1675,7 @@ class Watchtower:
             self.aliases = load_aliases(self.slug, self.me)
         alias_dirty = False
 
-        for comrade, size in gazettes.items():
+        for comrade, props in gazettes.items():
             # My own gazette is read for alias learning ONLY - my intro lands
             # there and nowhere else, so an armed watchtower that skips self can
             # never register its own alias (issue #1). Unarmed, self is skipped
@@ -1660,7 +1684,7 @@ class Watchtower:
             if is_me and not self.trigger:
                 continue
             offset = self.hwm.get(comrade, 0)
-            if size <= offset:
+            if props["size"] <= offset:
                 continue
             st, data = self.client.get_range(
                 f"{self.head}{comrade}/gazette.jsonl", offset)

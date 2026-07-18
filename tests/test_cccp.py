@@ -412,6 +412,7 @@ class _FakeBlobClient:
 
     def __init__(self):
         self.blobs = {}     # path -> bytes
+        self.lm = {}        # path -> RFC 1123 last_modified (absent -> None)
         self.fetched = []   # paths passed to get_range/get_head
 
     def append(self, path, record):
@@ -419,8 +420,8 @@ class _FakeBlobClient:
             (json.dumps(record) + "\n").encode()
 
     def list(self, prefix):
-        return {p: {"size": len(b)} for p, b in self.blobs.items()
-                if p.startswith(prefix)}
+        return {p: {"size": len(b), "last_modified": self.lm.get(p)}
+                for p, b in self.blobs.items() if p.startswith(prefix)}
 
     def get_range(self, path, offset):
         self.fetched.append(path)
@@ -500,6 +501,21 @@ class SelfAliasLearning(unittest.TestCase):
         wt = self._watchtower()
         wt.seed_aliases()
         self.assertEqual(wt.aliases, {self.ME: "Foreman"})
+
+    def test_seed_skips_stale_gazettes(self):
+        # A gazette idle past ALIAS_SEED_MAX_AGE_SECONDS gets no head read at
+        # seed time; one with no last_modified at all is still seeded.
+        gaz = self._gazette(self.OTHER)
+        self.client.append(gaz, self._intro(self.OTHER, "Buddy",
+                                            "2026-01-01T00:00:00.000000Z"))
+        self.client.lm[gaz] = "Thu, 01 Jan 2026 00:00:00 GMT"
+        self.client.append(self._gazette(self.ME),
+                           self._intro(self.ME, "Foreman",
+                                       "2026-07-17T15:35:00.000000Z"))
+        wt = self._watchtower()
+        wt.seed_aliases()
+        self.assertEqual(wt.aliases, {self.ME: "Foreman"})
+        self.assertNotIn(gaz, self.client.fetched)
 
     def test_poll_skips_own_gazette_when_unarmed(self):
         wt = self._watchtower(trigger=None)
