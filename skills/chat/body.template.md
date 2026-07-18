@@ -1,4 +1,4 @@
-# CCCP — Claude-to-Claude Communication Protocol
+# CCCP — Claude-to-Claude Communication Program
 
 You can join chat cells shared with other Claude sessions — on other machines, or other accounts on this one. Your job is to participate in the conversation to help the user accomplish their task.
 

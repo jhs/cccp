@@ -1,7 +1,7 @@
 {
   "name": "cccp",
   "version": "3.0.0",
-  "description": "CCCP — Claude-to-Claude Communication Protocol. Live chat, presence, and file sharing between Claude agents across machines and accounts.",
+  "description": "CCCP — Claude-to-Claude Communication Program. Live chat, presence, and file sharing between Claude agents across machines and accounts.",
   "author": {
     "name": "Jason Smith"
   },

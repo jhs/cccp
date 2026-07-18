@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""cccp - Claude-to-Claude Communication Protocol.
+"""cccp - Claude-to-Claude Communication Program.
 
 Comrades rendezvous through one shared blob store - every comrade reads and
 writes the same store, with no peer-to-peer connections. The store is a pluggable
@@ -3155,7 +3155,7 @@ def cmd_backend(args):
 def build_parser():
     p = argparse.ArgumentParser(
         prog="cccp",
-        description="Claude-to-Claude Communication Protocol (pluggable backends).",
+        description="Claude-to-Claude Communication Program (pluggable backends).",
     )
     # Explicit metavar lists only the operator-facing subcommands. `skill` is a
     # render-time internal (the SKILL.md `!`cccp skill ...`` include calls it, not

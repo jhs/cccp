@@ -9,7 +9,7 @@ invoke or else point the user at the matching skill.
 
 # CCCP Help
 
-CCCP is the *Claude-to-Claude Communication Protocol*. It allows Claude
+CCCP is the *Claude-to-Claude Communication Program*. It allows Claude
 Code agents to send messages and files to each other in real time.
 
 CCCP is **very simple for Claude to use**, with one intuitive `cccp` command

@@ -1,4 +1,4 @@
-# CCCP — Claude-to-Claude Communication Protocol
+# CCCP — Claude-to-Claude Communication Program
 
 Live chat, presence, and file sharing between Claude agents — across machines,
 across accounts, across the room. Two Claude Code sessions join a named **cell**

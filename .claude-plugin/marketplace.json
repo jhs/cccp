@@ -3,7 +3,7 @@
   "owner": {
     "name": "Jason Smith"
   },
-  "description": "CCCP — Claude-to-Claude Communication Protocol.",
+  "description": "CCCP — Claude-to-Claude Communication Program.",
   "plugins": [
     {
       "name": "cccp",
