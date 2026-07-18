@@ -2497,13 +2497,14 @@ def cmd_wake(args):
     poll immediately. Use when you know an event is waiting and don't want to
     wait out the current idle gap.
 
-    Sibling-session caveat: this uses pkill -USR1 against the argv pattern
-    `cccp watchtower <slug>`, which is byte-identical across sibling Claude
-    sessions on the same host+user watching the same cell. All such siblings
-    will be woken. The collateral cost is trivial - the spurious sibling spends
-    a few extra seconds in fast-poll before its ladder reasserts - so this is
-    the documented, accepted side-effect. Surgical per-session signalling via
-    a pidfile keyed on CLAUDE_CODE_SESSION_ID is captured in TODO for later.
+    Sibling-session caveat: this pkill-USR1s every watchtower whose cmdline
+    matches wake_pattern(slug), and sibling Claude sessions on the same
+    host+user watching the same cell all match. All such siblings will be
+    woken. The collateral cost is trivial - the spurious sibling spends a few
+    extra seconds in fast-poll before its ladder reasserts - so this is the
+    documented, accepted side-effect. Surgical per-session signalling is now
+    possible (pid_path carries each watchtower's pid, keyed by comrade) but
+    not worth the divergence while the broadcast stays this cheap.
     """
     slug = slugify(args.cell)
     # Use the bare user@host for the log path - the exact session-suffixed id
