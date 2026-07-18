@@ -61,6 +61,12 @@ the environment is overriding that file's value.
 `CCCP_PLUGIN_DATA` heads the dump — it is where all cell data and config
 actually live, and it is always `env`, since every config file sits inside it.
 
+`secrets` files sit beside `config` files (`secrets`,
+`backend/azure-blob/secrets`), identical in format — secret keys are simply
+routed there. Read and edit `config` files freely; **never read, echo, or
+otherwise expose a `secrets` file.** `cccp config` already shows everything
+you may know about one (`<set, N chars>`).
+
 Every backend appears in the dump, introduced by an `Active backend:` /
 `Inactive backend:` line — an
 inactive backend keeps its stored config, which is the whole setup flow:
@@ -76,7 +82,8 @@ non-zero too, but it is a finding, and it prints its own fix.
 ## How to Set Config Values
 
 `cccp config KEY=VALUE ...` writes; keys are automatically routed to the proper
-file (`CCCP_AZURE_BLOB_*` to `backend/azure-blob/config`, globals like
+file (`CCCP_AZURE_BLOB_ACCOUNT` to `backend/azure-blob/config`, secrets like
+`CCCP_AZURE_BLOB_SAS` to `backend/azure-blob/secrets`, globals like
 `CCCP_DEBUG` to `config`), and the confirmation names the file it touched. Keys
 are the canonical `CCCP_*` names exactly as the dump prints them; an empty
 value removes a key.
@@ -162,7 +169,7 @@ cccp config                        # SAS should read <set, N chars>
 cccp backend check azure-blob
 ```
 
-Never echo a secret back, and never `cat` a config file — `cccp config`
+Never echo a secret back, never `cat` or read a `secrets` file — `cccp config`
 redacts secrets precisely so you never have to hold one.
 
 ## How to Test and Change Backends

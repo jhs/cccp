@@ -293,7 +293,9 @@ DEFAULT_BACKEND = "local-fs"
 # `params` lists the non-secret params; `secrets` lists the secret ones, which
 # are of course params too - each key is declared exactly once, and
 # _backend_params() is the full set (a key repeated in both would be a bug, not
-# a convention to maintain). A secret is never printed (see _fmt_param).
+# a convention to maintain). A secret is never printed (see _fmt_param), and
+# `cccp config` routes it to the scope's `secrets` file rather than `config` -
+# same format, but a file nothing should ever read except cccp.
 # `defaults` maps an OPTIONAL param to a zero-arg callable producing its
 # effective value - lazy, because defaults like the local-fs root depend on
 # CCCP_PLUGIN_DATA at call time. A param with a default is never "missing".
@@ -345,12 +347,14 @@ def _env_layer():
 def resolve_config():
     """Resolve the active backend and its config.
 
-    Flat, self-namespacing KEY=value config (dotenv syntax) from two sources, low
-    -> high precedence:
+    Flat, self-namespacing KEY=value config (dotenv syntax), low -> high
+    precedence; each scope splits into a `config` file and a format-identical
+    `secrets` file, so secret values live in files nothing should ever read
+    but cccp:
 
-        config                         global cccp state (active backend, debug)
-          -> backend/<active>/config   the active backend's own params
-            -> process env CCCP_*       highest (per-project via direnv, CI, etc.)
+        config -> secrets                        global cccp state
+          -> backend/<active>/config -> secrets  the active backend's params
+            -> process env CCCP_*                 highest (direnv, CI, etc.)
 
     The active backend must resolve before its config file loads, so it comes from
     the global file + env first (default local-fs); then that backend's file joins
@@ -379,11 +383,15 @@ def resolve_config():
     # layer list drives both the merge and the provenance map, so the two can never
     # disagree about which layer won a key: later layers overwrite earlier ones in
     # lockstep, exactly as {**global_file, **backend_file, **env} would.
-    backend_file = _read_kv_file(backend_dir(backend) / "config")
     merged, sources = {}, {}
-    for layer_name, layer in (("config", global_file),
-                              (f"backend/{backend}/config", backend_file),
-                              ("env", env)):
+    for layer_name, layer in (
+            ("config", global_file),
+            ("secrets", _read_kv_file(plugin_data_dir() / "secrets")),
+            (f"backend/{backend}/config",
+             _read_kv_file(backend_dir(backend) / "config")),
+            (f"backend/{backend}/secrets",
+             _read_kv_file(backend_dir(backend) / "secrets")),
+            ("env", env)):
         merged.update(layer)
         for k in layer:
             sources.setdefault(k, []).append(layer_name)
@@ -2821,10 +2829,10 @@ def validate_backend(cfg, network=False):
 def _write_kv(path, key, value):
     """Set KEY=value in a flat KEY=value config file, preserving every other line
     and comment; `value=None` removes the key instead. Creates the file and its
-    parents if absent, and keeps it owner-only - a backend config may hold a SAS.
+    parents if absent, and keeps it owner-only - a secrets file holds a SAS.
 
-    Shared by the global config file and every backend/<name>/config, so the two
-    keep identical dotenv semantics and neither grows a writer of its own."""
+    Shared by every config and secrets file, global and per-backend, so all of
+    them keep identical dotenv semantics and none grows a writer of its own."""
     path.parent.mkdir(parents=True, exist_ok=True)
     out, replaced = [], False
     if path.exists():
@@ -2928,9 +2936,10 @@ def _config_destinations():
     with nothing extra to register. Exact-match only: prefix routing would
     happily write a typo'd key and leave a <missing> to debug later."""
     dest = {"CCCP_DEBUG": "config"}
-    for name in BACKENDS:
+    for name, spec in BACKENDS.items():
         for key in _config_keys(name):
-            dest[_backend_key(name, key)] = f"backend/{name}/config"
+            file = "secrets" if key in spec["secrets"] else "config"
+            dest[_backend_key(name, key)] = f"backend/{name}/{file}"
     return dest
 
 

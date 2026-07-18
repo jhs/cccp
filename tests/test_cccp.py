@@ -901,6 +901,14 @@ class ConfigDump(unittest.TestCase):
         self.assertNotIn("sig-do-not-print", out)
         self.assertIn("<set, 16 chars>", out)
 
+    def test_secrets_file_layer_resolves_and_labels(self):
+        Path(self.data, "backend", "azure-blob").mkdir(parents=True)
+        Path(self.data, "backend", "azure-blob", "secrets").write_text(
+            "CCCP_AZURE_BLOB_SAS=sig-from-secrets\n")
+        row = [l for l in self._dump().splitlines() if "SAS" in l][0]
+        self.assertIn("backend/azure-blob/secrets", row)
+        self.assertNotIn("sig-from-secrets", row)
+
     def test_set_by_names_the_file_path(self):
         Path(self.data, "backend", "azure-blob").mkdir(parents=True)
         Path(self.data, "backend", "azure-blob", "config").write_text(
@@ -985,7 +993,11 @@ class ConfigSet(unittest.TestCase):
     def test_destinations_cover_globals_and_every_backend(self):
         dest = cccp._config_destinations()
         self.assertEqual(dest["CCCP_DEBUG"], "config")
-        self.assertEqual(dest["CCCP_AZURE_BLOB_SAS"], "backend/azure-blob/config")
+        self.assertEqual(dest["CCCP_AZURE_BLOB_ACCOUNT"],
+                         "backend/azure-blob/config")
+        self.assertEqual(dest["CCCP_AZURE_BLOB_SAS"],
+                         "backend/azure-blob/secrets")
+        self.assertEqual(dest["CCCP_LOCAL_FS_ROOT"], "backend/local-fs/config")
         self.assertNotIn("CCCP_ACTIVE_BACKEND", dest)   # refused, not routed
         self.assertNotIn("CCCP_PLUGIN_DATA", dest)
 
@@ -1000,6 +1012,18 @@ class ConfigSet(unittest.TestCase):
             {"CCCP_AZURE_BLOB_ACCOUNT": "hub"})
         self.assertEqual(cccp._read_kv_file(Path(self.data, "config")),
                          {"CCCP_DEBUG": "1"})
+
+    def test_secret_routes_to_the_secrets_file(self):
+        out = self._set(["CCCP_AZURE_BLOB_SAS=sig123"])
+        self.assertIn("Set CCCP_AZURE_BLOB_SAS (backend/azure-blob/secrets)",
+                      out)
+        self.assertEqual(
+            cccp._read_kv_file(
+                Path(self.data, "backend", "azure-blob", "secrets")),
+            {"CCCP_AZURE_BLOB_SAS": "sig123"})
+        self.assertEqual(
+            cccp._read_kv_file(
+                Path(self.data, "backend", "azure-blob", "config")), {})
 
     def test_backend_write_suggests_validation(self):
         out = self._set(["CCCP_AZURE_BLOB_ACCOUNT=hub"])
