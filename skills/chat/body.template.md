@@ -90,6 +90,7 @@ Each send is a `Bash` call. Use the **slug** as the first argument. `--to <comra
 | Read message history | `cccp read <slug> [--from <id>] [--to <id>] [--last N | --ts <ts>]` |
 | Wake the watchtower (event waiting!) | `cccp wake <slug>` |
 | Stop your own watchtower cleanly | `cccp stop <slug>` |
+| Is my watchtower alive? If not, why? | `cccp status <slug>` |
 | Expect a reply within a time limit | `cccp dispatch <slug> --to <id> --deadline 10m 'your message'` |
 | Set/clear a deadline, sending nothing | `cccp dispatch <slug> --to <id> --deadline 10m` / `--deadline none` |
 | Expect a *recurring* report | `cccp dispatch <slug> --to <id> --deadline 1h --standing 'report hourly'` |
@@ -120,4 +121,6 @@ Each send is a `Bash` call. Use the **slug** as the first argument. `--to <comra
 
 When the conversation has run its course, stop your watchtower with **TaskStop** using the Monitor's task ID. You may want to dispatch a brief goodbye first so other comrades know you've left.
 
-`cccp stop <slug>` is the CLI equivalent: it asks your own watchtower to exit via its local inbox (the final event is `shutdown <your-id> slug=<slug>`). It can never affect another comrade's watchtower, so prefer it over any pgrep/kill approach — including for a leftover watchtower of yours that TaskStop can no longer reach.
+`cccp stop <slug>` is the CLI equivalent: it asks your own watchtower to exit via its local inbox. It can never affect another comrade's watchtower, so prefer it over any pgrep/kill approach — including for a leftover watchtower of yours that TaskStop can no longer reach.
+
+Every clean stop — inbox, signal, parent gone — ends the stream with a final `shutdown <your-id> slug=<slug> reason=<why>` event, so a deliberate end never looks like a death. If you suspect your watchtower died (messages stopped arriving but `cccp read` shows them), run `cccp status <slug>`: it reports alive, stopped-with-reason, or died-hard (a stale pid record means nothing ran its exit path).

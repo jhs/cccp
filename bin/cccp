@@ -1109,6 +1109,63 @@ def inbox_path(slug, me):
     return run_dir() / "watchtower" / slug / me / "inbox.jsonl"
 
 
+def pid_path(slug, me):
+    """The live watchtower's pid record (JSON: pid, started), written at startup
+    and removed on any clean exit - so a pidfile with no matching process means
+    exactly "died without running its exit path" (#18). Scoped like the inbox:
+    one watchtower = one cell = one comrade."""
+    return run_dir() / "watchtower" / slug / me / "pid.json"
+
+
+def last_stop_path(slug, me):
+    """The most recent clean stop (JSON: ts, reason, pid), written by the exit
+    path pid_path's removal happens in. Survives until read; `cccp status` is
+    the reader. Never cleaned up - each stop overwrites the last."""
+    return run_dir() / "watchtower" / slug / me / "last-stop.json"
+
+
+def process_argv(pid):
+    """The command line of a live process, or None when no such process. Uses ps
+    (portable across Linux and macOS; /proc is not)."""
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    r = subprocess.run(["ps", "-o", "args=", "-p", str(pid)],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    return r.stdout.strip() or None
+
+
+def watchtower_status(slug, me):
+    """(state, human line) for my watchtower in one cell.
+
+    States: "alive" (pid record's process exists AND its argv carries both this
+    cell and my ownership tag - a recycled pid cannot fake that), "stale"
+    (pid record but no such watchtower: it died hard, nothing ran its exit
+    path), "stopped" (clean exit, reason recorded), "absent" (no record at
+    all). #18: a dead watchtower must be distinguishable from a quiet cell in
+    one command."""
+    try:
+        rec = json.loads(pid_path(slug, me).read_text())
+    except (OSError, ValueError):
+        rec = None
+    if rec:
+        pid = rec.get("pid")
+        argv = process_argv(pid)
+        if argv and f"cccp watchtower {slug} " in argv \
+                and argv.endswith(f"-- {me}"):
+            return "alive", f"alive pid={pid} started={rec.get('started', '?')}"
+        return "stale", (f"dead pid={pid}: pid record is stale - the "
+                         f"watchtower died without a clean exit (killed or "
+                         f"crashed hard), so no stop reason was recorded")
+    try:
+        stop = json.loads(last_stop_path(slug, me).read_text())
+        return "stopped", (f"stopped reason={stop.get('reason', '?')} "
+                           f"at={stop.get('ts', '?')}")
+    except (OSError, ValueError):
+        return "absent", f"no watchtower record for cell {slug!r}"
+
+
 def inbox_send(slug, me, records):
     """Append command records to my own watchtower's inbox, then wake it.
 
@@ -1449,6 +1506,43 @@ class Watchtower:
 
     def run(self):
         self._reset_inbox()
+        self._write_pidfile()
+        try:
+            self._run()
+        finally:
+            self._record_stop()
+
+    def _write_pidfile(self):
+        """Liveness record for `cccp status` (#18). Best-effort: a watchtower
+        that cannot write it still serves events."""
+        try:
+            p = pid_path(self.slug, self.me)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps({"pid": os.getpid(), "started": now_iso()}))
+        except OSError as e:
+            self._log(f"pidfile write failed ({type(e).__name__}: {e})")
+
+    def _record_stop(self):
+        """Make the death visible (#18): a final `shutdown` event while stdout
+        may still work, the reason persisted for `cccp status`, and the pidfile
+        cleared - so a pidfile that outlives us means exactly "died hard".
+        stdout_closed is the one reason that cannot be emitted (the reader is
+        what died); it is still recorded."""
+        exc = sys.exc_info()[1]
+        reason = self.stop_reason or (
+            f"crash_{type(exc).__name__}" if exc else "unknown")
+        if reason != "stdout_closed":
+            self._emit(f"shutdown {self.me} slug={self.slug} reason={reason}")
+        self._log(f"stopped reason={reason}")
+        self.log.debug(f"ev=watchtower_stop reason={_kv(reason)}")
+        try:
+            last_stop_path(self.slug, self.me).write_text(json.dumps(
+                {"ts": now_iso(), "reason": reason, "pid": os.getpid()}))
+            pid_path(self.slug, self.me).unlink(missing_ok=True)
+        except OSError as e:
+            self._log(f"stop record write failed ({type(e).__name__}: {e})")
+
+    def _run(self):
         with TimeLogger(self.log, "initial_scan"):
             self.initial_scan()
         if self.trigger:
@@ -1509,8 +1603,6 @@ class Watchtower:
             except Exception:
                 self._log("sleep/wake exception (survived):\n" + traceback.format_exc())
                 time.sleep(POLL_LADDER[-1])
-        self.log.debug(
-            f"ev=watchtower_stop reason={_kv(self.stop_reason or 'unknown')}")
 
     def _on_signal(self, signum, _frame):
         self.stop = True
@@ -1580,10 +1672,9 @@ class Watchtower:
             # Deliberate, kill-free termination (#16): the inbox is keyed
             # (cell, comrade), so only this comrade's own tooling can reach us -
             # a shutdown can never arrive from a peer's recovery routine. The
-            # emitted event tells the stdout reader the stream is ending on
-            # purpose, not dying.
+            # final `shutdown` event is emitted by _record_stop with this
+            # reason, exactly like every other stop path.
             self._log(f"inbox shutdown: {rec!r}")
-            self._emit(f"shutdown {self.me} slug={self.slug}")
             self.stop = True
             self.stop_reason = "inbox_shutdown"
             return
@@ -2362,6 +2453,22 @@ def cmd_stop(args):
             sys.exit(f"pkill failed: {r.stderr.decode().strip() or r.returncode}")
 
 
+def cmd_status(args):
+    """Report my watchtower's state for a cell: alive (verified against the
+    process table via the argv ownership tag), stopped-with-reason, or
+    died-hard (stale pid record). Exit 0 only when alive."""
+    slug = slugify(args.cell)
+    me = comrade_id()
+    cfg = resolve_config()
+    log = setup_logging(cfg, slug, me, sys.argv)
+    with subcommand_footer(log):
+        state, detail = watchtower_status(slug, me)
+        log.debug(f"ev=status state={state}")
+        print(detail)
+        if state != "alive":
+            sys.exit(1)
+
+
 def cmd_read(args):
     """Print cell message history - the on-demand history tool. Filter by sender
     (--from), recipient (--to), and select with --ts or --last."""
@@ -3048,6 +3155,12 @@ def build_parser():
                               "cleanly, via its inbox. Never touches a peer's.")
     stp.add_argument("cell", help="Cell slug.")
     stp.set_defaults(func=cmd_stop)
+
+    sts = sub.add_parser("status",
+                         help="Report whether my watchtower for this cell is "
+                              "alive - and when it is not, why it stopped.")
+    sts.add_argument("cell", help="Cell slug.")
+    sts.set_defaults(func=cmd_status)
 
     rd = sub.add_parser("read", help="Print cell message history.")
     rd.add_argument("cell", help="Cell slug.")

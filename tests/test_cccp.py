@@ -1211,11 +1211,16 @@ class InboxShutdown(unittest.TestCase):
         self.wt.emitted = []
         self.wt._emit = self.wt.emitted.append
 
-    def test_shutdown_record_stops_and_emits(self):
+    def test_shutdown_record_stops(self):
         self.wt._apply_inbox({"ev": "shutdown", "ts": "2026-07-18T00:00:00Z"})
         self.assertTrue(self.wt.stop)
         self.assertEqual(self.wt.stop_reason, "inbox_shutdown")
-        self.assertIn("shutdown me@h:mmm slug=demo", self.wt.emitted)
+
+    def test_record_stop_emits_reason(self):
+        self.wt.stop_reason = "inbox_shutdown"
+        self.wt._record_stop()
+        self.assertIn("shutdown me@h:mmm slug=demo reason=inbox_shutdown",
+                      self.wt.emitted)
 
     def test_poll_after_shutdown_skips_network(self):
         self.wt.client.blobs = None   # any scan would raise
@@ -1231,6 +1236,69 @@ class InboxShutdown(unittest.TestCase):
     def test_unknown_ev_still_ignored(self):
         self.wt._apply_inbox({"ev": "frobnicate"})
         self.assertFalse(self.wt.stop)
+
+
+class WatchtowerStatus(unittest.TestCase):
+    """#18: `cccp status` must distinguish alive, stopped-with-reason, and
+    died-hard (stale pid record) - a dead watchtower must never be mistaken
+    for a quiet cell."""
+
+    SLUG, ME = "demo", "me@h:mmm"
+
+    def setUp(self):
+        self.data = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.data, True))
+        self.env = _isolated_env(self.data)
+        self.env.__enter__()
+        self.addCleanup(lambda: self.env.__exit__(None, None, None))
+        self.wt = cccp.Watchtower(_FakeBlobClient(), "", self.SLUG, self.ME, 0)
+        self.wt.emitted = []
+        self.wt._emit = self.wt.emitted.append
+
+    def test_absent_before_any_run(self):
+        state, detail = cccp.watchtower_status(self.SLUG, self.ME)
+        self.assertEqual(state, "absent")
+        self.assertIn("no watchtower record", detail)
+
+    def test_alive_requires_matching_argv(self):
+        self.wt._write_pidfile()
+        my_argv = (f"/usr/bin/python3 /x/bin/cccp watchtower {self.SLUG} "
+                   f"-- {self.ME}")
+        with mock.patch.object(cccp, "process_argv", lambda pid: my_argv):
+            state, detail = cccp.watchtower_status(self.SLUG, self.ME)
+        self.assertEqual(state, "alive")
+        self.assertIn(f"pid={os.getpid()}", detail)
+
+    def test_recycled_pid_is_stale_not_alive(self):
+        self.wt._write_pidfile()
+        with mock.patch.object(cccp, "process_argv",
+                               lambda pid: "/usr/bin/vim notes.txt"):
+            state, detail = cccp.watchtower_status(self.SLUG, self.ME)
+        self.assertEqual(state, "stale")
+        self.assertIn("died without a clean exit", detail)
+
+    def test_hard_death_is_stale(self):
+        self.wt._write_pidfile()
+        with mock.patch.object(cccp, "process_argv", lambda pid: None):
+            state, _ = cccp.watchtower_status(self.SLUG, self.ME)
+        self.assertEqual(state, "stale")
+
+    def test_clean_stop_reports_reason_and_clears_pidfile(self):
+        self.wt._write_pidfile()
+        self.wt.stop_reason = "parent_exited"
+        self.wt._record_stop()
+        self.assertFalse(cccp.pid_path(self.SLUG, self.ME).exists())
+        state, detail = cccp.watchtower_status(self.SLUG, self.ME)
+        self.assertEqual(state, "stopped")
+        self.assertIn("reason=parent_exited", detail)
+
+    def test_crash_in_run_records_crash_reason(self):
+        self.wt.initial_scan = mock.Mock(side_effect=RuntimeError("boom"))
+        with self.assertRaises(RuntimeError):
+            self.wt.run()
+        state, detail = cccp.watchtower_status(self.SLUG, self.ME)
+        self.assertEqual(state, "stopped")
+        self.assertIn("reason=crash_RuntimeError", detail)
 
 
 class JournalRecordsOnBad(unittest.TestCase):
