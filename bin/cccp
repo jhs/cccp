@@ -91,11 +91,14 @@ IDLE_MAX_SECONDS = 24 * 3600   # cap for the idle backoff - past this, idles fir
                                # at most once a day so a long-silent watchtower
                                # stops forcing Claude to wake and respond
 PUBLISH_MAX = 256 * 1024 * 1024   # single-PUT publish ceiling; larger needs staging
-AUTODOWNLOAD_MAX = 1024 * 1024    # watchtower auto-downloads published files at or
+AUTODOWNLOAD_MAX_DEFAULT = "1m"   # watchtower auto-downloads published files at or
                                   # under this size; larger ones are only announced
                                   # (Claude fetches them with `cccp pull`). Bounded
                                   # by what downloads fast enough not to stall the
                                   # poll loop - not by "how big a file is".
+                                  # Tunable: CCCP_AUTODOWNLOAD_MAX (parse_size
+                                  # syntax); kept as its human spelling so the
+                                  # config dump can print it verbatim.
 DEBUG_LOG_MAX_BYTES = 10 * 1024 * 1024    # per debug.log; rotates to keep 5 backups
 DEBUG_LOG_BACKUPS = 5                     # so worst case ~60 MB per (cell, comrade)
 TEXT_EXTENSIONS = {
@@ -121,6 +124,18 @@ def parse_duration(text):
     if not text or not _DURATION_FULL.fullmatch(text):
         return None
     return sum(int(n) * _UNIT_SECONDS[u] for n, u in _DURATION_PART.findall(text))
+
+
+def parse_size(text):
+    """A compact byte size -> whole bytes: '4096', '512k', '10m', '1g' (suffix
+    case-insensitive, optional trailing 'b'). Returns None for anything not
+    well-formed, so a caller can reject the raw input rather than silently
+    misread it - exactly parse_duration's contract, for sizes."""
+    m = re.fullmatch(r"(\d+)\s*([kmg]?)b?", str(text).strip().lower())
+    if not m:
+        return None
+    return int(m.group(1)) * {"": 1, "k": 1024, "m": 1024 ** 2,
+                              "g": 1024 ** 3}[m.group(2)]
 
 
 def format_duration(seconds):
@@ -406,11 +421,24 @@ def resolve_config():
             params[k.lower()] = default()
     prefix = merged.get(_backend_key(backend, "PREFIX")) or spec["prefix_default"]
 
+    # Sizes are validated here, not at the use site: a malformed value must
+    # fail the command loudly (parse_duration's contract), never quietly fall
+    # back to the default - env is a config layer too and can inject garbage
+    # no `cccp config` write ever vetted.
+    raw_adl = merged.get("CCCP_AUTODOWNLOAD_MAX")
+    if raw_adl is not None and parse_size(raw_adl) is None:
+        sys.exit(f"error: CCCP_AUTODOWNLOAD_MAX {raw_adl!r} is not a size "
+                 f"('4096', '512k', '10m', '1g')")
+
     return {
         "BACKEND": backend,
         "PARAMS": params,
         "PREFIX": prefix,
         "DEBUG": merged.get("CCCP_DEBUG"),
+        "AUTODOWNLOAD_MAX": parse_size(raw_adl if raw_adl is not None
+                                       else AUTODOWNLOAD_MAX_DEFAULT),
+        "AUTODOWNLOAD_MAX_RAW": raw_adl if raw_adl is not None
+                                else AUTODOWNLOAD_MAX_DEFAULT,
         "SOURCES": sources,
     }
 
@@ -1366,10 +1394,13 @@ class Watchtower:
     live in the container."""
 
     def __init__(self, client, prefix, slug, me, idle_initial,
-                 idle_max=IDLE_MAX_SECONDS, log=None, quiet=(), trigger=None):
+                 idle_max=IDLE_MAX_SECONDS, log=None, quiet=(), trigger=None,
+                 autodownload_max=None):
         self.client = client
         self.prefix = prefix
         self.slug = slug
+        self.autodownload_max = (autodownload_max if autodownload_max is not None
+                                 else parse_size(AUTODOWNLOAD_MAX_DEFAULT))
         self.me = me
         # Alias support is opt-in: with no --alias-trigger, `self.trigger` is None
         # and the whole feature is inert (no seed, no learn, no translation).
@@ -1978,7 +2009,7 @@ class Watchtower:
         to stall the poll loop and add its local path to the event; just announce
         larger ones for `cccp pull`. On unpublish, drop the mirror copy."""
         op, wire_path = d.get("op"), d.get("path", "")
-        if op == "publish" and d.get("size", 0) <= AUTODOWNLOAD_MAX:
+        if op == "publish" and d.get("size", 0) <= self.autodownload_max:
             try:
                 with TimeLogger(self.log, "auto_download", path=wire_path,
                                 size=d.get("size", 0)):
@@ -2457,7 +2488,8 @@ def cmd_watchtower(args):
     # with a reason, which is the richer lifecycle record for a long-lived
     # process.
     Watchtower(client, cfg["PREFIX"], slug, me, args.idle * 60, log=log,
-               quiet=args.quiet, trigger=args.alias_trigger).run()
+               quiet=args.quiet, trigger=args.alias_trigger,
+               autodownload_max=cfg["AUTODOWNLOAD_MAX"]).run()
 
 
 def cmd_wake(args):
@@ -2935,7 +2967,7 @@ def _config_destinations():
     the BACKENDS registry, so adding a backend auto-claims its key namespace
     with nothing extra to register. Exact-match only: prefix routing would
     happily write a typo'd key and leave a <missing> to debug later."""
-    dest = {"CCCP_DEBUG": "config"}
+    dest = {"CCCP_DEBUG": "config", "CCCP_AUTODOWNLOAD_MAX": "config"}
     for name, spec in BACKENDS.items():
         for key in _config_keys(name):
             file = "secrets" if key in spec["secrets"] else "config"
@@ -2954,6 +2986,8 @@ def _global_rows(cfg):
         ("CCCP_PLUGIN_DATA", root, ["env"], root),
         ("CCCP_DEBUG", "on" if _truthy(cfg["DEBUG"]) else "off",
          src.get("CCCP_DEBUG", []), cfg["DEBUG"]),
+        ("CCCP_AUTODOWNLOAD_MAX", cfg["AUTODOWNLOAD_MAX_RAW"],
+         src.get("CCCP_AUTODOWNLOAD_MAX", []), cfg["AUTODOWNLOAD_MAX_RAW"]),
         ("CCCP_ACTIVE_BACKEND", cfg["BACKEND"],
          src.get("CCCP_ACTIVE_BACKEND", []), cfg["BACKEND"]),
     ]
@@ -3069,6 +3103,13 @@ def _config_set(assignments):
                     "user run this command themselves, in their own terminal, "
                     "with CCCP_PLUGIN_DATA set and cccp's full path.")
                 sys.exit(f"error: no value for {key} on stdin.{hint}")
+        # Typed keys are vetted at write time too, so a bad value dies here
+        # with context instead of at the next resolve_config in some other
+        # command. (Read-side validation still stands: env bypasses this.)
+        if key == "CCCP_AUTODOWNLOAD_MAX" and value \
+                and parse_size(value) is None:
+            sys.exit(f"error: {key} {value!r} is not a size "
+                     f"('4096', '512k', '10m', '1g')")
         _write_kv(plugin_data_dir() / rel, key, value or None)
         print(f"{'Set' if value else 'Removed'} {key} ({rel})")
         if key in env:

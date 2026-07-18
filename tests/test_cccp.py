@@ -974,6 +974,54 @@ class BackendConfigWrite(unittest.TestCase):
                          {"CCCP_AZURE_BLOB_CONTAINER": "cont"})
 
 
+class ParseSize(unittest.TestCase):
+    """parse_size mirrors parse_duration's contract: human spellings to whole
+    bytes, None for anything malformed - reject, never misread."""
+
+    def test_spellings(self):
+        for text, want in (("4096", 4096), ("512k", 512 * 1024),
+                           ("10m", 10 * 1024 ** 2), ("1g", 1024 ** 3),
+                           ("1M", 1024 ** 2), ("2kb", 2048), (" 1m ", 1024 ** 2)):
+            self.assertEqual(cccp.parse_size(text), want, text)
+
+    def test_malformed_is_none(self):
+        for text in ("", "m", "1.5m", "-1", "10 megs", "1mm", None):
+            self.assertIsNone(cccp.parse_size(text), text)
+
+
+class AutodownloadMax(unittest.TestCase):
+    """CCCP_AUTODOWNLOAD_MAX: the first strictly-typed config key - validated
+    loudly at write AND resolve (env can inject what no write ever vetted)."""
+
+    def setUp(self):
+        self.data = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.data, True))
+
+    def test_defaults_to_1m(self):
+        with _isolated_env(self.data):
+            cfg = cccp.resolve_config()
+        self.assertEqual(cfg["AUTODOWNLOAD_MAX"], 1024 ** 2)
+        self.assertEqual(cfg["AUTODOWNLOAD_MAX_RAW"], "1m")
+
+    def test_env_override_parses(self):
+        with _isolated_env(self.data, CCCP_AUTODOWNLOAD_MAX="512k"):
+            cfg = cccp.resolve_config()
+        self.assertEqual(cfg["AUTODOWNLOAD_MAX"], 512 * 1024)
+
+    def test_malformed_env_fails_loudly(self):
+        with _isolated_env(self.data, CCCP_AUTODOWNLOAD_MAX="lots"):
+            with self.assertRaises(SystemExit) as cm:
+                cccp.resolve_config()
+        self.assertIn("CCCP_AUTODOWNLOAD_MAX", str(cm.exception))
+
+    def test_watchtower_threshold_follows_config(self):
+        wt = cccp.Watchtower(None, "", "demo", "u@h:aaa", 0,
+                             autodownload_max=100)
+        self.assertEqual(wt.autodownload_max, 100)
+        wt = cccp.Watchtower(None, "", "demo", "u@h:aaa", 0)
+        self.assertEqual(wt.autodownload_max, 1024 ** 2)
+
+
 class ConfigSet(unittest.TestCase):
     """`cccp config KEY=VALUE` routes each canonical key to its proper file via
     the registry map, refuses what it must, and never leaves 'which file did
@@ -1052,6 +1100,16 @@ class ConfigSet(unittest.TestCase):
             with self.assertRaises(SystemExit) as cm:
                 cccp._config_set(["CCCP_PLUGIN_DATA=/x"])
         self.assertIn("environment-only", str(cm.exception))
+
+    def test_size_key_rejects_malformed_at_write(self):
+        with _isolated_env(self.data):
+            with self.assertRaises(SystemExit) as cm:
+                cccp._config_set(["CCCP_AUTODOWNLOAD_MAX=lots"])
+        self.assertIn("not a size", str(cm.exception))
+
+    def test_size_key_accepts_and_routes(self):
+        out = self._set(["CCCP_AUTODOWNLOAD_MAX=10m"])
+        self.assertIn("Set CCCP_AUTODOWNLOAD_MAX (config)", out)
 
     def test_env_shadowed_write_warns(self):
         out = self._set(["CCCP_DEBUG=0"], CCCP_DEBUG="1")
