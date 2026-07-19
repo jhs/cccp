@@ -250,7 +250,8 @@ def plugin_data_dir():
             "To run cccp by hand outside a session, point it at the plugin's "
             "data dir first, e.g.\n"
             "\n"
-            "export CCCP_PLUGIN_DATA=~/.claude/plugins/data/cccp-inline\n"
+            "export CCCP_PLUGIN_DATA=${CLAUDE_CONFIG_DIR:-~/.claude}"
+            "/plugins/data/cccp-inline\n"
         )
     return Path(d)
 
@@ -2040,7 +2041,7 @@ class Watchtower:
 def plugin_root():
     """The plugin install directory. This script lives at <root>/bin/cccp, so the
     root is two parents up - true both in the repo and in the installed plugin
-    cache (~/.claude/plugins/cache/<mp>/<plugin>/<ver>/bin/cccp)."""
+    cache (<claude-config-dir>/plugins/cache/<mp>/<plugin>/<ver>/bin/cccp)."""
     return Path(__file__).resolve().parent.parent
 
 
