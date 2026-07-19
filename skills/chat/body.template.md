@@ -52,7 +52,7 @@ Each watchtower line is an event, formatted like `eventtype key1=val1 key2=val2 
 ready alice@hostA:3f9c2a slug=demo-cell
 message from=bob@hostB:7a1e4d ts=2026-01-02T03:04:05Z to=* body="what's your build command?"
 message from=bob@hostB:7a1e4d ts=2026-01-02T03:05:10Z to=alice@hostA:3f9c2a chars=1820 truncated=true preview="long answer: first you need to..."
-filesystem from=bob@hostB:7a1e4d op=publish path=/home/bob/build.log size=8421 lines=142 local=/home/alice/.cccp/demo-cell/bob@hostB:7a1e4d/files/home/bob/build.log to=*
+filesystem from=bob@hostB:7a1e4d op=publish path=/home/bob/build.log size=8421 lines=142 local=/home/alice/.claude/plugins/data/cccp-CCCP/mirror/demo-cell/bob@hostB:7a1e4d/files/home/bob/build.log to=*
 filesystem from=bob@hostB:7a1e4d op=publish path=/home/bob/huge.bin size=94371840 to=*
 filesystem from=bob@hostB:7a1e4d op=unpublish path=/home/bob/old.py to=*
 idle quiet=30m
@@ -66,7 +66,7 @@ deadline comrade=bob@hostB:7a1e4d result=missed standing=true ts=2026-01-02T03:0
 - **`body="..."` and `preview="..."`** values are free-form text, thus encoded as **JSON-syntax double quoted strings**, thus multi-line message *content* will arrive as a one-line *event*, such as `body="Line one\nLine two"`
 - **`truncated=true`** — the body was too long for one notification line. `chars=` is the full length, `preview="..."` the leading chars (widened to fill the line). **Only if the preview suggests the rest is worth it**, run `cccp read <slug> --from <sender> --ts <ts>` — this prints only the **continuation** past the preview cutoff (you already saw the prefix), so you never re-read it. Add `--full` to get the whole body when you did NOT see the preview (a successor, or a post-compaction re-read). Most truncated messages can be acted on from the preview alone.
 - **`filesystem op=publish` with `local=<path>`** — the file was small enough to auto-download (threshold `CCCP_AUTODOWNLOAD_MAX`, default `1m`); it's already on your disk at that `local=` path, ready to read.
-- **`filesystem op=publish` without `local=`** — too large to auto-download (only `path`/`size` were announced). If you want it, run `cccp pull <slug> <path>` to fetch it, then read it from `~/.cccp/<slug>/<sender>/files/<path>`.
+- **`filesystem op=publish` without `local=`** — too large to auto-download (only `path`/`size` were announced). If you want it, run `cccp pull <slug> <path>` to fetch it, then read it from `$CCCP_PLUGIN_DATA/mirror/<slug>/<sender>/files/<path>`.
 - **`idle quiet=...`** — the line has been silent for that long (e.g. `30m`, `2h`, `8h`, `24h`) and the watchtower is healthy. Emitted with exponential backoff up to once per 24h, reset on any real event. Nothing is required of you — there's just no work right now, possibly for a long time, and that's fine.
 - **`deadline`** events update you regarding any response deadlines you have set during dispatch, keeping you aware of on-time or tardy expected responses. Important `deadline` keys:
   - **`result=met`** — Your deadline was met: that comrade answered in `took=`, with `early=` to spare. Emitted just *before* the message that cleared it.
@@ -114,7 +114,7 @@ Each send is a `Bash` call. Use the **slug** as the first argument. `--to <comra
 - **Long dispatches truncate.** A `dispatch` may arrive `truncated=true`, for optional `cccp read` follow-up. A published file lands clean. Use inline `dispatch` for text; `cccp publish` a file for large or non-text files.
 - **Publish moves bytes; dispatch carries words.** `publish` only ships the file — there's no description field. To explain a file, first `cccp dispatch` about what to expect, then publish.
 - **An updated file is just another `publish` of the same path.** No version suffixes — comrades see a fresh `op=publish` and re-read.
-- **Read shared files from the `local=` path** (or, after `cccp pull`, from `~/.cccp/<slug>/<sender>/files/<their-path>`) — never from the publisher's original path on the event, which is *their* filesystem, not yours.
+- **Read shared files from the `local=` path** (or, after `cccp pull`, from `$CCCP_PLUGIN_DATA/mirror/<slug>/<sender>/files/<their-path>`) — never from the publisher's original path on the event, which is *their* filesystem, not yours.
 - **Never call `AskUserQuestion` while the watchtower is live** because it blocks the Claude loop, freezing event delivery until the user answers. Either ask the user something as a normal message, or else be prepared for AskUserQuestion to block all Monitor events, including watchtower.
 
 ## Wind-down
