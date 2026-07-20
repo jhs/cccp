@@ -974,6 +974,69 @@ class BackendConfigWrite(unittest.TestCase):
                          {"CCCP_AZURE_BLOB_CONTAINER": "cont"})
 
 
+class TelemetryVersionSegment(unittest.TestCase):
+    """Telemetry is partitioned by the writing plugin's major version so two
+    releases sharing one marketplace data root cannot collide. Three programs
+    derive that segment independently - bin/cccp-statusline (bash, the writer),
+    bin/claude-tokens (the reader) and bin/cccp (setup detection) - so this
+    exercises all three against one fake plugin root and asserts they agree.
+    A divergence here strands the reader silently: jhs/cccp#14's failure mode."""
+
+    BINS = ("cccp", "cccp-statusline", "claude-tokens")
+
+    def _root(self, version, git=False):
+        import shutil
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(root, True))
+        (root / "bin").mkdir()
+        (root / ".claude-plugin").mkdir()
+        here = Path(__file__).resolve().parent.parent / "bin"
+        for name in self.BINS:
+            shutil.copy2(here / name, root / "bin" / name)
+        (root / ".claude-plugin" / "plugin.json").write_text(
+            json.dumps({"name": "cccp", "version": version}, indent=2))
+        if git:
+            (root / ".git").mkdir()
+        return root
+
+    def _segments(self, root):
+        """(statusline, claude-tokens, cccp) as each program computes it."""
+        import subprocess
+        data = root / "data"
+        subprocess.run([str(root / "bin" / "cccp-statusline"),
+                        f"--plugin-data={data}", "--passthrough"],
+                       input=b'{"session_id":"probe"}',
+                       capture_output=True, check=True)
+        written = list((data / "telemetry").glob("*/claude-code/probe.json"))
+        self.assertEqual(len(written), 1, "statusline wrote no snapshot")
+        probe = (
+            "import importlib.util,importlib.machinery,sys;"
+            "s=importlib.util.spec_from_loader('m',"
+            "importlib.machinery.SourceFileLoader('m',sys.argv[1]));"
+            "m=importlib.util.module_from_spec(s);s.loader.exec_module(m);"
+            "print((getattr(m,'_version_segment',None)"
+            " or m.telemetry_version_segment)())"
+        )
+        out = [subprocess.run(["python3", "-c", probe, str(root / "bin" / n)],
+                              capture_output=True, text=True, check=True).stdout.strip()
+               for n in ("claude-tokens", "cccp")]
+        return (written[0].parent.parent.name, out[0], out[1])
+
+    def test_release_versions_agree(self):
+        for version, want in (("3.0.0", "v3"), ("4.2.1", "v4"),
+                              ("12.0.0-rc1", "v12")):
+            segs = self._segments(self._root(version))
+            self.assertEqual(segs, (want, want, want), f"version {version}")
+
+    def test_checkout_is_inline_in_all_three(self):
+        segs = self._segments(self._root("3.0.0", git=True))
+        self.assertEqual(segs, ("inline", "inline", "inline"))
+
+    def test_unparseable_version_agrees_on_unknown(self):
+        segs = self._segments(self._root("not-a-version"))
+        self.assertEqual(segs, ("unknown", "unknown", "unknown"))
+
+
 class ParseSize(unittest.TestCase):
     """parse_size mirrors parse_duration's contract: human spellings to whole
     bytes, None for anything malformed - reject, never misread."""

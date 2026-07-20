@@ -4,7 +4,8 @@
 See skills/token-aware/SKILL.md for usage.
 
 Reads the per-session snapshot the statusLine side-write drops at
-$CCCP_PLUGIN_DATA/telemetry/claude-code/<session_id>.json (see bin/cccp-statusline). 'status'
+$CCCP_PLUGIN_DATA/telemetry/<v-major|inline>/claude-code/<session_id>.json
+(see bin/cccp-statusline). 'status'
 prints a one-shot summary; 'watch' streams milestone events for the Monitor
 tool. Session id resolves from the optional positional arg, else
 $CLAUDE_CODE_SESSION_ID, else the newest snapshot on disk.
@@ -13,9 +14,30 @@ $CLAUDE_CODE_SESSION_ID, else the newest snapshot on disk.
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
+
+
+def _version_segment():
+    """The telemetry partition this plugin copy owns: `v<major>` from its own
+    plugin.json, or `inline` for a checkout (whose version is whatever the
+    branch says, not a release).
+
+    bin/cccp-statusline WRITES the directory this names and derives it from the
+    same file by the same rule - major digits before the first dot, .git means
+    inline. Keep the two identical: a divergence strands the reader silently,
+    which is exactly the failure jhs/cccp#14 was."""
+    root = Path(__file__).resolve().parent.parent
+    if (root / ".git").exists():
+        return "inline"
+    try:
+        raw = json.loads((root / ".claude-plugin" / "plugin.json").read_text())
+        m = re.match(r"(\d+)\.", str(raw.get("version", "")))
+        return f"v{m.group(1)}" if m else "unknown"
+    except (OSError, ValueError):
+        return "unknown"
 
 
 def _data_dir():
@@ -24,7 +46,7 @@ def _data_dir():
         print("CCCP_PLUGIN_DATA is not set -- is the cccp plugin enabled?",
               file=sys.stderr)
         sys.exit(1)
-    return Path(d) / "telemetry" / "claude-code"
+    return Path(d) / "telemetry" / _version_segment() / "claude-code"
 
 
 DEFAULT_THRESHOLDS = (50, 75, 90, 95)

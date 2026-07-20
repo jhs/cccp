@@ -212,7 +212,9 @@ def current_session_id():
 #                         authoritative local cell store, azure-blob/ holds only
 #                         connection config
 #   mirror/               cache: pulled files, aliases, per-cell debug + watchtower logs
-#   telemetry/            cache: harvested session data (token-aware)
+#   telemetry/<version>/  cache: harvested session data (token-aware), keyed by
+#                         the writing plugin's major version (or "inline"), so
+#                         releases sharing one data root never collide
 #   run/                  ephemeral inter-process runtime state (the /var/run of
 #                         the tree): watchtower inboxes today, pidfiles later
 #
@@ -2228,11 +2230,36 @@ def _ds_validate(plugin_data):
             f"Plugin data directory `{plugin_data}` is not writable: {e}")
 
 
+def telemetry_version_segment():
+    """The telemetry partition this plugin copy owns: `v<major>` from its own
+    plugin.json, or `inline` for a checkout (whose version is whatever the
+    branch says, not a release).
+
+    One data root holds every version installed from one marketplace, so
+    partitioning by major version keeps two releases from scribbling on each
+    other's snapshots. bin/cccp-statusline (the writer) and bin/claude-tokens
+    (the reader) derive this from the same file by the same rule - major digits
+    before the first dot, .git means inline. All three must stay identical: a
+    divergence strands the reader silently, which is exactly #14's failure."""
+    root = plugin_root()
+    if (root / ".git").exists():
+        return "inline"
+    try:
+        raw = json.loads((root / ".claude-plugin" / "plugin.json").read_text())
+        m = re.match(r"(\d+)\.", str(raw.get("version", "")))
+        return f"v{m.group(1)}" if m else "unknown"
+    except (OSError, ValueError):
+        return "unknown"
+
+
 def _ds_detect(plugin_data):
-    # Harvested session telemetry lives under telemetry/claude-code/ (see
-    # bin/cccp-statusline and the plugin data tree above): an auth-status.json plus one
-    # <session-uuid>.json per session.
-    tele = Path(plugin_data) / "telemetry" / "claude-code"
+    # Harvested session telemetry lives under
+    # telemetry/<v-major|inline>/claude-code/ (see bin/cccp-statusline and the
+    # plugin data tree above): an auth-status.json plus one <session-uuid>.json
+    # per session. Detection is per-version: a v3 tree says nothing about
+    # whether THIS copy's statusLine write is wired up.
+    tele = (Path(plugin_data) / "telemetry" / telemetry_version_segment()
+            / "claude-code")
     if not (tele / "auth-status.json").exists():
         return False
     try:

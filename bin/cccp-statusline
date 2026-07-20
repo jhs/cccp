@@ -31,9 +31,33 @@ fi
 
 input=$(cat)
 
-# Harvested Claude Code session telemetry lives under telemetry/claude-code/ in
-# the plugin data tree (see the map in bin/cccp). --plugin-data is still the tree root.
-tele_dir="$data_dir/telemetry/claude-code"
+# Harvested Claude Code session telemetry lives under
+# telemetry/<v-major|inline>/claude-code/ in the plugin data tree (see the map
+# in bin/cccp). --plugin-data is still the tree root.
+#
+# One data root holds every version installed from one marketplace (the root is
+# keyed by marketplace, not version), so the tree is partitioned by the WRITING
+# plugin's major version - v3, v4 - and two releases can never scribble on each
+# other's snapshots. A checkout writes to "inline" instead: its plugin.json
+# version is whatever the branch happens to say, which is not a release.
+#
+# claude-tokens reads this same directory and derives the segment from the same
+# file by the same rule (major digits before the first dot, .git means inline).
+# The two rules must stay identical: a divergence silently strands the reader,
+# which is exactly the failure jhs/cccp#14 was.
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+if [[ -d "$root/.git" ]]; then
+    version_segment="inline"
+else
+    major=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([0-9][0-9]*\)\..*/\1/p' \
+        "$root/.claude-plugin/plugin.json" 2>/dev/null | head -1)
+    if [[ -n "$major" ]]; then
+        version_segment="v$major"
+    else
+        version_segment="unknown"
+    fi
+fi
+tele_dir="$data_dir/telemetry/$version_segment/claude-code"
 
 # Write claude auth status. Cached with 5h TTL.
 auth_file="$tele_dir/auth-status.json"
