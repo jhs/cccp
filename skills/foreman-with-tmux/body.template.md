@@ -6,6 +6,8 @@ The Foreman sections above cover staffing authority and lifecycle decisions. Thi
 
 Each comrade runs as a `claude` process in its own tmux window. The window name IS the role name — `Builder`, `Analyst`, whatever fits the slice. One window per role; `spawn-comrade` refuses duplicates.
 
+A standing role therefore keeps its bare name for the life of the cell, which makes an **overlap succession** — successor spawned while the incumbent is still up — the one case that collides. Rename the incumbent out of the way first (`tmux rename-window -t <Role> <Role>Retiring`), spawn the successor under the canonical name, then kill the retiring window once the handover is done. The Foreman's own succession is this pattern plus a window swap; see below.
+
 ## Spawning a comrade
 
 ```
@@ -63,11 +65,34 @@ Verify delivery with `tmux capture-pane`.
 
 ## Foreman succession
 
-When handing off to a successor Foreman:
+**The Foreman holds window 0.** Under tmux's default `base-index 0`, that makes `<session>:0` the cell's coordinator no matter who currently holds the role — one fixed place to look. Indices are incidental everywhere else; the window *name* is the stable handle, and the swap in step 3 is what keeps the slot across a succession.
 
 1. **Rename your window first:** `tmux rename-window -t Foreman ForemanEmeritus`
+   Frees the name `Foreman` for the spawn. You still hold window 0.
 2. **Spawn the successor:** `spawn-comrade -m <model> -e <effort> --skill foreman-with-tmux Foreman <slug>`
+   It lands at a nonzero index, since 0 is still yours.
+3. **Swap it into window 0:** `tmux swap-window -d -s Foreman -t ForemanEmeritus`
+   By name: `Foreman` moves to index 0, `ForemanEmeritus` to the successor's old index. `-d` leaves focus where it is.
 
 Rename-before-spawn is load-bearing — `spawn-comrade` refuses duplicate window names, so spawning before renaming fails on the name collision.
 
-After the successor is settled, it terminates you: `tmux kill-window -t ForemanEmeritus`.
+### Parking as ForemanEmeritus
+
+Once the successor introduces itself you are **query-only**: it owns the live map and every routine cell event. Answer direct questions about past decisions and the reasoning behind them; drive nothing, and stay off broadcasts — every event you respond to re-processes your near-full context for work that is no longer yours.
+
+**Silence your idle heartbeats.** Stop your watchtower Monitor and restart it with `--idle 0`:
+
+```
+cccp watchtower <slug> --idle 0
+```
+
+A default watchtower emits an `idle` heartbeat on a healthy quiet cell (30 min, then doubling). Each one forces a full-context generation on a near-full Emeritus for no reason. `--idle 0` drops only the heartbeats — a direct dispatch still wakes you.
+
+### Resolving the Emeritus
+
+An Emeritus is a decaying asset, so the successor sets itself a deadline for dealing with one: on joining, it arms an early milestone on its own token watch — `claude-tokens watch --threshold 20 --threshold 50 ...` — as a **forcing point**. When that milestone fires, resolve the Emeritus one of two ways. Don't let it drift past.
+
+- **Kill it — the default.** If it isn't actively adding value: `tmux kill-window -t ForemanEmeritus`. No ceremony and no goodbye dispatch; a quiet comrade is just quiet.
+- **Escalate — the exception.** If it *is* still adding value, it holds something the cell never absorbed. Surface that to your principal instead of quietly leaning on it: a near-full session is itself at risk of exhausting its context and losing what it knows, so how to preserve it is their call, not a dependency to take on silently.
+
+Either way, querying an Emeritus is expensive — each input re-processes its whole context. That cost is the reason for the forcing point.
