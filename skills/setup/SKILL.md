@@ -1,6 +1,6 @@
 ---
 name: setup
-description: This skill should be used when the user wants to inspect, choose, configure, or troubleshoot the CCCP data backend. Phrases like "which cccp backend am I on", "set up cccp on azure", "switch cccp to local-fs", "why can't cccp reach the hub". NOT for joining cells or messaging — use the `chat` skill for that.
+description: This skill should be used when the user wants to inspect, choose, configure, or troubleshoot the CCCP data backend, or to read or set any CCCP config value. Phrases like "which cccp backend am I on", "set up cccp on azure", "switch cccp to local-fs", "why can't cccp reach the hub", "what cccp settings do I have", "set a cccp config value", "where does cccp config live". NOT for joining cells or messaging — use the `chat` skill for that.
 argument-hint: [what you want to do with the backend]
 allowed-tools: Bash
 ---

@@ -1085,6 +1085,66 @@ class AutodownloadMax(unittest.TestCase):
         self.assertEqual(wt.autodownload_max, 1024 ** 2)
 
 
+class AliasTrigger(unittest.TestCase):
+    """CCCP_ALIAS_TRIGGER: config, not a watchtower flag. A cell-wide convention
+    reads as configuration, and the env layer already supplies the one-off
+    override (`CCCP_ALIAS_TRIGGER=... cccp watchtower <slug>`) that a flag would
+    have duplicated. Unset means off, so bare `chat` is untouched."""
+
+    def setUp(self):
+        self.data = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.data, True))
+
+    def test_defaults_to_off(self):
+        with _isolated_env(self.data):
+            self.assertIsNone(cccp.resolve_config()["ALIAS_TRIGGER"])
+
+    def test_env_override_resolves(self):
+        with _isolated_env(self.data, CCCP_ALIAS_TRIGGER="Intro:"):
+            self.assertEqual(cccp.resolve_config()["ALIAS_TRIGGER"], "Intro:")
+
+    def test_short_trigger_fails_loudly_from_env(self):
+        # The write path never saw this value; resolve must still refuse it.
+        with _isolated_env(self.data, CCCP_ALIAS_TRIGGER="Hi"):
+            with self.assertRaises(SystemExit) as cm:
+                cccp.resolve_config()
+        self.assertIn("CCCP_ALIAS_TRIGGER", str(cm.exception))
+
+    def test_short_trigger_fails_loudly_at_write(self):
+        with _isolated_env(self.data):
+            with self.assertRaises(SystemExit) as cm:
+                cccp._config_set(["CCCP_ALIAS_TRIGGER=Hi"])
+        self.assertIn("CCCP_ALIAS_TRIGGER", str(cm.exception))
+
+    def test_boundary_is_three(self):
+        self.assertIsNotNone(cccp._typed_key_error("CCCP_ALIAS_TRIGGER", "Hi"))
+        self.assertIsNone(cccp._typed_key_error("CCCP_ALIAS_TRIGGER", "Hi:"))
+
+    def test_write_then_resolve_round_trips(self):
+        with _isolated_env(self.data):
+            with contextlib.redirect_stdout(io.StringIO()):
+                cccp._config_set(["CCCP_ALIAS_TRIGGER=Intro:"])
+            self.assertEqual(cccp.resolve_config()["ALIAS_TRIGGER"], "Intro:")
+
+    def test_both_typed_keys_share_one_validator(self):
+        # The DRY contract: one function decides legality for every typed key,
+        # so the write path and the resolve path can never drift apart.
+        self.assertEqual(cccp.TYPED_KEYS,
+                         ("CCCP_AUTODOWNLOAD_MAX", "CCCP_ALIAS_TRIGGER"))
+        for key in cccp.TYPED_KEYS:
+            self.assertIsNone(cccp._typed_key_error(key, ""))     # unset is fine
+            self.assertIsNone(cccp._typed_key_error(key, None))
+        self.assertIsNotNone(cccp._typed_key_error("CCCP_AUTODOWNLOAD_MAX", "lots"))
+        self.assertIsNotNone(cccp._typed_key_error("CCCP_ALIAS_TRIGGER", "I"))
+
+    def test_the_triggers_it_rejects_are_the_ones_that_mis_parse(self):
+        # Why ALIAS_TRIGGER_MIN exists: parse_alias cannot catch these, because
+        # by the time it runs the short trigger has already matched prose. Both
+        # lengths below the floor yield a plausible-looking, wrong alias.
+        self.assertEqual(cccp.parse_alias("I am ready", "I"), "am")
+        self.assertEqual(cccp.parse_alias("Hi all, I'm Bob", "Hi"), "all")
+
+
 class ConfigSet(unittest.TestCase):
     """`cccp config KEY=VALUE` routes each canonical key to its proper file via
     the registry map, refuses what it must, and never leaves 'which file did
@@ -1421,11 +1481,11 @@ class WakePattern(unittest.TestCase):
 
     WT_BARE = "/usr/bin/python3 /x/bin/cccp watchtower demo -- u@h:aaaaaa"
     WT_FLAGS = ("/usr/bin/python3 /x/bin/cccp watchtower demo "
-                "--alias-trigger Intro: -- u@h:aaaaaa")
+                "--quiet filesystem -- u@h:aaaaaa")
     WRAP_BARE = ("bash -c cd /x && eval 'bin/cccp watchtower demo' "
                  "< /dev/null && echo done")
     WRAP_FLAGS = ("bash -c cd /x && eval 'bin/cccp watchtower demo "
-                  "--alias-trigger 'Intro:'' < /dev/null && echo done")
+                  "--quiet filesystem' < /dev/null && echo done")
 
     def _hits(self, cmdline, slug="demo"):
         import re as _re

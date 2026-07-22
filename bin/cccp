@@ -99,6 +99,15 @@ AUTODOWNLOAD_MAX_DEFAULT = "1m"   # watchtower auto-downloads published files at
                                   # Tunable: CCCP_AUTODOWNLOAD_MAX (parse_size
                                   # syntax); kept as its human spelling so the
                                   # config dump can print it verbatim.
+ALIAS_TRIGGER_MIN = 3   # shortest usable CCCP_ALIAS_TRIGGER. Below this a
+                        # trigger is just a prose prefix: 'I' turns "I am ready"
+                        # into the alias 'am', and 'Hi' turns "Hi all, I'm Bob"
+                        # into 'all'. parse_alias cannot catch either - by then
+                        # the trigger has already matched - so the only place to
+                        # reject them is where the trigger is configured. Three
+                        # is not a guarantee (no length makes a trigger
+                        # distinctive), just the floor below which it is
+                        # guaranteed WRONG.
 DEBUG_LOG_MAX_BYTES = 10 * 1024 * 1024    # per debug.log; rotates to keep 5 backups
 DEBUG_LOG_BACKUPS = 5                     # so worst case ~60 MB per (cell, comrade)
 TEXT_EXTENSIONS = {
@@ -362,6 +371,34 @@ def _env_layer():
     return {k: v for k, v in os.environ.items() if k.startswith("CCCP_")}
 
 
+# Global keys whose value has a shape, so a wrong one is worth refusing rather
+# than carrying to the use site. Backend params are absent on purpose: they are
+# opaque strings (an account name, a SAS) that only the store can judge, which
+# `cccp backend check` does over the network.
+TYPED_KEYS = ("CCCP_AUTODOWNLOAD_MAX", "CCCP_ALIAS_TRIGGER")
+
+
+def _typed_key_error(key, value):
+    """The one vetting pass for TYPED_KEYS: an error string, or None if the value
+    is fine. Empty/absent is always fine - it means "unset", which each key reads
+    as its default or as off.
+
+    Both config paths call this, which is not redundancy but two different jobs:
+    `cccp config` vets a write so a typo dies at the keyboard with context, and
+    resolve_config vets the merged result because env is a config layer too and
+    bypasses the write path entirely. One function so the two can never drift on
+    what is legal or on how the refusal reads."""
+    if not value:
+        return None
+    if key == "CCCP_AUTODOWNLOAD_MAX" and parse_size(value) is None:
+        return f"{key} {value!r} is not a size ('4096', '512k', '10m', '1g')"
+    if key == "CCCP_ALIAS_TRIGGER" and len(value) < ALIAS_TRIGGER_MIN:
+        return (f"{key} {value!r} is too short to be a declaration prefix - it "
+                f"would match ordinary prose and harvest garbage names. Use "
+                f"something deliberate, like 'Intro:'")
+    return None
+
+
 def resolve_config():
     """Resolve the active backend and its config.
 
@@ -424,15 +461,16 @@ def resolve_config():
             params[k.lower()] = default()
     prefix = merged.get(_backend_key(backend, "PREFIX")) or spec["prefix_default"]
 
-    # Sizes are validated here, not at the use site: a malformed value must
-    # fail the command loudly (parse_duration's contract), never quietly fall
-    # back to the default - env is a config layer too and can inject garbage
-    # no `cccp config` write ever vetted.
-    raw_adl = merged.get("CCCP_AUTODOWNLOAD_MAX")
-    if raw_adl is not None and parse_size(raw_adl) is None:
-        sys.exit(f"error: CCCP_AUTODOWNLOAD_MAX {raw_adl!r} is not a size "
-                 f"('4096', '512k', '10m', '1g')")
+    # Typed values are validated here, not at the use site: a malformed value must
+    # fail the command loudly, never quietly fall back to the default - env is a
+    # config layer too and can inject garbage no `cccp config` write ever vetted.
+    # _typed_key_error is the single source of truth; `cccp config` calls it too.
+    for key in TYPED_KEYS:
+        err = _typed_key_error(key, merged.get(key))
+        if err:
+            sys.exit(f"error: {err}")
 
+    raw_adl = merged.get("CCCP_AUTODOWNLOAD_MAX")
     return {
         "BACKEND": backend,
         "PARAMS": params,
@@ -442,6 +480,8 @@ def resolve_config():
                                        else AUTODOWNLOAD_MAX_DEFAULT),
         "AUTODOWNLOAD_MAX_RAW": raw_adl if raw_adl is not None
                                 else AUTODOWNLOAD_MAX_DEFAULT,
+        # None when unset, which is exactly "aliases off" (see parse_alias).
+        "ALIAS_TRIGGER": merged.get("CCCP_ALIAS_TRIGGER"),
         "SOURCES": sources,
     }
 
@@ -1287,12 +1327,17 @@ def wake_watchtowers(slug):
 #
 # Aliases are human/LLM-friendly names for comrades, kept as a LOCAL projection:
 # the wire and the data model always carry raw user@host:hex ids. A comrade
-# declares its alias in an intro whose body starts with the watchtower's
-# --alias-trigger prefix; every armed comrade - including the declarer's own
-# watchtower, which reads its own gazette for exactly this - learns it and
-# translates on the way in (watchtower metadata) and out (dispatch --to). Off
-# entirely unless a trigger is set, so bare `chat` is unchanged; `team` is the
-# layer that turns it on.
+# declares its alias in an intro whose body starts with the CCCP_ALIAS_TRIGGER
+# prefix; every armed comrade - including the declarer's own watchtower, which
+# reads its own gazette for exactly this - learns it and translates on the way in
+# (watchtower metadata) and out (dispatch --to). Off entirely unless a trigger is
+# set, so bare `chat` is unchanged; `team` is the layer that turns it on.
+#
+# The trigger is config, not a watchtower flag: a cell-wide convention every
+# comrade must agree on reads as configuration, and the config layers already
+# give a one-off override for free - `CCCP_ALIAS_TRIGGER='Intro:' cccp watchtower
+# <slug>` beats the file, and cmd_watchtower's re-exec keeps environ, so it
+# survives into the process that actually parses.
 
 ALIAS_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")   # a shell-safe alias
 ALIAS_SEED_BYTES = 64 * 1024   # per-gazette cap when seeding the map at startup.
@@ -2516,7 +2561,7 @@ def cmd_watchtower(args):
     # with a reason, which is the richer lifecycle record for a long-lived
     # process.
     Watchtower(client, cfg["PREFIX"], slug, me, args.idle * 60, log=log,
-               quiet=args.quiet, trigger=args.alias_trigger,
+               quiet=args.quiet, trigger=cfg["ALIAS_TRIGGER"],
                autodownload_max=cfg["AUTODOWNLOAD_MAX"]).run()
 
 
@@ -2996,7 +3041,8 @@ def _config_destinations():
     the BACKENDS registry, so adding a backend auto-claims its key namespace
     with nothing extra to register. Exact-match only: prefix routing would
     happily write a typo'd key and leave a <missing> to debug later."""
-    dest = {"CCCP_DEBUG": "config", "CCCP_AUTODOWNLOAD_MAX": "config"}
+    dest = {"CCCP_DEBUG": "config", "CCCP_AUTODOWNLOAD_MAX": "config",
+            "CCCP_ALIAS_TRIGGER": "config"}
     for name, spec in BACKENDS.items():
         for key in _config_keys(name):
             file = "secrets" if key in spec["secrets"] else "config"
@@ -3007,8 +3053,10 @@ def _config_destinations():
 def _global_rows(cfg):
     """The global section's (key, shown, layers, raw) rows: the tree root, the
     debug switch (rendered as its effective boolean - unset is its normal state,
-    not a configuration gap), and the backend selection that the sections below
-    hang off."""
+    not a configuration gap), the alias trigger (likewise: `off` is its normal
+    state, and this row is the only place aliases advertise themselves now that
+    no CLI flag does), and the backend selection that the sections below hang
+    off."""
     root = str(plugin_data_dir())
     src = cfg["SOURCES"]
     return [
@@ -3017,6 +3065,8 @@ def _global_rows(cfg):
          src.get("CCCP_DEBUG", []), cfg["DEBUG"]),
         ("CCCP_AUTODOWNLOAD_MAX", cfg["AUTODOWNLOAD_MAX_RAW"],
          src.get("CCCP_AUTODOWNLOAD_MAX", []), cfg["AUTODOWNLOAD_MAX_RAW"]),
+        ("CCCP_ALIAS_TRIGGER", cfg["ALIAS_TRIGGER"] or "off",
+         src.get("CCCP_ALIAS_TRIGGER", []), cfg["ALIAS_TRIGGER"]),
         ("CCCP_ACTIVE_BACKEND", cfg["BACKEND"],
          src.get("CCCP_ACTIVE_BACKEND", []), cfg["BACKEND"]),
     ]
@@ -3135,10 +3185,9 @@ def _config_set(assignments):
         # Typed keys are vetted at write time too, so a bad value dies here
         # with context instead of at the next resolve_config in some other
         # command. (Read-side validation still stands: env bypasses this.)
-        if key == "CCCP_AUTODOWNLOAD_MAX" and value \
-                and parse_size(value) is None:
-            sys.exit(f"error: {key} {value!r} is not a size "
-                     f"('4096', '512k', '10m', '1g')")
+        err = _typed_key_error(key, value)
+        if err:
+            sys.exit(f"error: {err}")
         _write_kv(plugin_data_dir() / rel, key, value or None)
         print(f"{'Set' if value else 'Removed'} {key} ({rel})")
         if key in env:
@@ -3284,11 +3333,6 @@ def build_parser():
                          "suppressed). A coordination hub passes `--quiet filesystem` "
                          "to drop redundant publish pings when a pointer dispatch "
                          "already announced the file.")
-    wt.add_argument("--alias-trigger", metavar="PREFIX", default=None,
-                    help="Opt-in aliases: when a message body starts with this "
-                         "prefix, the first shell-safe token after it is the "
-                         "sender's alias. Off (ids only) when omitted; the `team` "
-                         "skill sets it.")
     wt.set_defaults(func=cmd_watchtower)
 
     al = sub.add_parser("aliases", help="List this cell's local alias map.")
