@@ -13,6 +13,7 @@ import importlib.util
 import io
 import json
 import os
+import signal
 import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
@@ -1597,6 +1598,41 @@ class WatchtowerStatus(unittest.TestCase):
         state, detail = cccp.watchtower_status(self.SLUG, self.ME)
         self.assertEqual(state, "stopped")
         self.assertIn("reason=crash_RuntimeError", detail)
+
+
+class WakeHandlerArmedBeforeStartup(unittest.TestCase):
+    """#21: SIGUSR1 must be handled BEFORE the network-bound startup, not after
+    `ready`. `cccp wake`/`dispatch` pkill-broadcasts SIGUSR1 cell-wide, and its
+    default disposition is Term - so a joining watchtower whose `initial_scan`/
+    `seed_aliases` overlapped a peer's wake was killed (exit 138) before it could
+    come up. The handler must already be `_on_wake` while `initial_scan` runs."""
+
+    def setUp(self):
+        self.data = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.data, True))
+        self.env = _isolated_env(self.data)
+        self.env.__enter__()
+        self.addCleanup(lambda: self.env.__exit__(None, None, None))
+        # _run installs real handlers in this process; restore the runner's own.
+        for sig in (signal.SIGUSR1, signal.SIGTERM, signal.SIGINT):
+            self.addCleanup(signal.signal, sig, signal.getsignal(sig))
+        self.wt = cccp.Watchtower(_FakeBlobClient(), "", "demo", "me@h:mmm", 0)
+        self.wt._emit = lambda *_: None
+
+    def test_sigusr1_handler_installed_during_initial_scan(self):
+        seen = {}
+        real_scan = self.wt.initial_scan
+
+        def spy():
+            seen["handler"] = signal.getsignal(signal.SIGUSR1)
+            return real_scan()
+
+        self.wt.initial_scan = spy
+        self.wt.stop = True   # fall straight through the poll loop after startup
+        self.wt._run()
+        handler = seen["handler"]   # not SIG_DFL/SIG_IGN; bound _on_wake of this wt
+        self.assertEqual(handler.__func__, cccp.Watchtower._on_wake)
+        self.assertIs(handler.__self__, self.wt)
 
 
 class JournalRecordsOnBad(unittest.TestCase):

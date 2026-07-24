@@ -1666,6 +1666,16 @@ class Watchtower:
             self._log(f"stop record write failed ({type(e).__name__}: {e})")
 
     def _run(self):
+        # #21: arm the wake handler BEFORE the network-bound startup, not after
+        # `ready`. `initial_scan`/`seed_aliases` take seconds, and any peer's
+        # `cccp wake`/`dispatch` pkill-broadcasts SIGUSR1 across the cell during
+        # that window. SIGUSR1's default disposition is Term, so a joining
+        # watchtower was killed (exit 138) before it could emit `ready`. With the
+        # handler installed first, an early wake merely sets `wake_requested`; the
+        # first poll runs unconditionally and subsumes it. (SIGTERM/SIGINT stay
+        # below - they aren't broadcast by wake, and a joining watchtower should
+        # remain promptly killable during its own startup.)
+        signal.signal(signal.SIGUSR1, self._on_wake)
         with TimeLogger(self.log, "initial_scan"):
             self.initial_scan()
         if self.trigger:
@@ -1683,7 +1693,7 @@ class Watchtower:
         self.ladder_step = -1
         signal.signal(signal.SIGTERM, self._on_signal)
         signal.signal(signal.SIGINT, self._on_signal)
-        signal.signal(signal.SIGUSR1, self._on_wake)
+        # SIGUSR1 was already armed at the top of _run (#21).
         while not self.stop:
             # Never outlive our creator. A changed ppid means the parent exited
             # and we were re-parented, so nobody is reading stdout any more.
