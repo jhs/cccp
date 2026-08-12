@@ -15,6 +15,7 @@ and is exercised separately; see integrations/pi/README.md.
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -46,6 +47,15 @@ class PackageManifest(unittest.TestCase):
         self.assertEqual(self.pkg["version"], plugin["version"],
                          "package.json and .claude-plugin/plugin.json versions "
                          "must be bumped together (see CLAUDE.md)")
+
+    def test_version_lockstep_with_cccp_binary(self):
+        # The v3.2.0 release shipped with bin/cccp still announcing v=3.1.1 on
+        # the ready line - a live Pi comrade caught it. Never again.
+        src = (REPO / "bin" / "cccp").read_text()
+        m = re.search(r'^CCCP_VERSION = "([^"]+)"', src, re.MULTILINE)
+        self.assertIsNotNone(m, "CCCP_VERSION constant not found in bin/cccp")
+        self.assertEqual(self.pkg["version"], m.group(1),
+                         "bin/cccp CCCP_VERSION must join the version bump")
 
 
 class ChatSkill(unittest.TestCase):
