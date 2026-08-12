@@ -10,7 +10,7 @@ Ad hoc (development):
 pi --extension integrations/pi/cccp-comrade.ts
 ```
 
-(Add `CCCP_BIN=/path/to/checkout/bin/cccp` to run a repo checkout's cccp instead of the installed one.)
+(The extension finds `bin/cccp` beside itself — a repo checkout runs the checkout's cccp, an installed package clone runs its own copy; only when neither exists does it fall back to `cccp` on PATH.)
 
 Then join from inside the session — membership is agent-driven, exactly like Claude Code:
 
@@ -44,5 +44,5 @@ The split vs Claude Code: there the chat skill both instructs the model AND arms
 |---|---|
 | `CCCP_COMRADE_ID` | Optional override. By default derived Claude-Code-style at join time — `user@shorthost:<first-6-of-Pi-session-id>` — and exported, so the watchtower, dispatches, and the bash tool share one identity. |
 | `CCCP_PLUGIN_DATA` | Optional cccp data directory. Defaults to the Claude plugin's conventional `${CLAUDE_CONFIG_DIR:-~/.claude}/plugins/data/cccp-CCCP`; if neither is usable, `cccp_join` fails loudly in-session. |
-| `CCCP_BIN` | Optional path to the cccp binary (default: `cccp` on PATH). Its directory is prepended to `PATH`, so plain `cccp` also works in the model's bash tool. |
-| `CCCP_PI_LOG` | Optional extension log file (default: `$CCCP_PLUGIN_DATA/logs/pi-comrade.log`, append mode). |
+
+Both are pre-existing cccp surface, not Pi inventions. The cccp binary needs no configuration: the extension uses the `bin/cccp` two directories above its own file (present in any repo or package clone) and prepends that directory to `PATH` at join, so plain `cccp` works in the model's bash tool too. The extension's own log appends to `$CCCP_PLUGIN_DATA/logs/pi-comrade.log`.

@@ -73,6 +73,46 @@ class ChatSkill(unittest.TestCase):
             self.assertIn(needle, self.text)
 
 
+class EnvSurface(unittest.TestCase):
+    """The extension invents NO env vars: cell is a tool parameter, the binary
+    self-locates, the log path is fixed. Only pre-existing cccp surface
+    (CCCP_COMRADE_ID, CCCP_PLUGIN_DATA) may appear."""
+
+    def test_retired_env_vars_stay_gone(self):
+        src = EXTENSION.read_text()
+        for retired in ("CCCP_CELL", "CCCP_BIN", "CCCP_PI_LOG"):
+            self.assertNotIn(retired, src,
+                             f"{retired} was deliberately removed; do not reintroduce")
+
+    def test_bin_resolution_id_derivation_and_path_prepend(self):
+        """Import the extension with Node's native type stripping and exercise
+        the exported resolvers: cccp resolves to this repo's bin/cccp, the
+        comrade id derives from the session id, and PATH gains the bin dir."""
+        script = (
+            'import("./integrations/pi/cccp-comrade.ts").then(m => {'
+            '  const bin = m.cccpBin();'
+            '  const problem = m.resolveEnvironment("abcdef99-1111-2222-3333-444444444444");'
+            '  console.log(JSON.stringify({bin, problem,'
+            '    id: process.env.CCCP_COMRADE_ID,'
+            '    pathHead: process.env.PATH.split(":")[0]}));'
+            '}, e => { console.error(e.message); process.exit(1); });'
+        )
+        with tempfile.TemporaryDirectory() as td:
+            env = {k: v for k, v in os.environ.items() if k != "CCCP_COMRADE_ID"}
+            env["CCCP_PLUGIN_DATA"] = td
+            r = subprocess.run(["node", "--no-warnings", "-e", script], cwd=REPO,
+                               env=env, capture_output=True, text=True, timeout=60)
+        if r.returncode != 0 and "Unknown file extension" in r.stderr + r.stdout:
+            self.skipTest("SKIPPED LOUDLY: this node cannot import TypeScript "
+                          "natively (needs Node >= 23) - resolver test not run")
+        self.assertEqual(r.returncode, 0, f"node failed:\n{r.stderr}")
+        out = json.loads(r.stdout.strip().splitlines()[-1])
+        self.assertEqual(out["bin"], str(REPO / "bin" / "cccp"))
+        self.assertIsNone(out["problem"])
+        self.assertRegex(out["id"], r"^[^@\s]+@[^:\s]+:abcdef$")
+        self.assertEqual(out["pathHead"], str(REPO / "bin"))
+
+
 class TypeCheck(unittest.TestCase):
     def test_extension_typechecks(self):
         if not (REPO / "node_modules" / ".bin" / "tsc").exists():
@@ -92,9 +132,9 @@ class Dormancy(unittest.TestCase):
                           "`npm install -g @earendil-works/pi-coding-agent` "
                           "to enable the dormancy test")
         with tempfile.TemporaryDirectory() as td:
-            log = Path(td) / "cccp-pi-comrade.log"
+            log = Path(td) / "logs" / "pi-comrade.log"
             env = dict(os.environ)
-            env["CCCP_PI_LOG"] = str(log)
+            env["CCCP_PLUGIN_DATA"] = td
             r = subprocess.run(
                 ["pi", "--mode", "rpc", "--no-skills",
                  "--extension", str(EXTENSION)],

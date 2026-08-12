@@ -10,15 +10,15 @@
  * intervals, --quiet, alias opt-in), never to this extension. Replies go out through the `cccp_dispatch` tool
  * (body over stdin, so no shell-quoting hazards). The watchtower dies with the session.
  *
- * No environment variables are required. Optional overrides:
+ * No environment variables are required. The cccp binary is the sibling ../../bin/cccp of this file when
+ * running from a repo or installed-package clone (else `cccp` on PATH), and its directory is prepended to
+ * PATH at join time so plain `cccp` also works in the model's bash tool. The extension log appends to
+ * $CCCP_PLUGIN_DATA/logs/pi-comrade.log. Optional overrides, both pre-existing cccp surface:
  *   CCCP_COMRADE_ID  explicit comrade id; by default derived Claude-Code-style at join time as
  *                    user@shorthost:<first-6-of-Pi-session-id> and exported, so the watchtower, dispatches,
  *                    and the bash tool all inherit one identity
  *   CCCP_PLUGIN_DATA cccp data directory; defaults to the Claude plugin's conventional location, and
  *                    cccp_join fails loudly when neither exists
- *   CCCP_BIN         path to the cccp binary (default: "cccp" on PATH); its directory is prepended to PATH
- *                    so plain `cccp` also works in the model's bash tool
- *   CCCP_PI_LOG      extension log file (default: $CCCP_PLUGIN_DATA/logs/pi-comrade.log, appended)
  */
 
 import { execFile, spawn, type ChildProcess } from "node:child_process";
@@ -27,15 +27,23 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline";
+import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-const CCCP_BIN = process.env.CCCP_BIN ?? "cccp";
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+
+/** The cccp binary: the sibling bin/cccp when this file runs from a repo or package clone, else PATH. */
+export function cccpBin(): string {
+	const sibling = path.resolve(HERE, "..", "..", "bin", "cccp");
+	return fs.existsSync(sibling) ? sibling : "cccp";
+}
+
+const CCCP = cccpBin();
 
 let logDirReady = false;
 
 function logPath(): string {
-	if (process.env.CCCP_PI_LOG) return process.env.CCCP_PI_LOG;
 	const data = process.env.CCCP_PLUGIN_DATA;
 	return data ? path.join(data, "logs", "pi-comrade.log") : "/tmp/cccp-pi-comrade.log";
 }
@@ -50,7 +58,7 @@ function log(level: string, message: string): void {
 }
 
 /** Fill in every derivable env var (idempotent); return a human-readable problem when joining must fail. */
-function resolveEnvironment(sessionId: string | undefined): string | null {
+export function resolveEnvironment(sessionId: string | undefined): string | null {
 	if (!process.env.CCCP_PLUGIN_DATA) {
 		const configDir = process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
 		const candidate = path.join(configDir, "plugins", "data", "cccp-CCCP");
@@ -65,8 +73,8 @@ function resolveEnvironment(sessionId: string | undefined): string | null {
 		const suffix = (sessionId ?? "").replace(/-/g, "").slice(0, 6) || crypto.randomBytes(3).toString("hex");
 		process.env.CCCP_COMRADE_ID = `${os.userInfo().username}@${os.hostname().split(".")[0]}:${suffix}`;
 	}
-	if (process.env.CCCP_BIN) {
-		const binDir = path.dirname(path.resolve(process.env.CCCP_BIN));
+	if (CCCP !== "cccp") {
+		const binDir = path.dirname(CCCP);
 		const parts = (process.env.PATH ?? "").split(path.delimiter);
 		if (!parts.includes(binDir)) process.env.PATH = [binDir, ...parts].join(path.delimiter);
 	}
@@ -129,7 +137,7 @@ export default function (pi: ExtensionAPI) {
 			log("INFO", `Join cell ${cell} as comrade: ${process.env.CCCP_COMRADE_ID}`);
 			const stderrTail: string[] = [];
 			state.slug = cell;
-			state.tower = spawn(CCCP_BIN, ["watchtower", cell], { stdio: ["ignore", "pipe", "pipe"] });
+			state.tower = spawn(CCCP, ["watchtower", cell], { stdio: ["ignore", "pipe", "pipe"] });
 			readline.createInterface({ input: state.tower.stdout! }).on("line", (line) => {
 				log("INFO", `Cell event: ${JSON.stringify(line)}`);
 				pi.sendMessage(
@@ -186,7 +194,7 @@ export default function (pi: ExtensionAPI) {
 			const args = ["dispatch", state.slug, ...(params.to ?? []).flatMap((t) => ["--to", t]), "-"];
 			log("INFO", `Dispatch to cell ${state.slug}: ${JSON.stringify(params.to ?? ["*"])}`);
 			const output = await new Promise<string>((resolve, reject) => {
-				const child = execFile(CCCP_BIN, args, { timeout: 60_000 }, (err, stdout, stderr) => {
+				const child = execFile(CCCP, args, { timeout: 60_000 }, (err, stdout, stderr) => {
 					if (err) reject(new Error(`cccp dispatch failed: ${err.message}\n${stderr}`));
 					else resolve(`${stdout}${stderr}`.trim());
 				});
