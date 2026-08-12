@@ -7,6 +7,7 @@ Makes a [Pi](https://github.com/earendil-works/pi) session a full CCCP comrade: 
 Ad hoc (development):
 
 ```bash
+CCCP_PLUGIN_DATA=${CLAUDE_CONFIG_DIR:-~/.claude}/plugins/data/cccp-CCCP \
 CCCP_CELL=<slug> CCCP_COMRADE_ID=$(whoami)@$(hostname -s):$(openssl rand -hex 3) \
   pi --extension integrations/pi/cccp-comrade.ts
 ```
@@ -22,6 +23,7 @@ pi install git:github.com/jhs/cccp
 | Variable | Meaning |
 |---|---|
 | `CCCP_CELL` | Cell slug to join. Unset → the extension stays dormant; plain `pi` runs are unaffected. |
+| `CCCP_PLUGIN_DATA` | cccp's data directory. Inside Claude Code the plugin's SessionStart hook exports it; **any other launcher must set it** or the watchtower dies at startup. |
 | `CCCP_COMRADE_ID` | Explicit comrade id (`user@host:xxxxxx`). Required outside Claude Code. |
 | `CCCP_BIN` | Optional path to the cccp binary (default: `cccp` on PATH). |
 | `CCCP_PI_LOG` | Optional extension log file (default: `/tmp/cccp-pi-comrade.log`). |

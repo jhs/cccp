@@ -68,11 +68,13 @@ export default function (pi: ExtensionAPI) {
 	if (!slug) return; // No cell configured — stay dormant so plain pi runs are unaffected
 
 	let tower: ChildProcess | null = null;
+	let shuttingDown = false;
 	pi.registerTool(makeDispatchTool(slug));
 
 	pi.on("session_start", (_event, ctx) => {
 		if (tower) return; // Idempotent across session reload
 		log("INFO", `Spawn watchtower for cell: ${slug}`);
+		const stderrTail: string[] = [];
 		tower = spawn(CCCP_BIN, ["watchtower", slug], { stdio: ["ignore", "pipe", "pipe"] });
 		readline.createInterface({ input: tower.stdout! }).on("line", (line) => {
 			log("INFO", `Cell event: ${JSON.stringify(line)}`);
@@ -81,10 +83,29 @@ export default function (pi: ExtensionAPI) {
 				{ deliverAs: "followUp", triggerTurn: true },
 			);
 		});
-		readline.createInterface({ input: tower.stderr! }).on("line", (line) => log("WARN", `Watchtower stderr: ${line}`));
+		readline.createInterface({ input: tower.stderr! }).on("line", (line) => {
+			log("WARN", `Watchtower stderr: ${line}`);
+			stderrTail.push(line);
+			if (stderrTail.length > 8) stderrTail.shift();
+		});
 		tower.on("exit", (code) => {
 			log(code === 0 ? "INFO" : "ERROR", `Watchtower exited: ${code}`);
 			tower = null;
+			if (shuttingDown) return; // A deliberate kill on session end needs no alarm
+			// A dead watchtower means a DEAF comrade: cell events stop arriving while dispatch may
+			// still work, which the model cannot detect on its own. Silence here was the failure
+			// mode of the first live test — the watchtower died at startup (missing env) and the
+			// session waited forever for events that could never come.
+			const detail = stderrTail.length ? `\nRecent watchtower stderr:\n${stderrTail.join("\n")}` : "";
+			pi.sendMessage(
+				{
+					customType: "cccp-event",
+					content:
+						`Your CCCP watchtower for cell '${slug}' exited (code=${code}). You are NO LONGER receiving cell events, though outgoing cccp_dispatch may still work. Tell the user now; the usual fix is relaunching the session with a corrected environment.${detail}`,
+					display: true,
+				},
+				{ deliverAs: "followUp", triggerTurn: true },
+			);
 		});
 		if (ctx.hasUI) ctx.ui.notify(`CCCP comrade armed on cell: ${slug}`, "info");
 	});
@@ -92,6 +113,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", () => {
 		if (tower) {
 			log("INFO", "Kill watchtower on session shutdown");
+			shuttingDown = true;
 			tower.kill();
 			tower = null;
 		}
