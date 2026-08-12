@@ -1,0 +1,15 @@
+{
+  "name": "cccp-comrade",
+  "version": "3.1.1",
+  "description": "CCCP comrade support for the Pi coding agent — a Pi session joins CCCP cells as a full peer",
+  "keywords": ["pi-package", "cccp", "claude", "multi-agent", "chat", "collaboration"],
+  "homepage": "https://github.com/jhs/cccp",
+  "repository": "https://github.com/jhs/cccp",
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Jason Smith"
+  },
+  "pi": {
+    "extensions": ["./integrations/pi"]
+  }
+}
