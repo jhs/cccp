@@ -68,7 +68,7 @@ class ChatSkill(unittest.TestCase):
                         f"pi.skills does not cover {self.SKILL}")
 
     def test_skill_teaches_the_essentials(self):
-        for needle in ("cccp_dispatch", "Comrade Introduction: ", "truncated=true",
+        for needle in ("cccp_join", "cccp_dispatch", "Comrade Introduction: ", "truncated=true",
                        "CCCP_COMRADE_ID", "never start one"):
             self.assertIn(needle, self.text)
 
@@ -84,16 +84,16 @@ class TypeCheck(unittest.TestCase):
 
 
 class Dormancy(unittest.TestCase):
-    """CCCP_CELL unset => a plain pi run is completely unaffected."""
+    """No cccp_join call => a plain pi run is completely unaffected."""
 
-    def test_no_watchtower_and_no_log_without_cell(self):
+    def test_no_watchtower_and_no_log_without_join(self):
         if shutil.which("pi") is None:
             self.skipTest("SKIPPED LOUDLY: pi binary not on PATH - "
                           "`npm install -g @earendil-works/pi-coding-agent` "
                           "to enable the dormancy test")
         with tempfile.TemporaryDirectory() as td:
             log = Path(td) / "cccp-pi-comrade.log"
-            env = {k: v for k, v in os.environ.items() if k != "CCCP_CELL"}
+            env = dict(os.environ)
             env["CCCP_PI_LOG"] = str(log)
             r = subprocess.run(
                 ["pi", "--mode", "rpc", "--no-skills",
