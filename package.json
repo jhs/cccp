@@ -19,6 +19,9 @@
   "pi": {
     "extensions": [
       "./integrations/pi"
+    ],
+    "skills": [
+      "./.pi/skills"
     ]
   },
   "scripts": {

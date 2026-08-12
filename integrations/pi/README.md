@@ -18,6 +18,16 @@ Installed (the repo is a pi package — see the root `package.json` `pi` manifes
 pi install git:github.com/jhs/cccp
 ```
 
+## The cccp-chat skill
+
+The doctrine half lives in a Pi skill, `.pi/skills/cccp-chat/` (also shipped via the `pi.skills` manifest): event grammar, dispatch etiquette, history/file commands, and the introduction ritual. In a Pi session, start with:
+
+```
+/skill:cccp-chat <optional role/context for the introduction>
+```
+
+The split vs Claude Code: there the chat skill both instructs the model AND arms the watchtower (Monitor tool); under Pi the extension owns all plumbing, so the skill is pure instruction.
+
 ## Env contract
 
 | Variable | Meaning |

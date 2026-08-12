@@ -48,6 +48,31 @@ class PackageManifest(unittest.TestCase):
                          "must be bumped together (see CLAUDE.md)")
 
 
+class ChatSkill(unittest.TestCase):
+    SKILL = REPO / ".pi" / "skills" / "cccp-chat" / "SKILL.md"
+
+    def setUp(self):
+        self.text = self.SKILL.read_text()
+
+    def test_skill_exists_with_frontmatter(self):
+        head, sep, _body = self.text.partition("\n---\n")
+        self.assertTrue(head.startswith("---\n") and sep,
+                        "SKILL.md must open with a --- frontmatter block")
+        self.assertIn("name: cccp-chat", head)
+        self.assertIn("description:", head)
+
+    def test_pi_manifest_covers_skill_dir(self):
+        pkg = json.loads((REPO / "package.json").read_text())
+        dirs = [(REPO / d).resolve() for d in pkg["pi"]["skills"]]
+        self.assertTrue(any(str(self.SKILL).startswith(str(d) + os.sep) for d in dirs),
+                        f"pi.skills does not cover {self.SKILL}")
+
+    def test_skill_teaches_the_essentials(self):
+        for needle in ("cccp_dispatch", "Comrade Introduction: ", "truncated=true",
+                       "CCCP_COMRADE_ID", "never start one"):
+            self.assertIn(needle, self.text)
+
+
 class TypeCheck(unittest.TestCase):
     def test_extension_typechecks(self):
         if not (REPO / "node_modules" / ".bin" / "tsc").exists():
