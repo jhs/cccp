@@ -7,10 +7,10 @@ Makes a [Pi](https://github.com/earendil-works/pi) session a full CCCP comrade: 
 Ad hoc (development):
 
 ```bash
-CCCP_PLUGIN_DATA=${CLAUDE_CONFIG_DIR:-~/.claude}/plugins/data/cccp-CCCP \
-CCCP_CELL=<slug> CCCP_COMRADE_ID=$(whoami)@$(hostname -s):$(openssl rand -hex 3) \
-  pi --extension integrations/pi/cccp-comrade.ts
+CCCP_CELL=<slug> pi --extension integrations/pi/cccp-comrade.ts
 ```
+
+(Add `CCCP_BIN=/path/to/checkout/bin/cccp` to run a repo checkout's cccp instead of the installed one.)
 
 Installed (the repo is a pi package — see the root `package.json` `pi` manifest):
 
@@ -32,8 +32,8 @@ The split vs Claude Code: there the chat skill both instructs the model AND arms
 
 | Variable | Meaning |
 |---|---|
-| `CCCP_CELL` | Cell slug to join. Unset → the extension stays dormant; plain `pi` runs are unaffected. |
-| `CCCP_PLUGIN_DATA` | cccp's data directory. Inside Claude Code the plugin's SessionStart hook exports it; **any other launcher must set it** or the watchtower dies at startup. |
-| `CCCP_COMRADE_ID` | Explicit comrade id (`user@host:xxxxxx`). Required outside Claude Code. |
-| `CCCP_BIN` | Optional path to the cccp binary (default: `cccp` on PATH). |
-| `CCCP_PI_LOG` | Optional extension log file (default: `/tmp/cccp-pi-comrade.log`). |
+| `CCCP_CELL` | Cell slug to join — **the only required variable**. Unset → the extension stays dormant; plain `pi` runs are unaffected. |
+| `CCCP_COMRADE_ID` | Optional override. By default derived Claude-Code-style — `user@shorthost:<first-6-of-Pi-session-id>` — and exported, so the watchtower, dispatches, and the bash tool share one identity. |
+| `CCCP_PLUGIN_DATA` | Optional cccp data directory. Defaults to the Claude plugin's conventional `${CLAUDE_CONFIG_DIR:-~/.claude}/plugins/data/cccp-CCCP`; if neither is usable the extension refuses to arm and says so in-session. |
+| `CCCP_BIN` | Optional path to the cccp binary (default: `cccp` on PATH). Its directory is prepended to `PATH`, so plain `cccp` also works in the model's bash tool. |
+| `CCCP_PI_LOG` | Optional extension log file (default: `$CCCP_PLUGIN_DATA/logs/pi-comrade.log`, append mode). |
