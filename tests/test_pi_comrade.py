@@ -332,9 +332,28 @@ class _LiveHarness:
                 if pipe and not pipe.closed:
                     pipe.close()
         self.observer.stop()
+        self._sweep_scratch_processes()
         subprocess.run([str(CCCP), "rm", self.slug, "--yes"], env=self.env,
                        capture_output=True, text=True)
         self._td.cleanup()
+
+    def _sweep_scratch_processes(self):
+        """Kill anything still mentioning this run's slug. The model under test
+        holds a real bash tool and WILL improvise: an early draft of this test
+        (cwd=repo) had it nohup its own `./bin/cccp watchtower <slug>`, which
+        then outlived the Pi session as an orphan polling a deleted cell. The
+        neutral cwd and scrubbed PATH make that route impossible now; this sweep
+        is the belt to that suspenders, because a leaked watchtower is exactly
+        the #12 nuisance these tests exist to prevent."""
+        r = subprocess.run(["pgrep", "-f", self.slug],
+                           capture_output=True, text=True)
+        for pid in (int(p) for p in r.stdout.split()):
+            if pid == os.getpid():
+                continue
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
 
     # -- Pi RPC plumbing ---------------------------------------------------
 
