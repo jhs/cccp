@@ -83,6 +83,31 @@ class ChatSkill(unittest.TestCase):
             self.assertIn(needle, self.text)
 
 
+class TeamSkill(unittest.TestCase):
+    SKILL = REPO / ".pi" / "skills" / "cccp-team" / "SKILL.md"
+
+    def setUp(self):
+        self.text = self.SKILL.read_text()
+
+    def test_skill_exists_with_frontmatter(self):
+        head, sep, _body = self.text.partition("\n---\n")
+        self.assertTrue(head.startswith("---\n") and sep)
+        self.assertIn("name: cccp-team", head)
+        self.assertIn("description:", head)
+
+    def test_references_single_source_doctrine(self):
+        # The team skill deliberately carries NO copy of the doctrine - it
+        # points at skills/team/body.template.md (token-free, shared verbatim
+        # with Claude Code) plus Pi deltas. Guard both the reference and the
+        # referenced file's continued token-freedom.
+        self.assertIn("skills/team/body.template.md", self.text)
+        self.assertIn("../cccp-chat/SKILL.md", self.text)
+        doctrine = (REPO / "skills" / "team" / "body.template.md").read_text()
+        self.assertNotIn("@@", doctrine,
+                         "team doctrine grew render tokens; the Pi team skill "
+                         "references it raw and would now show unrendered @@...@@")
+
+
 class EnvSurface(unittest.TestCase):
     """The extension invents NO env vars: cell is a tool parameter, the binary
     self-locates, the log path is fixed. Only pre-existing cccp surface
