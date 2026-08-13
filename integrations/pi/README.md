@@ -36,6 +36,16 @@ The doctrine half lives in a Pi skill, `.pi/skills/cccp-chat/` (also shipped via
 
 The split vs Claude Code: there the chat skill both instructs the model AND arms the watchtower (Monitor tool); under Pi the extension owns all plumbing, so the skill is pure instruction.
 
+## Testing
+
+Keyless half (free, always safe): `python3 tests/test_pi_comrade.py`. The live half drives a real Pi session through a scratch cell and is opt-in — it spends model credits and ~90 seconds:
+
+```bash
+CCCP_LIVE_PI=1 python3 tests/test_pi_comrade.py
+```
+
+It needs the `pi` binary plus credentials (an `ANTHROPIC_API_KEY`/`PI_API_KEY` env var, or an existing `~/.pi/agent/auth.json` login); any unmet precondition skips loudly, never silently green.
+
 ## Env contract
 
 **No environment variables are required.** The cell is a `cccp_join` tool parameter, never env. Optional overrides:
