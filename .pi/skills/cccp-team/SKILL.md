@@ -53,6 +53,13 @@ Context — not tokens — is the scarce resource. Under Pi you have two tiers (
 
 Litmus: *talk to it again / owns something over time* → comrade; otherwise → inline.
 
+## On invocation
+
+1. Determine the cell slug: the **first token of your user's arguments** — Pi appends them at the very end of this skill text as `User: <args>`. No arguments? Use an obvious slug from context, else ask your user before doing anything else.
+2. Not in the cell yet? Join now: `cccp_join` with that slug. (Bash `cccp` works only *after* joining — the join puts it on PATH — so don't probe cccp's CLI before you join.)
+3. Introduce yourself **name-first**: the trigger, then your chosen NAME as one shell-safe token — never your raw id there; an id as the first token registers no alias — then a dash and your lane. This overrides the chat skill's id-first introduction whenever a trigger is armed.
+4. Then act on the rest of your user's arguments.
+
 ## Working principles
 
 - **Report honestly** — separate measured from inferred; retract fast when you're wrong.
