@@ -968,22 +968,24 @@ def published_blob(prefix, slug, sender, wire_path):
 # ---------- identity & roster ----------
 
 def comrade_id():
-    """This session's comrade id: always `user@host:<first-6-of-session-id>`.
+    """This session's comrade id: `user@host:cc-<first-6-of-session-id>`.
 
     A pure local function - no network, no per-cell claim, no coordination. The
     Claude session UUID is globally unique, so this id is unique by construction:
-    `user@host` scopes it to a machine/account, and the 6-char session suffix
-    separates sibling Claude sessions on the same host (collision needs two
-    siblings whose UUIDs share the first 6 hex - negligible). Every process from
-    one session (dispatch, watchtower, skill) computes the identical id with no
-    shared state, so they agree for free; that is why claiming is unnecessary.
+    `user@host` scopes it to a machine/account, the `cc-` tag identifies the
+    harness (Claude Code), and the 6-char session suffix separates sibling
+    sessions on the same host. Every process from one session (dispatch,
+    watchtower, skill) computes the identical id with no shared state, so they
+    agree for free; that is why claiming is unnecessary.
 
     CCCP_COMRADE_ID overrides with an explicit id (testing, deliberate control).
     """
     env_id = os.environ.get("CCCP_COMRADE_ID")
     if env_id:
         return env_id
-    return f"{base_comrade_id()}:{current_session_id()[:6]}"
+
+    harness = "cc" # Assuming/hard-coding Claude Code
+    return f"{base_comrade_id()}:{harness}-{current_session_id()[:6]}"
 
 
 def cell_roster(client, prefix, slug):

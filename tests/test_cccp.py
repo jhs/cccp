@@ -194,12 +194,11 @@ class ComradeId(unittest.TestCase):
         with mock.patch.dict(os.environ, {"CCCP_COMRADE_ID": "custom@id:xyz"}):
             self.assertEqual(cccp.comrade_id(), "custom@id:xyz")
 
-    def test_format_is_user_at_host_colon_six_hex(self):
+    def test_format_is_user_at_host_colon_cc_six_hex(self):
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "abcdef1234567890"}):
             os.environ.pop("CCCP_COMRADE_ID", None)   # ensure override is off
             cid = cccp.comrade_id()
-        # user@host:<first-6-of-session> - always suffixed, never bare
-        self.assertRegex(cid, r"^[^@]+@[^:]+:abcdef$")
+        self.assertRegex(cid, r"^[^@]+@[^:]+:cc-abcdef$")
 
 
 class SkillRender(unittest.TestCase):

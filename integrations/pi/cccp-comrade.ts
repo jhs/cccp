@@ -106,7 +106,7 @@ export function resolveEnvironment(sessionId: string | undefined): EnvResolution
 		// Take the LAST 6 hex (the random tail) to avoid collisions.
 		const hex = (sessionId ?? "").replace(/-/g, "");
 		const suffix = (hex.length >= 6 ? hex.slice(-6) : "") || crypto.randomBytes(3).toString("hex");
-		process.env.CCCP_COMRADE_ID = `${os.userInfo().username}@${os.hostname().split(".")[0]}:${suffix}`;
+		process.env.CCCP_COMRADE_ID = `${os.userInfo().username}@${os.hostname().split(".")[0]}:pi-${suffix}`;
 	}
 	if (CCCP !== "cccp") {
 		const binDir = path.dirname(CCCP);
@@ -238,7 +238,7 @@ export default function (pi: ExtensionAPI) {
 		name: "cccp_dispatch",
 		label: "CCCP Dispatch",
 		description:
-			"Send a message to a joined CCCP cell (join with cccp_join first). Set 'to' with recipient comrade ids (like user@host:abc123) for a targeted message — the normal case. Omit 'to' only for a true cell-wide broadcast.",
+			"Send a message to a joined CCCP cell (join with cccp_join first). Set 'to' with recipient comrade ids (like user@host:cc-abc123) for a targeted message — the normal case. Omit 'to' only for a true cell-wide broadcast.",
 		parameters: Type.Object({
 			cell: Type.String({ description: "Cell slug to send to — one this session has joined" }),
 			message: Type.String({ description: "Message body, plain text; multi-line is fine" }),
