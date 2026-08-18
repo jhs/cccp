@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# spawn-comrade — launch a cccp comrade in a new tmux window.
+# spawn-comrade — launch a cccp comrade in a new tmux window (Claude Code or Pi).
 #
 # Usage:
 #   spawn-comrade -m MODEL -e EFFORT [OPTIONS] NAME SLUG [DOC...]
@@ -9,23 +9,89 @@
 #   DOC...      docs to point the comrade at on join, in order
 #
 # Options:
-#   -m MODEL    Required. claude --model value (e.g. 'claude-opus-4-8[1m]')
-#   -e EFFORT   Required. claude --effort value (low|medium|high|xhigh|max)
+#   --impl IMPL implementation: claude (default) | pi
+#   -m MODEL    Required. A TIER (cheap|normal|premium, mapped per impl) or a raw model id.
+#               No ambient default (#798 fail-closed). Tier map:
+#                 claude → claude-opus-4-8[1m] | claude-opus-5 | claude-fable-5
+#                 pi     → gpt-5.5            | gpt-5.6-terra  | gpt-5.6-sol
+#               (pi's gpt-5.6-luna exists but is UNMAPPED — pass it as a raw id.)
+#   -e EFFORT   Required. claude --effort / pi --thinking value (low|medium|high|xhigh|max).
 #   -s SESSION  tmux session (default: current)
 #   -c CWD      working directory (default: current)
 #   -f ID       Foreman comrade ID for targeted intro on join
-#   --skill SK  cccp skill variant (default: team)
-#   --no-skip   don't pass --dangerously-skip-permissions
+#   --skill SK  cccp skill variant (default: team; claude only)
+#   --no-skip   don't pass --dangerously-skip-permissions (claude only)
 #   --force     allow duplicate window names
+#
+#   Under --impl pi: a [1m] model suffix is refused (claude-only); --resume and token-watch are
+#   not yet implemented; a NONPROD + extension preflight must pass (fails closed with the fix).
 #
 # Observe:  tmux capture-pane -t SESSION:NAME -p | tail -40
 # Retire:   tmux kill-window -t SESSION:NAME
 set -euo pipefail
 
-usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+usage() { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 
+# ── testable pure-bash surface (#1577) — see tests/test_spawn_comrade.sh ─────────
+
+# map_tier IMPL VALUE → resolved model id. Tier language maps per impl; any other value (a raw id)
+# echoes verbatim. There is deliberately no ambient default: the caller always passes -m (#798).
+map_tier() {
+  local impl=$1 val=$2
+  case "$impl:$val" in
+    claude:cheap)   echo 'claude-opus-4-8[1m]' ;;
+    claude:normal)  echo 'claude-opus-5' ;;
+    claude:premium) echo 'claude-fable-5' ;;
+    pi:cheap)       echo 'gpt-5.5' ;;
+    pi:normal)      echo 'gpt-5.6-terra' ;;
+    pi:premium)     echo 'gpt-5.6-sol' ;;
+    # gpt-5.6-luna exists in pi's catalog but is intentionally left off the tier map — pass it as a
+    # raw id if you want it. Raw ids (either impl) fall through and echo verbatim.
+    *)              echo "$val" ;;
+  esac
+}
+
+# pi_refuse_model MODEL → nonzero if MODEL carries a claude-only affordance under pi.
+pi_refuse_model() {
+  local model=$1
+  if [[ "$model" == *'[1m]'* ]]; then
+    echo "spawn-comrade: the [1m] context suffix is claude-only and has no meaning under --impl pi: $model" >&2
+    return 1
+  fi
+  return 0
+}
+
+# pi_preflight → fail-closed check that this box is set up to run a Pi comrade, and refresh the stable
+# cccp-current symlink the repo .pi/settings.json references. Everything is under $HOME so it is
+# sandbox-testable. On any gap: print the exact fix command and return nonzero (never spawn blind).
+pi_preflight() {
+  local agents="$HOME/.pi/agent/AGENTS.md"
+  if [[ ! -e "$agents" ]]; then
+    echo "spawn-comrade: Pi NONPROD declaration missing — ~/.pi/agent/AGENTS.md is not linked." >&2
+    echo "  Fix: ln -s \"\$PWD/docs/agent-env/NONPROD.md\" ~/.pi/agent/AGENTS.md   (from the repo root)" >&2
+    return 1
+  fi
+  local cache="$HOME/.claude/plugins/cache/CCCP/cccp"
+  local newest=""
+  [[ -d "$cache" ]] && newest="$(ls -1 "$cache" 2>/dev/null | sort -V | tail -1)"
+  if [[ -z "$newest" || ! -f "$cache/$newest/integrations/pi/cccp-comrade.ts" ]]; then
+    echo "spawn-comrade: the cccp Pi extension is not installed under ~/.claude/plugins/cache/CCCP/cccp/<ver>." >&2
+    echo "  Fix: pi install ~/.claude/plugins/cache/CCCP/cccp/<ver>   (install the cccp plugin for Pi)" >&2
+    return 1
+  fi
+  # Stable indirection: the repo .pi/settings.json points at ~/.pi/agent/cccp-current, refreshed to
+  # the newest installed version here (version-sort, newest wins) — so a plugin upgrade needs no edits.
+  ln -sfn "$cache/$newest" "$HOME/.pi/agent/cccp-current"
+  return 0
+}
+
+# Sourced by the test harness for its functions only — define, then return before the launch body.
+[[ -n "${SPAWN_COMRADE_LIB:-}" ]] && return 0
+
+# ── argument parsing ────────────────────────────────────────────────────────────
 session=""
 cwd=""
+impl="claude"
 model=""
 effort=""
 foreman=""
@@ -35,6 +101,7 @@ force=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --impl) [[ $# -ge 2 ]] || { echo "spawn-comrade: --impl needs a value" >&2; exit 1; }; impl="$2"; shift 2 ;;
     -s) [[ $# -ge 2 ]] || { echo "spawn-comrade: -s needs a value" >&2; exit 1; }; session="$2"; shift 2 ;;
     -c) [[ $# -ge 2 ]] || { echo "spawn-comrade: -c needs a value" >&2; exit 1; }; cwd="$2"; shift 2 ;;
     -m|--model) [[ $# -ge 2 ]] || { echo "spawn-comrade: $1 needs a value" >&2; exit 1; }; model="$2"; shift 2 ;;
@@ -54,20 +121,21 @@ done
 name="$1"; slug="$2"; shift 2
 extra_docs=("$@")
 
-[[ -n "$model" ]] || { echo "spawn-comrade: -m/--model is required — pass the comrade's model explicitly; never rely on claude's ambient default" >&2; exit 1; }
-[[ -n "$effort" ]] || { echo "spawn-comrade: -e/--effort is required — pass the comrade's effort explicitly; never rely on claude's ambient default" >&2; exit 1; }
+case "$impl" in claude|pi) ;; *) echo "spawn-comrade: --impl must be claude or pi (got: $impl)" >&2; exit 1 ;; esac
+[[ -n "$model" ]] || { echo "spawn-comrade: -m/--model is required — pass a tier (cheap|normal|premium) or a raw id; never rely on an ambient default" >&2; exit 1; }
+[[ -n "$effort" ]] || { echo "spawn-comrade: -e/--effort is required — pass it explicitly; never rely on an ambient default" >&2; exit 1; }
+
+# Resolve tier → model (raw ids pass through).
+model="$(map_tier "$impl" "$model")"
 
 command -v tmux >/dev/null || { echo "spawn-comrade: tmux not found" >&2; exit 1; }
-command -v claude >/dev/null || { echo "spawn-comrade: claude not found" >&2; exit 1; }
 
-# Default the session to the one we're running inside.
+# ── session + duplicate-window guard (impl-agnostic) ─────────────────────────────
 if [[ -z "$session" ]]; then
   session="$(tmux display-message -p '#S' 2>/dev/null || true)"
   [[ -n "$session" ]] || { echo "spawn-comrade: not inside tmux and no -s given" >&2; exit 1; }
 fi
 tmux has-session -t "$session" 2>/dev/null || { echo "spawn-comrade: no tmux session '$session'" >&2; exit 1; }
-
-# One comrade per role — refuse a duplicate window unless --force.
 if tmux list-windows -t "$session" -F '#W' 2>/dev/null | grep -qxF "$name"; then
   if (( force )); then
     echo "spawn-comrade: window '$name' already exists — spawning anyway (--force)" >&2
@@ -78,33 +146,58 @@ if tmux list-windows -t "$session" -F '#W' 2>/dev/null | grep -qxF "$name"; then
   fi
 fi
 
-# Build the /cccp:<skill> prompt.
-prompt="/cccp:$skill $slug"
-if [[ ${#extra_docs[@]} -gt 0 ]]; then
-  refs="${extra_docs[0]}"
-  for d in "${extra_docs[@]:1}"; do refs+=" then $d"; done
-  prompt+=" # See $refs"
-fi
-if [[ -n "$foreman" ]]; then
-  prompt+=" -- then introduce yourself to your Foreman at ${foreman},"
-else
-  prompt+=" -- then introduce yourself to the cell,"
-fi
-prompt+=" beginning with the literal prefix Intro: followed by your alias ${name}"
-
-# Escape single-quotes for the sh -c string ( ' -> '\'' ).
-esc=${prompt//\'/\'\\\'\'}
-flag=""; (( skip )) && flag=" --dangerously-skip-permissions"
-mflag=" --model '${model//\'/\'\\\'\'}'"
-eflag=" --effort '${effort//\'/\'\\\'\'}'"
-nflag=" --name '${name//\'/\'\\\'\'}'"
-cmd="claude${flag}${mflag}${eflag}${nflag} '${esc}'"
-
 [[ -z "$cwd" ]] && cwd="$(pwd)"
+
+# ── build the launch command, per impl ───────────────────────────────────────────
+if [[ "$impl" == "pi" ]]; then
+  command -v pi >/dev/null || { echo "spawn-comrade: pi not found" >&2; exit 1; }
+  pi_refuse_model "$model" || exit 1
+  pi_preflight || exit 1
+
+  # Pi has no /cccp:<skill> slash-command; it loads the cccp-chat SKILL and drives it in natural
+  # language. Docs become @-file references. The intro ritual is the NON-NEGOTIABLE Comrade.md shape
+  # (#1577): the first message MUST begin with the literal "Comrade Introduction: <Name>", Name the
+  # first bare word — the cell's watchtowers auto-register an alias from exactly that token.
+  docrefs=""
+  for d in "${extra_docs[@]}"; do docrefs+=" @${d}"; done
+  if [[ -n "$foreman" ]]; then intro_target="your Foreman at ${foreman}"; else intro_target="the cell"; fi
+  prompt="Join CCCP cell ${slug} as a comrade using the cccp-chat skill.${docrefs:+ First read these docs:${docrefs}.}"
+  prompt+=" Then introduce yourself to ${intro_target} with a targeted message that begins with the LITERAL prefix"
+  prompt+=" \"Comrade Introduction: ${name}\" — ${name} as the very first bare word, no punctuation attached — followed by your role and comrade id."
+  esc=${prompt//\'/\'\\\'\'}
+  # Export the repo .env and put the cccp bin/ on PATH (the extension also self-locates bin/cccp).
+  bindir="$(cd "$(dirname "$0")" && pwd)"
+  envload=""
+  [[ -f "$cwd/.env" ]] && envload="set -a; . '$cwd/.env'; set +a; "
+  cmd="${envload}export PATH='${bindir}':\"\$PATH\"; pi --provider openai-codex --model '${model//\'/\'\\\'\'}' --thinking '${effort//\'/\'\\\'\'}' --name '${name//\'/\'\\\'\'}' '${esc}'"
+  launchdesc="pi (${model})"
+else
+  command -v claude >/dev/null || { echo "spawn-comrade: claude not found" >&2; exit 1; }
+  # Build the /cccp:<skill> prompt.
+  prompt="/cccp:$skill $slug"
+  if [[ ${#extra_docs[@]} -gt 0 ]]; then
+    refs="${extra_docs[0]}"
+    for d in "${extra_docs[@]:1}"; do refs+=" then $d"; done
+    prompt+=" # See $refs"
+  fi
+  if [[ -n "$foreman" ]]; then
+    prompt+=" -- then introduce yourself to your Foreman at ${foreman},"
+  else
+    prompt+=" -- then introduce yourself to the cell,"
+  fi
+  prompt+=" beginning with the literal prefix Intro: followed by your alias ${name}"
+  esc=${prompt//\'/\'\\\'\'}
+  flag=""; (( skip )) && flag=" --dangerously-skip-permissions"
+  mflag=" --model '${model//\'/\'\\\'\'}'"
+  eflag=" --effort '${effort//\'/\'\\\'\'}'"
+  nflag=" --name '${name//\'/\'\\\'\'}'"
+  cmd="claude${flag}${mflag}${eflag}${nflag} '${esc}'"
+  launchdesc="claude (${model})"
+fi
 
 # Trailing ':' so tmux reads it as the SESSION and picks the next free window index.
 tmux new-window -d -t "${session}:" -n "$name" -c "$cwd" "$cmd"
 
-echo "Spawned '$name' in $session (cell: $slug, skill: $skill)"
+echo "Spawned '$name' [$launchdesc] in $session (cell: $slug)"
 echo "  watch:  tmux capture-pane -t $session:$name -p | tail -40"
 echo "  retire: tmux kill-window -t $session:$name"
