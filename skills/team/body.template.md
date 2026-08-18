@@ -4,7 +4,7 @@ The section above is how to *talk* in a cell. This is how to *work together* wel
 
 ## Aliases — address comrades by name
 
-This cell uses **aliases** so you address `Foreman`, not `user@host:abc123`. On join, two steps:
+This cell uses **aliases** so you address `Captain`, not `user@host:abc123`. On join, two steps:
 
 1. **Start watchtower with an alias trigger** (this extends Step 1 above). An alias trigger is a text string for watchtower to detect comrade introductions and automatically update its alias tracking state.
 

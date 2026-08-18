@@ -9,14 +9,14 @@
 #   DOC...      docs to point the comrade at on join, in order
 #
 # Options:
-#   -m MODEL    Required. claude --model value (e.g. 'claude-opus-4-8[1m]')
-#   -e EFFORT   Required. claude --effort value (low|medium|high|xhigh|max)
-#   -s SESSION  tmux session (default: current)
-#   -c CWD      working directory (default: current)
-#   -f ID       Foreman comrade ID for targeted intro on join
-#   --skill SK  cccp skill variant (default: team)
-#   --no-skip   don't pass --dangerously-skip-permissions
-#   --force     allow duplicate window names
+#   -m MODEL      Required. claude --model value (e.g. 'claude-opus-4-8[1m]')
+#   -e EFFORT     Required. claude --effort value (low|medium|high|xhigh|max)
+#   -s SESSION    tmux session (default: current)
+#   -c CWD        working directory (default: current)
+#   --captain ID  Captain comrade ID for targeted intro on join
+#   --skill SK    cccp skill variant (default: team)
+#   --no-skip     don't pass --dangerously-skip-permissions
+#   --force       allow duplicate window names
 #
 # Observe:  tmux capture-pane -t SESSION:NAME -p | tail -40
 # Retire:   tmux kill-window -t SESSION:NAME
@@ -28,7 +28,7 @@ session=""
 cwd=""
 model=""
 effort=""
-foreman=""
+captain=""
 skill="team"
 skip=1
 force=0
@@ -39,7 +39,7 @@ while [[ $# -gt 0 ]]; do
     -c) [[ $# -ge 2 ]] || { echo "spawn-comrade: -c needs a value" >&2; exit 1; }; cwd="$2"; shift 2 ;;
     -m|--model) [[ $# -ge 2 ]] || { echo "spawn-comrade: $1 needs a value" >&2; exit 1; }; model="$2"; shift 2 ;;
     -e|--effort) [[ $# -ge 2 ]] || { echo "spawn-comrade: $1 needs a value" >&2; exit 1; }; effort="$2"; shift 2 ;;
-    -f|--foreman) [[ $# -ge 2 ]] || { echo "spawn-comrade: $1 needs a value" >&2; exit 1; }; foreman="$2"; shift 2 ;;
+    --captain) [[ $# -ge 2 ]] || { echo "spawn-comrade: $1 needs a value" >&2; exit 1; }; captain="$2"; shift 2 ;;
     --skill) [[ $# -ge 2 ]] || { echo "spawn-comrade: --skill needs a value" >&2; exit 1; }; skill="$2"; shift 2 ;;
     --no-skip) skip=0; shift ;;
     --force) force=1; shift ;;
@@ -85,8 +85,8 @@ if [[ ${#extra_docs[@]} -gt 0 ]]; then
   for d in "${extra_docs[@]:1}"; do refs+=" then $d"; done
   prompt+=" # See $refs"
 fi
-if [[ -n "$foreman" ]]; then
-  prompt+=" -- then introduce yourself to your Foreman at ${foreman},"
+if [[ -n "$captain" ]]; then
+  prompt+=" -- then introduce yourself to your Captain at ${captain},"
 else
   prompt+=" -- then introduce yourself to the cell,"
 fi
