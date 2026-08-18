@@ -36,6 +36,27 @@ The doctrine half lives in a Pi skill, `.pi/skills/cccp-chat/` (also shipped via
 
 The split vs Claude Code: there the chat skill both instructs the model AND arms the watchtower (Monitor tool); under Pi the extension owns all plumbing, so the skill is pure instruction.
 
+## Event delivery
+
+Each watchtower line reaches the model as its own turn, carrying the raw event behind one label:
+
+```
+CCCP cell event <slug>: message from=bob@hostB:7a1e4d ts=... to=* body="..."
+```
+
+The label is doing two jobs and no more: `<slug>` says which joined cell the event came from, and the literal `CCCP cell event` is the `cccp-chat` skill's trigger phrase. How to *act* on an event — when a reply is warranted, how to read a truncated body — lives in the skill and nowhere else, exactly as it does for a Claude Code comrade reading raw Monitor output. The extension never annotates the wire.
+
+### Idle heartbeats
+
+A quiet cell still emits `idle quiet=<dur>` on cccp's backoff schedule, and under Pi each one wakes the model for a turn. `cccp_join` takes an optional `idle_minutes` to set `cccp watchtower --idle`: `0` disables heartbeats entirely, any other integer is the initial silence in minutes. Omit it and cccp's own default (30) stands — the extension holds no opinion of its own.
+
+To change it mid-session, drop the listener and rejoin — the Pi analogue of restarting the Monitor that `skills/captain-with-tmux` prescribes for Claude Code:
+
+```
+cccp stop <slug>          # bash; the shutdown event confirms a clean exit
+cccp_join(cell: "<slug>", idle_minutes: 0)
+```
+
 ## Testing
 
 Keyless half (free, always safe): `python3 tests/test_pi_comrade.py`. The live half drives a real Pi session through a scratch cell and is opt-in — it spends model credits and ~90 seconds:
@@ -52,7 +73,7 @@ It needs the `pi` binary plus credentials (an `ANTHROPIC_API_KEY`/`PI_API_KEY` e
 
 | Variable | Meaning |
 |---|---|
-| `CCCP_COMRADE_ID` | Optional override. By default derived Claude-Code-style at session start — `user@shorthost:<first-6-of-Pi-session-id>` — and exported, so the watchtowers, dispatches, and the bash tool share one stable identity for the whole session (`echo $CCCP_COMRADE_ID`). |
+| `CCCP_COMRADE_ID` | Optional override. By default derived Claude-Code-style at session start — `user@shorthost:pi-<last-6-hex-of-Pi-session-id>` — and exported, so the watchtowers, dispatches, and the bash tool share one stable identity for the whole session (`echo $CCCP_COMRADE_ID`). |
 | `CCCP_PLUGIN_DATA` | Optional cccp data directory. Defaults to the Claude plugin's conventional `${CLAUDE_CONFIG_DIR:-~/.claude}/plugins/data/cccp-CCCP` when it exists (a shared store: same-machine Claude and Pi comrades reach the same local-fs cells); on a Claude-less machine, `~/.pi/cccp` is auto-created on first run, announced by a one-time in-session INFO message pointing at the `cccp-setup` skill. |
 
 The cccp binary needs no configuration: the extension uses the `bin/cccp` two directories above its own file (present in any repo or package clone) and prepends that directory to `PATH` at session start, so plain `cccp` works in the model's bash tool from the first turn. The extension's own log appends to `$CCCP_PLUGIN_DATA/logs/pi-comrade.log`.
