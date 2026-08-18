@@ -9,7 +9,7 @@
  *   session_start     Resolve the session-scoped environment, unconditionally — the user enabled this
  *                     extension, so `cccp` (e.g. `cccp config` before any join) must work in the bash tool
  *                     from the first turn. All idempotent, explicit env always wins:
- *                       CCCP_COMRADE_ID   derived Claude-Code-style as user@shorthost:<first-6-of-Pi-session-id>
+ *                       CCCP_COMRADE_ID   derived as user@shorthost:<last-6-hex-of-Pi-session-id>
  *                                         and exported, so every watchtower, dispatch, and bash call shares one
  *                                         stable identity, inspectable all session via `echo $CCCP_COMRADE_ID`.
  *                       CCCP_PLUGIN_DATA  the Claude plugin's conventional data dir when it exists (a shared
@@ -101,9 +101,11 @@ export function resolveEnvironment(sessionId: string | undefined): EnvResolution
 		}
 	}
 	if (!process.env.CCCP_COMRADE_ID) {
-		// The Claude Code recipe (bin/cccp comrade_id): user@shorthost scopes to a machine/account, the first
-		// 6 chars of the session id separate sibling sessions. Random fallback for an absent session id.
-		const suffix = (sessionId ?? "").replace(/-/g, "").slice(0, 6) || crypto.randomBytes(3).toString("hex");
+		// Pi session ids are UUIDv7 (time-ordered): the leading hex is a timestamp,
+		// so sibling sessions started close together share the same first-6 prefix.
+		// Take the LAST 6 hex (the random tail) to avoid collisions.
+		const hex = (sessionId ?? "").replace(/-/g, "");
+		const suffix = (hex.length >= 6 ? hex.slice(-6) : "") || crypto.randomBytes(3).toString("hex");
 		process.env.CCCP_COMRADE_ID = `${os.userInfo().username}@${os.hostname().split(".")[0]}:${suffix}`;
 	}
 	if (CCCP !== "cccp") {

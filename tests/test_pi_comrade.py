@@ -195,7 +195,7 @@ class EnvSurface(unittest.TestCase):
         self.assertEqual(out["bin"], str(REPO / "bin" / "cccp"))
         self.assertIsNone(out["problem"])
         self.assertIsNone(out["created"])
-        self.assertRegex(out["id"], r"^[^@\s]+@[^:\s]+:abcdef$")
+        self.assertRegex(out["id"], r"^[^@\s]+@[^:\s]+:444444$")
         self.assertEqual(out["pathHead"], str(REPO / "bin"))
 
     def test_data_dir_auto_creation_on_claude_less_machine(self):
