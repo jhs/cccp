@@ -64,14 +64,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 API_VERSION = "2023-11-03"
-CCCP_VERSION = "3.3.0"     # Shown on the watchtower `ready` line (v=...) so a
-                           # comrade's Claude can see which build it is running.
-                           # Cosmetic only - nothing reads it. KEEP EQUAL to the
-                           # version in .claude-plugin/plugin.json - the single
-                           # source of truth (the marketplace entry carries no
-                           # version; Claude Code resolves plugin.json first). Bump
-                           # both together each release so the ready-line v= matches
-                           # the installed plugin.
+def cccp_version():
+    """Read the version from plugin.json — the single source of truth."""
+    try:
+        raw = json.loads((Path(__file__).resolve().parent.parent / ".claude-plugin" / "plugin.json").read_text())
+        return raw.get("version", "unknown")
+    except (OSError, ValueError):
+        return "unknown"
 # A prefix carves namespace room inside one flat shared container/bucket, so it is
 # azure/S3-only in practice: local-fs gets that isolation from its own root dir and
 # exposes no prefix key at all (empty prefix, no __default__ folder). Every path
@@ -1683,7 +1682,7 @@ class Watchtower:
         if self.trigger:
             with TimeLogger(self.log, "seed_aliases"):
                 self.seed_aliases()
-        self._emit(f"ready {self.me} slug={self.slug} v={CCCP_VERSION}")
+        self._emit(f"ready {self.me} slug={self.slug} v={cccp_version()}")
         self.log.debug(
             f"ev=watchtower_ready comrade={_kv(self.me)} slug={_kv(self.slug)} "
             f"idle_initial_s={self.idle_initial} idle_max_s={self.idle_max} "
@@ -3247,6 +3246,7 @@ def build_parser():
         prog="cccp",
         description="Claude-to-Claude Communication Program (pluggable backends).",
     )
+    p.add_argument("--version", action="version", version=f"cccp {cccp_version()}")
     # Explicit metavar lists only the operator-facing subcommands. `skill` is a
     # render-time internal (the SKILL.md `!`cccp skill ...`` include calls it, not
     # a human) - it stays a valid choice, so `cccp skill` and `cccp skill --help`

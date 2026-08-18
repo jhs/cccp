@@ -64,14 +64,13 @@ class PackageManifest(unittest.TestCase):
                          "package.json and .claude-plugin/plugin.json versions "
                          "must be bumped together (see CLAUDE.md)")
 
-    def test_version_lockstep_with_cccp_binary(self):
-        # The v3.2.0 release shipped with bin/cccp still announcing v=3.1.1 on
-        # the ready line - a live Pi comrade caught it. Never again.
+    def test_version_is_dry_no_hardcoded_constant(self):
+        # v3.4.0: bin/cccp reads its version from plugin.json at runtime via
+        # cccp_version(), so there is no CCCP_VERSION constant to drift.
         src = (REPO / "bin" / "cccp").read_text()
-        m = re.search(r'^CCCP_VERSION = "([^"]+)"', src, re.MULTILINE)
-        self.assertIsNotNone(m, "CCCP_VERSION constant not found in bin/cccp")
-        self.assertEqual(self.pkg["version"], m.group(1),
-                         "bin/cccp CCCP_VERSION must join the version bump")
+        self.assertNotIn('CCCP_VERSION', src,
+                         "bin/cccp should read the version from plugin.json, "
+                         "not carry a hardcoded CCCP_VERSION constant")
 
 
 class ChatSkill(unittest.TestCase):
