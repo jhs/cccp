@@ -20,7 +20,7 @@
  *
  *   cccp_join         Membership, per cell. The cell slug is always a tool argument — never env, never session
  *                     state. A session may join any number of cells (or none: sessions that never join stay
- *                     dormant). Each join spawns `cccp watchtower <slug>` and injects its stdout lines into the
+ *                     dormant). Each join spawns `cccp watchtower <slug>` (optionally `--idle <minutes>`) and injects its stdout lines into the
  *                     session via pi.sendMessage({deliverAs: "followUp", triggerTurn: true}) — the same
  *                     full-parity behavior a Claude Code comrade gets from the Monitor tool. Telemetry lines
  *                     (ready/idle/alias/shutdown) are delivered too; emission policy belongs to cccp's own knobs
@@ -116,13 +116,14 @@ export function resolveEnvironment(sessionId: string | undefined): EnvResolution
 	return { created, problem: null };
 }
 
-function eventPreamble(slug: string, line: string): string {
-	return (
-		`CCCP cell event on '${slug}' (from the cell's shared watchtower; body= values are JSON-encoded strings). ` +
-		`If a reply carries content, use the cccp_dispatch tool with cell '${slug}' targeted to the sender; telemetry lines (ready/idle/alias/shutdown) need no reply. ` +
-		`For a line with truncated=true, read the remainder with the bash tool: cccp read ${slug} --from <sender> --ts <ts>\n` +
-		line
-	);
+/** Concise event turn: joining supplies the one-time handling guidance. */
+export function eventMessage(slug: string, line: string): string {
+	return `cccp ${slug}: ${line}`;
+}
+
+/** Omit --idle to preserve cccp's default; zero explicitly disables heartbeats. */
+export function watchtowerArgs(cell: string, idleMinutes?: number): string[] {
+	return ["watchtower", cell, ...(idleMinutes === undefined ? [] : ["--idle", String(idleMinutes)])];
 }
 
 type ComradeState = {
@@ -179,8 +180,9 @@ export default function (pi: ExtensionAPI) {
 			"Join a CCCP cell (a chat room shared with other AI agents) as a comrade. Starts a listener for that cell; its incoming events then arrive automatically as messages. A session may join any number of cells.",
 		parameters: Type.Object({
 			cell: Type.String({ description: "Cell slug to join — lowercase, hyphenated, shell-safe, e.g. 'demo-cell'" }),
+			idle_minutes: Type.Optional(Type.Integer({ minimum: 0, description: "Minutes before idle heartbeats; 0 disables them. Omit for cccp's default." })),
 		}),
-		async execute(_toolCallId: string, params: { cell: string }) {
+		async execute(_toolCallId: string, params: { cell: string; idle_minutes?: number }) {
 			const cell = params.cell;
 			if (state.towers.has(cell)) {
 				return { content: [{ type: "text" as const, text: `Already joined cell '${cell}' as ${process.env.CCCP_COMRADE_ID}` }], details: { cell } };
@@ -193,12 +195,12 @@ export default function (pi: ExtensionAPI) {
 			}
 			log("INFO", `Join cell ${cell} as comrade: ${process.env.CCCP_COMRADE_ID}`);
 			const stderrTail: string[] = [];
-			const tower = spawn(CCCP, ["watchtower", cell], { stdio: ["ignore", "pipe", "pipe"] });
+			const tower = spawn(CCCP, watchtowerArgs(cell, params.idle_minutes), { stdio: ["ignore", "pipe", "pipe"] });
 			state.towers.set(cell, tower);
 			readline.createInterface({ input: tower.stdout! }).on("line", (line) => {
 				log("INFO", `Cell ${cell} event: ${JSON.stringify(line)}`);
 				pi.sendMessage(
-					{ customType: "cccp-event", content: eventPreamble(cell, line), display: true },
+					{ customType: "cccp-event", content: eventMessage(cell, line), display: true },
 					{ deliverAs: "followUp", triggerTurn: true },
 				);
 			});
@@ -228,7 +230,7 @@ export default function (pi: ExtensionAPI) {
 				);
 			});
 			return {
-				content: [{ type: "text" as const, text: `Joined cell '${cell}' as ${process.env.CCCP_COMRADE_ID}. The ready event confirms the listener; cell events arrive automatically from now on.` }],
+				content: [{ type: "text" as const, text: `Joined cell '${cell}' as ${process.env.CCCP_COMRADE_ID}. The ready event confirms the listener; cell events arrive automatically from now on. Reply only when a reply carries content, using cccp_dispatch targeted to the sender; ready, idle, alias, and shutdown events need no reply. For truncated=true, read the remainder with: cccp read ${cell} --from <sender> --ts <ts>.` }],
 				details: { cell },
 			};
 		},

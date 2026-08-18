@@ -18,7 +18,7 @@ Then join from inside the session — membership is agent-driven, exactly like C
 /skill:cccp-chat <slug> <optional role/context>
 ```
 
-The skill has the model call the `cccp_join` tool with the slug; no watchtower runs until then. Sessions that never join stay dormant apart from the session-start environment resolution below, which is what makes `cccp config` (and the comrade id) available before any join.
+The skill has the model call the `cccp_join` tool with the slug; no watchtower runs until then. Sessions that never join stay dormant apart from the session-start environment resolution below, which is what makes `cccp config` (and the comrade id) available before any join. Pass optional `idle_minutes: 0` to `cccp_join` to disable idle heartbeats; omit it to retain cccp's default interval.
 
 Installed (the repo is a pi package — see the root `package.json` `pi` manifest):
 
@@ -35,6 +35,10 @@ The doctrine half lives in a Pi skill, `.pi/skills/cccp-chat/` (also shipped via
 ```
 
 The split vs Claude Code: there the chat skill both instructs the model AND arms the watchtower (Monitor tool); under Pi the extension owns all plumbing, so the skill is pure instruction.
+
+## Event delivery
+
+`cccp_join` returns the one-time instructions for replying to events and reading a truncated event. After that, each event turn is only `cccp <slug>: <raw event line>`, keeping multi-cell sessions identifiable without repeating the standing guidance.
 
 ## Testing
 

@@ -256,6 +256,44 @@ class EnvSurface(unittest.TestCase):
                              "must not create ~/.pi/cccp when the Claude dir exists")
 
 
+class EventSurface(unittest.TestCase):
+    """A joined Pi comrade gets concise event turns and an explicit idle knob."""
+
+    def _extension_values(self):
+        script = (
+            'import("./integrations/pi/cccp-comrade.ts").then(m => {'
+            '  console.log(JSON.stringify({'
+            '    event: m.eventMessage("second-cell", "idle quiet=30m"),'
+            '    defaultArgs: m.watchtowerArgs("second-cell"),'
+            '    disabledArgs: m.watchtowerArgs("second-cell", 0)'
+            '  }));'
+            '}, e => { console.error(e.message); process.exit(1); });'
+        )
+        with tempfile.TemporaryDirectory() as td:
+            env = dict(os.environ, CCCP_PLUGIN_DATA=td)
+            r = subprocess.run(["node", "--no-warnings", "-e", script], cwd=REPO,
+                               env=env, capture_output=True, text=True, timeout=60)
+        if r.returncode != 0 and "Unknown file extension" in r.stderr + r.stdout:
+            self.skipTest("SKIPPED LOUDLY: this node cannot import TypeScript "
+                          "natively (needs Node >= 23) - event-surface test not run")
+        self.assertEqual(r.returncode, 0, f"node failed:\n{r.stderr}")
+        return json.loads(r.stdout.strip().splitlines()[-1])
+
+    def test_event_turn_is_raw_line_without_repeated_preamble(self):
+        out = self._extension_values()
+        self.assertIn("idle quiet=30m", out["event"])
+        self.assertNotIn("CCCP cell event on 'second-cell'", out["event"])
+        self.assertEqual(out["event"], "cccp second-cell: idle quiet=30m")
+
+    def test_idle_zero_reaches_watchtower_and_default_stays_unchanged(self):
+        out = self._extension_values()
+        self.assertEqual(out["defaultArgs"], ["watchtower", "second-cell"])
+        self.assertEqual(out["disabledArgs"], ["watchtower", "second-cell", "--idle", "0"])
+        self.assertIn('spawn(CCCP, watchtowerArgs(cell, params.idle_minutes)',
+                      EXTENSION.read_text(),
+                      "cccp_join must pass its idle_minutes through to the spawned watchtower")
+
+
 class TypeCheck(unittest.TestCase):
     def test_extension_typechecks(self):
         if not (REPO / "node_modules" / ".bin" / "tsc").exists():
