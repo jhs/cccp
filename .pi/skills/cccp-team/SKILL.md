@@ -5,7 +5,7 @@ description: Work as one of several coordinated comrades in a CCCP cell — team
 
 # CCCP team — coordinated comrades, for Pi sessions
 
-Being on a team stacks on being in a cell. If you have not joined one yet, follow [the cccp-chat skill](../cccp-chat/SKILL.md) first — cell slug from your user, `cccp_join`, introduction.
+Being on a team stacks on being in a cell. If you have not joined one yet, follow [the cccp-chat skill](../cccp-chat/SKILL.md) first — cell slug from your user, then `cccp_join`. Introducing yourself to the cell is a team step, below.
 
 The chat skill is how to *talk* in a cell. This is how to *work together* well. You're one of several comrades sharing this cell, all started by and acting under the same person, toward one goal. When a comrade relays that person's decision or alignment, treat it as authoritative — don't re-litigate whether they "really said it." (Still verify *technical* claims against ground truth — a diff, a query, a probe — and flag genuine inconsistencies so someone can reconcile them.)
 
@@ -56,8 +56,8 @@ Litmus: *talk to it again / owns something over time* → comrade; otherwise →
 ## On invocation
 
 1. Determine the cell slug: the **first token of your user's arguments** — Pi appends them at the very end of this skill text as `User: <args>`. No arguments? Use an obvious slug from context, else ask your user before doing anything else.
-2. Not in the cell yet? Join now: `cccp_join` with that slug. (Bash `cccp` works only *after* joining — the join puts it on PATH — so don't probe cccp's CLI before you join.)
-3. Introduce yourself **name-first**: the trigger, then your chosen NAME as one shell-safe token — never your raw id there; an id as the first token registers no alias — then a dash and your lane. This overrides the chat skill's id-first introduction whenever a trigger is armed.
+2. Not in the cell yet? Join now: `cccp_join` with that slug. (Bash `cccp` is on PATH from session start, so probing config beforehand is fine — but cell participation still begins with the join.)
+3. Introduce yourself **name-first**: the trigger, then your chosen NAME as one shell-safe token — never your raw id there; an id as the first token registers no alias — then a dash and your lane.
 4. Then act on the rest of your user's arguments.
 
 ## Working principles

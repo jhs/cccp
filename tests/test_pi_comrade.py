@@ -94,8 +94,33 @@ class ChatSkill(unittest.TestCase):
                         f"pi.skills does not cover {self.SKILL}")
 
     def test_skill_teaches_the_essentials(self):
-        for needle in ("cccp_join", "cccp_dispatch", "Comrade Introduction: ", "truncated=true",
+        for needle in ("cccp_join", "cccp_dispatch", "truncated=true",
                        "CCCP_COMRADE_ID", "never start one"):
+            self.assertIn(needle, self.text)
+
+
+class SetupSkill(unittest.TestCase):
+    SKILL = REPO / ".pi" / "skills" / "cccp-setup" / "SKILL.md"
+
+    def setUp(self):
+        self.text = self.SKILL.read_text()
+
+    def test_skill_exists_with_frontmatter(self):
+        head, sep, _body = self.text.partition("\n---\n")
+        self.assertTrue(head.startswith("---\n") and sep,
+                        "SKILL.md must open with a --- frontmatter block")
+        self.assertIn("name: cccp-setup", head)
+        self.assertIn("description:", head)
+
+    def test_pi_manifest_covers_skill_dir(self):
+        pkg = json.loads((REPO / "package.json").read_text())
+        dirs = [(REPO / d).resolve() for d in pkg["pi"]["skills"]]
+        self.assertTrue(any(str(self.SKILL).startswith(str(d) + os.sep) for d in dirs),
+                        f"pi.skills does not cover {self.SKILL}")
+
+    def test_skill_teaches_the_essentials(self):
+        for needle in ("cccp config", "cccp backend", "local-fs", "azure-blob",
+                       "never read, echo", "CCCP_PLUGIN_DATA"):
             self.assertIn(needle, self.text)
 
 
@@ -127,7 +152,8 @@ class TeamSkill(unittest.TestCase):
 class EnvSurface(unittest.TestCase):
     """The extension invents NO env vars: cell is a tool parameter, the binary
     self-locates, the log path is fixed. Only pre-existing cccp surface
-    (CCCP_COMRADE_ID, CCCP_PLUGIN_DATA) may appear."""
+    (CCCP_COMRADE_ID, CCCP_PLUGIN_DATA) may appear, resolved at session start
+    so identity and `cccp config` work before any join."""
 
     def test_retired_env_vars_stay_gone(self):
         src = EXTENSION.read_text()
@@ -142,8 +168,8 @@ class EnvSurface(unittest.TestCase):
         script = (
             'import("./integrations/pi/cccp-comrade.ts").then(m => {'
             '  const bin = m.cccpBin();'
-            '  const problem = m.resolveEnvironment("abcdef99-1111-2222-3333-444444444444");'
-            '  console.log(JSON.stringify({bin, problem,'
+            '  const res = m.resolveEnvironment("abcdef99-1111-2222-3333-444444444444");'
+            '  console.log(JSON.stringify({bin, problem: res.problem, created: res.created,'
             '    id: process.env.CCCP_COMRADE_ID,'
             '    pathHead: process.env.PATH.split(":")[0]}));'
             '}, e => { console.error(e.message); process.exit(1); });'
@@ -168,8 +194,67 @@ class EnvSurface(unittest.TestCase):
         out = json.loads(r.stdout.strip().splitlines()[-1])
         self.assertEqual(out["bin"], str(REPO / "bin" / "cccp"))
         self.assertIsNone(out["problem"])
+        self.assertIsNone(out["created"])
         self.assertRegex(out["id"], r"^[^@\s]+@[^:\s]+:abcdef$")
         self.assertEqual(out["pathHead"], str(REPO / "bin"))
+
+    def test_data_dir_auto_creation_on_claude_less_machine(self):
+        """No CCCP_PLUGIN_DATA, no Claude plugin data dir => resolveEnvironment
+        creates ~/.pi/cccp (HOME-scoped), exports it, and reports the creation
+        exactly once — the signal for the one-time first-run INFO message."""
+        script = (
+            'import("./integrations/pi/cccp-comrade.ts").then(m => {'
+            '  const first = m.resolveEnvironment("abcdef99-1111-2222-3333-444444444444");'
+            '  const second = m.resolveEnvironment("abcdef99-1111-2222-3333-444444444444");'
+            '  console.log(JSON.stringify({first, second, data: process.env.CCCP_PLUGIN_DATA}));'
+            '}, e => { console.error(e.message); process.exit(1); });'
+        )
+        with tempfile.TemporaryDirectory() as td:
+            env = {k: v for k, v in os.environ.items()
+                   if k not in ("CCCP_COMRADE_ID", "CCCP_PLUGIN_DATA", "CLAUDE_CONFIG_DIR")}
+            env["HOME"] = td
+            r = subprocess.run(["node", "--no-warnings", "-e", script], cwd=REPO,
+                               env=env, capture_output=True, text=True, timeout=60)
+            if r.returncode != 0 and "Unknown file extension" in r.stderr + r.stdout:
+                self.skipTest("SKIPPED LOUDLY: this node cannot import TypeScript "
+                              "natively (needs Node >= 23) - creation test not run")
+            self.assertEqual(r.returncode, 0, f"node failed:\n{r.stderr}")
+            out = json.loads(r.stdout.strip().splitlines()[-1])
+            expected = os.path.join(td, ".pi", "cccp")
+            self.assertEqual(out["first"], {"created": expected, "problem": None})
+            self.assertEqual(out["second"], {"created": None, "problem": None},
+                             "second resolution must not re-report creation")
+            self.assertEqual(out["data"], expected)
+            self.assertTrue(os.path.isdir(expected), f"not created: {expected}")
+
+    def test_existing_claude_data_dir_is_preferred(self):
+        """When the Claude plugin's data dir exists, Pi shares it (same-machine
+        Claude and Pi comrades must reach the same local-fs cells) and creates
+        nothing under ~/.pi."""
+        script = (
+            'import("./integrations/pi/cccp-comrade.ts").then(m => {'
+            '  const res = m.resolveEnvironment(undefined);'
+            '  console.log(JSON.stringify({res, data: process.env.CCCP_PLUGIN_DATA}));'
+            '}, e => { console.error(e.message); process.exit(1); });'
+        )
+        with tempfile.TemporaryDirectory() as td:
+            claude = Path(td) / "cfg" / "plugins" / "data" / "cccp-CCCP"
+            claude.mkdir(parents=True)
+            env = {k: v for k, v in os.environ.items()
+                   if k not in ("CCCP_COMRADE_ID", "CCCP_PLUGIN_DATA")}
+            env["HOME"] = td
+            env["CLAUDE_CONFIG_DIR"] = str(Path(td) / "cfg")
+            r = subprocess.run(["node", "--no-warnings", "-e", script], cwd=REPO,
+                               env=env, capture_output=True, text=True, timeout=60)
+            if r.returncode != 0 and "Unknown file extension" in r.stderr + r.stdout:
+                self.skipTest("SKIPPED LOUDLY: this node cannot import TypeScript "
+                              "natively (needs Node >= 23) - preference test not run")
+            self.assertEqual(r.returncode, 0, f"node failed:\n{r.stderr}")
+            out = json.loads(r.stdout.strip().splitlines()[-1])
+            self.assertEqual(out["res"], {"created": None, "problem": None})
+            self.assertEqual(out["data"], str(claude))
+            self.assertFalse((Path(td) / ".pi" / "cccp").exists(),
+                             "must not create ~/.pi/cccp when the Claude dir exists")
 
 
 class TypeCheck(unittest.TestCase):
@@ -442,9 +527,9 @@ class _LiveHarness:
             f"You are a CCCP comrade under test. Do exactly this, using tools, "
             f"with no questions asked:\n"
             f"1. Call the cccp_join tool with cell '{self.slug}'.\n"
-            f"2. Then call cccp_dispatch with NO 'to' parameter (a broadcast) "
-            f"and message starting exactly '{ALIAS_TRIGGER} PiTester' followed "
-            f"by one short sentence.\n"
+            f"2. Then call cccp_dispatch with cell '{self.slug}', NO 'to' "
+            f"parameter (a broadcast), and message starting exactly "
+            f"'{ALIAS_TRIGGER} PiTester' followed by one short sentence.\n"
             f"3. Then stop and wait. When a cell event arrives asking you "
             f"something, answer it with cccp_dispatch targeted to the sender "
             f"(the 'to' parameter set to the sender's comrade id).")

@@ -1,6 +1,6 @@
 # CCCP comrade extension for Pi
 
-Makes a [Pi](https://github.com/earendil-works/pi) session a full CCCP comrade: it joins a cell, receives cell events as turns, and replies through a registered `cccp_dispatch` tool. The cccp wire format and backend are untouched — this is a harness adapter, the Pi equivalent of the Claude Code Monitor + Bash glue.
+Makes a [Pi](https://github.com/earendil-works/pi) session a full CCCP comrade: it joins cells, receives cell events as turns, and replies through a registered `cccp_dispatch` tool. The cccp wire format and backend are untouched — this is a harness adapter, the Pi equivalent of the Claude Code Monitor + Bash glue. A session may join any number of cells (each `cccp_join` runs one watchtower), or none.
 
 ## Load
 
@@ -18,7 +18,7 @@ Then join from inside the session — membership is agent-driven, exactly like C
 /skill:cccp-chat <slug> <optional role/context>
 ```
 
-The skill has the model call the `cccp_join` tool with the slug; nothing runs until then, so sessions that never join are completely unaffected.
+The skill has the model call the `cccp_join` tool with the slug; no watchtower runs until then. Sessions that never join stay dormant apart from the session-start environment resolution below, which is what makes `cccp config` (and the comrade id) available before any join.
 
 Installed (the repo is a pi package — see the root `package.json` `pi` manifest):
 
@@ -48,11 +48,11 @@ It needs the `pi` binary plus credentials (an `ANTHROPIC_API_KEY`/`PI_API_KEY` e
 
 ## Env contract
 
-**No environment variables are required.** The cell is a `cccp_join` tool parameter, never env. Optional overrides:
+**No environment variables are required.** The cell is always a `cccp_join`/`cccp_dispatch` tool parameter, never env. Everything session-scoped resolves at **session start** — the user enabled the extension, so `cccp config` and the comrade id are usable in the bash tool before any join. Explicit env always wins; both variables are pre-existing cccp surface, not Pi inventions:
 
 | Variable | Meaning |
 |---|---|
-| `CCCP_COMRADE_ID` | Optional override. By default derived Claude-Code-style at join time — `user@shorthost:<first-6-of-Pi-session-id>` — and exported, so the watchtower, dispatches, and the bash tool share one identity. |
-| `CCCP_PLUGIN_DATA` | Optional cccp data directory. Defaults to the Claude plugin's conventional `${CLAUDE_CONFIG_DIR:-~/.claude}/plugins/data/cccp-CCCP`; if neither is usable, `cccp_join` fails loudly in-session. |
+| `CCCP_COMRADE_ID` | Optional override. By default derived Claude-Code-style at session start — `user@shorthost:<first-6-of-Pi-session-id>` — and exported, so the watchtowers, dispatches, and the bash tool share one stable identity for the whole session (`echo $CCCP_COMRADE_ID`). |
+| `CCCP_PLUGIN_DATA` | Optional cccp data directory. Defaults to the Claude plugin's conventional `${CLAUDE_CONFIG_DIR:-~/.claude}/plugins/data/cccp-CCCP` when it exists (a shared store: same-machine Claude and Pi comrades reach the same local-fs cells); on a Claude-less machine, `~/.pi/cccp` is auto-created on first run, announced by a one-time in-session INFO message pointing at the `cccp-setup` skill. |
 
-Both are pre-existing cccp surface, not Pi inventions. The cccp binary needs no configuration: the extension uses the `bin/cccp` two directories above its own file (present in any repo or package clone) and prepends that directory to `PATH` at join, so plain `cccp` works in the model's bash tool too. The extension's own log appends to `$CCCP_PLUGIN_DATA/logs/pi-comrade.log`.
+The cccp binary needs no configuration: the extension uses the `bin/cccp` two directories above its own file (present in any repo or package clone) and prepends that directory to `PATH` at session start, so plain `cccp` works in the model's bash tool from the first turn. The extension's own log appends to `$CCCP_PLUGIN_DATA/logs/pi-comrade.log`.
