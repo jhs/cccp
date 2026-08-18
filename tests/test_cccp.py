@@ -1651,5 +1651,116 @@ class JournalRecordsOnBad(unittest.TestCase):
         self.assertEqual(records, [{"a": 1}])
 
 
+class RecipientResolution(unittest.TestCase):
+    """Every command that takes `--to` must resolve an alias to a comrade id before
+    the token reaches the wire or a match (#25). The wire only ever carries ids, so
+    an unresolved alias addresses nobody: publish printed success while the
+    recipient's watchtower saw nothing, because `addressed_to_me` compares ids."""
+
+    ME = "me@hostA:cc-aaaaaa"
+    PEER = "peer@hostB:cc-bbbbbb"
+
+    def setUp(self):
+        self.data = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.data, True))
+        self.src = Path(self.data, "payload.txt")
+        self.src.write_text("hello\n")
+        self.slug = "demo"
+
+    @contextlib.contextmanager
+    def _cell(self):
+        """An isolated local-fs cell where PEER is aliased 'Foreman' for ME."""
+        with _isolated_env(self.data, CCCP_COMRADE_ID=self.ME):
+            cccp.save_aliases(self.slug, self.ME, {self.PEER: "Foreman"})
+            yield
+
+    def _gazette(self, sender):
+        with _isolated_env(self.data, CCCP_COMRADE_ID=self.ME):
+            cfg = cccp.resolve_config()
+            client = cccp.make_backend(cfg)
+            st, body = client.get(cccp.gazette_path(cfg["PREFIX"], self.slug, sender))
+        if st != 200:
+            return []
+        return [json.loads(line) for line in body.splitlines() if line.strip()]
+
+    def _args(self, **kw):
+        return type("Args", (), dict({"cell": self.slug}, **kw))()
+
+    def _quiet(self, fn, **kw):
+        """Run a command for its effect on the cell, not its console output."""
+        with contextlib.redirect_stdout(io.StringIO()):
+            fn(self._args(**kw))
+
+    def test_publish_to_alias_announces_the_resolved_id(self):
+        with self._cell():
+            self._quiet(cccp.cmd_publish, path=str(self.src), to=["Foreman"])
+        ann = [d for d in self._gazette(self.ME) if d.get("op") == "publish"]
+        self.assertEqual(len(ann), 1)
+        self.assertEqual(ann[0]["to"], [self.PEER])
+        # The point of resolving: the recipient's own filter must now match.
+        self.assertTrue(cccp.addressed_to_me(ann[0]["to"], self.PEER))
+
+    def test_publish_to_id_and_star_are_unchanged(self):
+        with self._cell():
+            self._quiet(cccp.cmd_publish, path=str(self.src), to=[self.PEER])
+            self._quiet(cccp.cmd_publish, path=str(self.src), to=[])
+        ann = [d for d in self._gazette(self.ME) if d.get("op") == "publish"]
+        self.assertEqual([d["to"] for d in ann], [[self.PEER], ["*"]])
+
+    def test_publish_to_unknown_alias_exits_without_announcing(self):
+        with self._cell():
+            with self.assertRaises(SystemExit) as cm:
+                self._quiet(cccp.cmd_publish, path=str(self.src), to=["Nobody"])
+        self.assertIn("unknown alias", str(cm.exception))
+        # Silent success was the whole harm in #25: no announcement, and the
+        # publisher is told so.
+        self.assertEqual(self._gazette(self.ME), [])
+
+    def test_unpublish_to_alias_announces_the_resolved_id(self):
+        with self._cell():
+            self._quiet(cccp.cmd_publish, path=str(self.src), to=["Foreman"])
+            self._quiet(cccp.cmd_unpublish, path=str(self.src), to=["Foreman"])
+        ann = [d for d in self._gazette(self.ME) if d.get("op") == "unpublish"]
+        self.assertEqual(len(ann), 1)
+        self.assertEqual(ann[0]["to"], [self.PEER])
+
+    def _dispatch(self, body, to):
+        self._quiet(cccp.cmd_dispatch, to=to, body=body, deadline=None, standing=False)
+
+    def _read(self, **kw):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cccp.cmd_read(self._args(**dict({"to": None, "from_": None, "ts": None,
+                                             "last": None, "full": False}, **kw)))
+        return out.getvalue()
+
+    def test_read_to_alias_selects_that_comrade_s_messages(self):
+        with self._cell():
+            self._dispatch("for the foreman", [self.PEER])
+            self._dispatch("for nobody in particular", ["other@h:cc-cccccc"])
+            got = self._read(to="Foreman")
+        self.assertIn("for the foreman", got)
+        self.assertNotIn("for nobody in particular", got)
+
+    def test_read_from_alias_selects_that_comrade_s_gazette(self):
+        with self._cell():
+            self._dispatch("mine", ["*"])
+            got = self._read(from_="Foreman")     # PEER's gazette: empty, not mine
+        self.assertNotIn("mine", got)
+        with self._cell():
+            with self.assertRaises(SystemExit) as cm:
+                self._read(from_="Nobody")
+        self.assertIn("unknown alias", str(cm.exception))
+
+    def test_help_advertises_aliases_wherever_they_resolve(self):
+        parser = cccp.build_parser()
+        cmds = parser._subparsers._group_actions[0].choices
+        for name, dest in (("dispatch", "to"), ("publish", "to"),
+                           ("unpublish", "to"), ("read", "to"), ("read", "from_")):
+            action = next(a for a in cmds[name]._actions if a.dest == dest)
+            self.assertIn("alias", action.help,
+                          f"{name} takes an alias for {dest} but does not say so")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
