@@ -298,11 +298,11 @@ class SkillCompose(unittest.TestCase):
         self.assertNotIn("Team norms", out)             # no team layer for plain chat
         self.assertIn("## Your instructions", out)      # outro still appended
 
-    def test_foreman_is_three_layer_stack(self):
-        """foreman = [chat, team, foreman] - transitive composition, base-first,
+    def test_captain_is_three_layer_stack(self):
+        """captain = [chat, team, captain] - transitive composition, base-first,
         outro still exactly once."""
         with mock.patch.dict(os.environ, {"CCCP_COMRADE_ID": "x@y:zzzzzz"}):
-            out = cccp.compose_skill("foreman")
+            out = cccp.compose_skill("captain")
         self.assertNotIn("@@", out)
         i_chat = out.index("# CCCP")
         i_team = out.index("Team norms")
@@ -338,16 +338,16 @@ class Aliases(unittest.TestCase):
         self.assertFalse(cccp.is_comrade_id("also-not-1"))
 
     def test_parse_alias(self):
-        self.assertEqual(cccp.parse_alias("Alias: Foreman — hi", "Alias:"), "Foreman")
+        self.assertEqual(cccp.parse_alias("Alias: Captain — hi", "Alias:"), "Captain")
         self.assertEqual(cccp.parse_alias("Alias:   Bob_1 reporting", "Alias:"), "Bob_1")
-        self.assertEqual(cccp.parse_alias("Alias: Foreman", "Alias:"), "Foreman")  # at EOL
+        self.assertEqual(cccp.parse_alias("Alias: Captain", "Alias:"), "Captain")  # at EOL
         self.assertIsNone(cccp.parse_alias("just a normal message", "Alias:"))
         self.assertIsNone(cccp.parse_alias("Alias: hi", None))       # no trigger -> off
         self.assertIsNone(cccp.parse_alias("Alias: !!!", "Alias:"))  # no token after
 
     def test_parse_alias_rejects_prose_and_ids(self):
         # Prose intro: "I" is a pronoun, not a name (issue #1 garbage alias).
-        self.assertIsNone(cccp.parse_alias("Alias: I am the new Foreman", "Alias:"))
+        self.assertIsNone(cccp.parse_alias("Alias: I am the new Captain", "Alias:"))
         # Id-first intro: the token is a comrade-id prefix, not a name (issue #1).
         self.assertIsNone(cccp.parse_alias("Alias: omni@fs:abc123 here", "Alias:"))
         self.assertIsNone(cccp.parse_alias("Alias: co@fs:abc123 is me", "Alias:"))
@@ -509,36 +509,36 @@ class SelfAliasLearning(unittest.TestCase):
         wt = self._watchtower()
         wt.initial_scan()
         self.client.append(self._gazette(self.ME),
-                           self._intro(self.ME, "Foreman",
+                           self._intro(self.ME, "Captain",
                                        "2026-07-17T15:35:00.000000Z"))
         wt._poll_once()
-        self.assertEqual(wt.aliases.get(self.ME), "Foreman")
-        self.assertTrue(any(l.startswith("alias name=Foreman") for l in wt.emitted))
+        self.assertEqual(wt.aliases.get(self.ME), "Captain")
+        self.assertTrue(any(l.startswith("alias name=Captain") for l in wt.emitted))
         # The intro itself must not echo back as a message event.
         self.assertFalse(any(l.startswith("message") for l in wt.emitted))
 
     def test_poll_own_intro_evicts_dead_predecessor(self):
-        cccp.save_aliases(self.SLUG, self.ME, {self.DEAD: "Foreman"})
+        cccp.save_aliases(self.SLUG, self.ME, {self.DEAD: "Captain"})
         wt = self._watchtower()
         wt.initial_scan()
         self.client.append(self._gazette(self.ME),
-                           self._intro(self.ME, "Foreman",
+                           self._intro(self.ME, "Captain",
                                        "2026-07-17T15:35:00.000000Z"))
         wt._poll_once()
-        self.assertEqual(wt.aliases, {self.ME: "Foreman"})
+        self.assertEqual(wt.aliases, {self.ME: "Captain"})
 
     def test_seed_learns_own_intro(self):
         # A restarted armed watchtower re-learns its own alias from backlog
         # instead of only resurrecting the dead predecessor's.
         self.client.append(self._gazette(self.DEAD),
-                           self._intro(self.DEAD, "Foreman",
+                           self._intro(self.DEAD, "Captain",
                                        "2026-07-13T00:00:00.000000Z"))
         self.client.append(self._gazette(self.ME),
-                           self._intro(self.ME, "Foreman",
+                           self._intro(self.ME, "Captain",
                                        "2026-07-17T15:35:00.000000Z"))
         wt = self._watchtower()
         wt.seed_aliases()
-        self.assertEqual(wt.aliases, {self.ME: "Foreman"})
+        self.assertEqual(wt.aliases, {self.ME: "Captain"})
 
     def test_seed_skips_stale_gazettes(self):
         # A gazette idle past ALIAS_SEED_MAX_AGE_SECONDS gets no head read at
@@ -548,18 +548,18 @@ class SelfAliasLearning(unittest.TestCase):
                                             "2026-01-01T00:00:00.000000Z"))
         self.client.lm[gaz] = "Thu, 01 Jan 2026 00:00:00 GMT"
         self.client.append(self._gazette(self.ME),
-                           self._intro(self.ME, "Foreman",
+                           self._intro(self.ME, "Captain",
                                        "2026-07-17T15:35:00.000000Z"))
         wt = self._watchtower()
         wt.seed_aliases()
-        self.assertEqual(wt.aliases, {self.ME: "Foreman"})
+        self.assertEqual(wt.aliases, {self.ME: "Captain"})
         self.assertNotIn(gaz, self.client.fetched)
 
     def test_poll_skips_own_gazette_when_unarmed(self):
         wt = self._watchtower(trigger=None)
         wt.initial_scan()
         self.client.append(self._gazette(self.ME),
-                           self._intro(self.ME, "Foreman",
+                           self._intro(self.ME, "Captain",
                                        "2026-07-17T15:35:00.000000Z"))
         wt._poll_once()
         self.assertNotIn(self._gazette(self.ME), self.client.fetched)
@@ -1669,9 +1669,9 @@ class RecipientResolution(unittest.TestCase):
 
     @contextlib.contextmanager
     def _cell(self):
-        """An isolated local-fs cell where PEER is aliased 'Foreman' for ME."""
+        """An isolated local-fs cell where PEER is aliased 'Captain' for ME."""
         with _isolated_env(self.data, CCCP_COMRADE_ID=self.ME):
-            cccp.save_aliases(self.slug, self.ME, {self.PEER: "Foreman"})
+            cccp.save_aliases(self.slug, self.ME, {self.PEER: "Captain"})
             yield
 
     def _gazette(self, sender):
@@ -1693,7 +1693,7 @@ class RecipientResolution(unittest.TestCase):
 
     def test_publish_to_alias_announces_the_resolved_id(self):
         with self._cell():
-            self._quiet(cccp.cmd_publish, path=str(self.src), to=["Foreman"])
+            self._quiet(cccp.cmd_publish, path=str(self.src), to=["Captain"])
         ann = [d for d in self._gazette(self.ME) if d.get("op") == "publish"]
         self.assertEqual(len(ann), 1)
         self.assertEqual(ann[0]["to"], [self.PEER])
@@ -1718,8 +1718,8 @@ class RecipientResolution(unittest.TestCase):
 
     def test_unpublish_to_alias_announces_the_resolved_id(self):
         with self._cell():
-            self._quiet(cccp.cmd_publish, path=str(self.src), to=["Foreman"])
-            self._quiet(cccp.cmd_unpublish, path=str(self.src), to=["Foreman"])
+            self._quiet(cccp.cmd_publish, path=str(self.src), to=["Captain"])
+            self._quiet(cccp.cmd_unpublish, path=str(self.src), to=["Captain"])
         ann = [d for d in self._gazette(self.ME) if d.get("op") == "unpublish"]
         self.assertEqual(len(ann), 1)
         self.assertEqual(ann[0]["to"], [self.PEER])
@@ -1736,16 +1736,16 @@ class RecipientResolution(unittest.TestCase):
 
     def test_read_to_alias_selects_that_comrade_s_messages(self):
         with self._cell():
-            self._dispatch("for the foreman", [self.PEER])
+            self._dispatch("for the captain", [self.PEER])
             self._dispatch("for nobody in particular", ["other@h:cc-cccccc"])
-            got = self._read(to="Foreman")
-        self.assertIn("for the foreman", got)
+            got = self._read(to="Captain")
+        self.assertIn("for the captain", got)
         self.assertNotIn("for nobody in particular", got)
 
     def test_read_from_alias_selects_that_comrade_s_gazette(self):
         with self._cell():
             self._dispatch("mine", ["*"])
-            got = self._read(from_="Foreman")     # PEER's gazette: empty, not mine
+            got = self._read(from_="Captain")     # PEER's gazette: empty, not mine
         self.assertNotIn("mine", got)
         with self._cell():
             with self.assertRaises(SystemExit) as cm:

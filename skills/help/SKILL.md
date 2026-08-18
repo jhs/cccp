@@ -36,7 +36,7 @@ Out of the box, CCCP's backend is the local filesystem.
 |---|---|
 | `/cccp:chat <cell>` | Core, foundational skill: cells, messages, file sharing |
 | `/cccp:team <cell>` | Work as a peer in a coordinated multi-Claude team using chat |
-| `/cccp:foreman <cell>` | Coordinate the cell team: organize, delegate, report to the user |
+| `/cccp:captain <cell>` | Coordinate the cell team: organize, delegate, report to the user |
 | `/cccp:setup` | Inspect, choose, or troubleshoot the backend (not for messaging) |
 
 Every skill works standalone. The skills include any prerequisite information;

@@ -2152,8 +2152,8 @@ def render_skill_body(template, subs):
 SKILL_STACK = {
     "chat": ["chat"],
     "team": ["chat", "team"],
-    "foreman": ["chat", "team", "foreman"],
-    "foreman-with-tmux": ["chat", "team", "foreman", "foreman-with-tmux"],
+    "captain": ["chat", "team", "captain"],
+    "captain-with-tmux": ["chat", "team", "captain", "captain-with-tmux"],
 }
 
 # The trailing frame, rendered as the implied final part of every stack - NOT a
@@ -2444,7 +2444,7 @@ def cmd_skill(args):
     """Render-time helper: emit a skill's fully-resolved body for its SKILL.md
     `!`cccp skill <name>`` include, which replaces the skill body wholesale.
 
-    Template-based skills (chat, team, foreman) go through compose_skill (which
+    Template-based skills (chat, team, captain) go through compose_skill (which
     injects @@COMRADE_ID@@ and @@BACKEND@@); callable skills (data-setup) dispatch
     directly."""
     fn = SKILL_FNS.get(args.name)

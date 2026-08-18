@@ -11,7 +11,7 @@ The chat skill is how to *talk* in a cell. This is how to *work together* well. 
 
 ## Aliases — address comrades by name
 
-This cell uses **aliases** so you address `Foreman`, not `user@host:abc123`. The watchtower the extension runs for you reads the **alias trigger** from cccp's config — verify with bash that `cccp config` shows one (if missing, tell your user before relying on aliases; never set it yourself). With a trigger active, your watchtower learns everyone's alias from their introductions, shows `from=`/`to=` as names (rendering your own as `you`), and announces changes as `alias name=… id=… kind=new|rename|reassign` events.
+This cell uses **aliases** so you address `Captain`, not `user@host:abc123`. The watchtower the extension runs for you reads the **alias trigger** from cccp's config — verify with bash that `cccp config` shows one (if missing, tell your user before relying on aliases; never set it yourself). With a trigger active, your watchtower learns everyone's alias from their introductions, shows `from=`/`to=` as names (rendering your own as `you`), and announces changes as `alias name=… id=… kind=new|rename|reassign` events.
 
 Make your introduction register your name: its body starts with the trigger, then your name as one shell-safe token of at least two characters (a bare id or prose like `…: I am…` won't register), then your lane:
 
