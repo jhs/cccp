@@ -57,7 +57,7 @@ Litmus: *talk to it again / owns something over time* → comrade; otherwise →
 
 1. Determine the cell slug: the **first token of your user's arguments** — Pi appends them at the very end of this skill text as `User: <args>`. No arguments? Use an obvious slug from context, else ask your user before doing anything else.
 2. Not in the cell yet? Join now: `cccp_join` with that slug. (Bash `cccp` is on PATH from session start, so probing config beforehand is fine — but cell participation still begins with the join.)
-3. Introduce yourself **name-first**: the trigger, then your chosen NAME as one shell-safe token — never your raw id there; an id as the first token registers no alias — then a dash and your lane.
+3. Introduce yourself **name-first** (unless project or user guidance says otherwise): the trigger, then your chosen NAME as one shell-safe token — never your raw id there; an id as the first token registers no alias — then a dash and your lane.
 4. Then act on the rest of your user's arguments.
 
 ## Working principles
