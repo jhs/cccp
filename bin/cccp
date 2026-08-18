@@ -1436,6 +1436,26 @@ def resolve_recipient(amap, token):
     return None, f"unknown alias {token!r}"
 
 
+def resolve_targets(slug, tokens):
+    """Every command's `--to`/`--from`, turned into comrade ids: no tokens means
+    broadcast, an unknown alias exits. The wire and every match (addressed_to_me, a
+    gazette path) are ids only, so an alias that gets past here addresses nobody and
+    says nothing about it (#25). The map loads only when an alias is present, so
+    id-only calls still work outside a Claude session."""
+    tokens = list(tokens) or ["*"]
+    if all(is_comrade_id(t) or t == "*" for t in tokens):
+        return tokens
+    amap = load_aliases(slug, comrade_id())
+    out = []
+    for t in tokens:
+        cid, err = resolve_recipient(amap, t)
+        if err:
+            sys.exit(f"error: {err} - known aliases: "
+                     f"{', '.join(sorted(amap.values())) or '(none)'}")
+        out.append(cid)
+    return out
+
+
 class Watchtower:
     """Polls the cell prefix and emits one event line per new dispatch. A live-
     event stream: it skips backlog at startup (no replay). The only local state is
@@ -2473,20 +2493,7 @@ def cmd_dispatch(args):
                 if parse_duration(limit) is None:
                     sys.exit(f"error: --deadline {args.deadline!r} is not a duration "
                              f"(e.g. 180s, 10m, 3h30m) or 'none'")
-        # Resolve any alias in --to back to a raw comrade id (the wire only ever
-        # carries ids). Aliases and ids are distinguishable, so this is a no-op
-        # for id/`*` recipients and errors on an unknown alias.
-        to = args.to if args.to else ["*"]
-        if any(not is_comrade_id(t) and t != "*" for t in to):
-            amap = load_aliases(slug, me)
-            resolved = []
-            for t in to:
-                cid, err = resolve_recipient(amap, t)
-                if err:
-                    sys.exit(f"error: {err} - known aliases: "
-                             f"{', '.join(sorted(amap.values())) or '(none)'}")
-                resolved.append(cid)
-            to = resolved
+        to = resolve_targets(slug, args.to)
         sent = None
         if args.body is not None:
             body = read_dispatch_body(args.body)
@@ -2663,7 +2670,10 @@ def cmd_read(args):
     prefix = cfg["PREFIX"]
 
     with subcommand_footer(log):
-        senders = [args.from_] if args.from_ else cell_roster(client, prefix, slug)
+        # Both filters name a comrade, so both take an alias.
+        recipient = resolve_targets(slug, [args.to])[0] if args.to else None
+        senders = resolve_targets(slug, [args.from_]) if args.from_ else \
+            cell_roster(client, prefix, slug)
         msgs = []
         for sender in senders:
             st, body = client.get(gazette_path(prefix, slug, sender))
@@ -2679,8 +2689,8 @@ def cmd_read(args):
                 if d.get("type") == "message":
                     msgs.append(d)
 
-        if args.to:
-            msgs = [m for m in msgs if addressed_to_me(m.get("to") or ["*"], args.to)]
+        if recipient:
+            msgs = [m for m in msgs if addressed_to_me(m.get("to") or ["*"], recipient)]
         msgs.sort(key=lambda m: m.get("ts", ""))
 
         if args.ts:
@@ -2740,6 +2750,8 @@ def cmd_publish(args):
     log = setup_logging(cfg, slug, me, sys.argv)
     client.log = log
     with subcommand_footer(log):
+        # Before the upload: a bad alias must not leave a blob announced to nobody.
+        to = resolve_targets(slug, args.to)
         src = Path(os.path.abspath(os.path.expanduser(args.path)))
         if not src.is_file():
             sys.exit(f"error: not a regular file: {src}")
@@ -2770,7 +2782,7 @@ def cmd_publish(args):
                                 f"NOT delivered".encode())
 
         d = {"type": "filesystem", "op": "publish", "ts": now_iso(), "from": me,
-             "to": args.to if args.to else ["*"], "path": f"files/{rel}", "size": size}
+             "to": to, "path": f"files/{rel}", "size": size}
         if src.suffix.lower() in TEXT_EXTENSIONS:
             d["lines"] = data.count(b"\n")
         with TimeLogger(log, "publish_announce", path=rel):
@@ -2788,11 +2800,12 @@ def cmd_unpublish(args):
     log = setup_logging(cfg, slug, me, sys.argv)
     client.log = log
     with subcommand_footer(log):
+        to = resolve_targets(slug, args.to)
         src = Path(os.path.abspath(os.path.expanduser(args.path)))
         rel = str(src).lstrip("/")
         client.delete(published_blob(cfg["PREFIX"], slug, me, f"files/{rel}"))  # 404 ok
         d = {"type": "filesystem", "op": "unpublish", "ts": now_iso(), "from": me,
-             "to": args.to if args.to else ["*"], "path": f"files/{rel}"}
+             "to": to, "path": f"files/{rel}"}
         append_dispatch(client, cfg["PREFIX"], slug, me, d)
         print(f"unpublished {rel}")
 
@@ -3385,9 +3398,11 @@ def build_parser():
     rd = sub.add_parser("read", help="Print cell message history.")
     rd.add_argument("cell", help="Cell slug.")
     rd.add_argument("--from", dest="from_", metavar="COMRADE",
-                    help="Only this sender's messages (default: all comrades).")
+                    help="Only this sender's messages, by comrade id or alias "
+                         "(default: all comrades).")
     rd.add_argument("--to", metavar="COMRADE",
-                    help="Only messages a given comrade would receive (incl. broadcasts).")
+                    help="Only messages a given comrade id or alias would receive "
+                         "(incl. broadcasts).")
     g = rd.add_mutually_exclusive_group()
     g.add_argument("--ts", help="Print only the message with this exact timestamp.")
     g.add_argument("--last", type=int, metavar="N",
@@ -3409,7 +3424,7 @@ def build_parser():
     pub = sub.add_parser("publish", help="Share a file with a cell.")
     pub.add_argument("cell", help="Cell slug.")
     pub.add_argument("--to", action="append", default=[], metavar="COMRADE",
-                     help="Repeatable. Comrade id; omit for broadcast.")
+                     help="Repeatable. Comrade id or alias; omit for broadcast.")
     pub.add_argument("path", help="Path of the file to publish.")
     pub.set_defaults(func=cmd_publish)
 
@@ -3417,7 +3432,7 @@ def build_parser():
                          help="Withdraw a previously-published file.")
     unp.add_argument("cell", help="Cell slug.")
     unp.add_argument("--to", action="append", default=[], metavar="COMRADE",
-                     help="Repeatable. Comrade id; omit for broadcast.")
+                     help="Repeatable. Comrade id or alias; omit for broadcast.")
     unp.add_argument("path", help="Path of the file to withdraw (as published).")
     unp.set_defaults(func=cmd_unpublish)
 
