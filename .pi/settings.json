@@ -1,3 +1,6 @@
 {
-  "extensions": ["../integrations/pi/cccp-comrade.ts"]
+  "extensions": [
+    "../integrations/pi/cccp-comrade.ts",
+    "../integrations/pi/token-watch.ts"
+  ]
 }

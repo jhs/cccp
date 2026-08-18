@@ -56,3 +56,19 @@ It needs the `pi` binary plus credentials (an `ANTHROPIC_API_KEY`/`PI_API_KEY` e
 | `CCCP_PLUGIN_DATA` | Optional cccp data directory. Defaults to the Claude plugin's conventional `${CLAUDE_CONFIG_DIR:-~/.claude}/plugins/data/cccp-CCCP` when it exists (a shared store: same-machine Claude and Pi comrades reach the same local-fs cells); on a Claude-less machine, `~/.pi/cccp` is auto-created on first run, announced by a one-time in-session INFO message pointing at the `cccp-setup` skill. |
 
 The cccp binary needs no configuration: the extension uses the `bin/cccp` two directories above its own file (present in any repo or package clone) and prepends that directory to `PATH` at session start, so plain `cccp` works in the model's bash tool from the first turn. The extension's own log appends to `$CCCP_PLUGIN_DATA/logs/pi-comrade.log`.
+
+## Token-watch extension (`token-watch.ts`, #1577)
+
+A second, independent extension: a Pi comrade self-monitors its context window the way a Claude
+comrade runs `claude-tokens watch`. Armed at session start with the Comrade.md thresholds
+(20/50/70/85/92/95 %), it reads pi's own usage feed (`ctx.getContextUsage()`) after each turn and, as
+usage climbs past a threshold, nudges the model once so it can follow the comrade telemetry rules
+(dispatch `Tokens: NN%`). Compaction re-arms the climb. The `token_watch` tool reconfigures the
+thresholds (`{ thresholds: [..] }`; no args re-arms the defaults).
+
+The crossing logic is a pure, dependency-free module (`token-watch-core.ts`) unit-tested at
+`tests/test_token_watch.ts` (`node --experimental-strip-types --test`); `token-watch.ts` is only the
+pi wiring (`turn_end` / `session_compact` / `registerTool`).
+
+Load it alongside the comrade extension via the same `.pi/settings.json` `extensions` list (this
+repo does; a consuming repo lists both files through its `cccp-current` symlink).
