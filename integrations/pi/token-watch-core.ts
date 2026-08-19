@@ -18,6 +18,14 @@ export class TokenWatch {
     return [...this.thresholds];
   }
 
+  /** Establish a starting point without reporting thresholds already passed. */
+  prime(percent: number | null): void {
+    if (percent === null || !Number.isFinite(percent) || percent < 0) return;
+    for (const threshold of this.thresholds) {
+      if (percent >= threshold) this.fired.add(threshold);
+    }
+  }
+
   /** Return the thresholds newly reached by this usage percentage. */
   crossed(percent: number | null): number[] {
     if (percent === null || !Number.isFinite(percent) || percent < 0) return [];

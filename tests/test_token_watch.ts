@@ -47,17 +47,23 @@ test("is inert until token_watch starts it, and token_status reports usage", asy
     registerTool: (tool: any) => tools.set(tool.name, tool),
     sendMessage: (message: any) => messages.push(message),
   } as any);
-  const ctx = { getContextUsage: () => ({ tokens: 75_000, contextWindow: 100_000, percent: 75 }) };
+  let usage = { tokens: 75_000, contextWindow: 100_000, percent: 75 };
+  const ctx = { getContextUsage: () => usage };
 
   handlers.get("turn_end")!({}, ctx);
   assert.equal(messages.length, 0);
 
   const status = await tools.get("token_status").execute("", {}, undefined, undefined, ctx);
-  assert.match(status.content[0].text, /75%.*75,000.*100,000/);
+  assert.equal(status.content[0].text, "75% (75k/100k)");
 
-  await tools.get("token_watch").execute("", { thresholds: [50, 75] }, undefined, undefined, ctx);
+  const started = await tools.get("token_watch").execute("", { thresholds: [50, 80] }, undefined, undefined, ctx);
+  assert.equal(started.content[0].text, "Start watch: 75% (75k/100k)");
   handlers.get("turn_end")!({}, ctx);
-  assert.equal(messages.length, 1);
+  assert.equal(messages.length, 0, "current usage establishes the baseline, not a crossing");
+
+  usage = { tokens: 80_000, contextWindow: 100_000, percent: 80 };
+  handlers.get("turn_end")!({}, ctx);
+  assert.match(messages[0].content, /^Crossed 80%: 80% \(80k\/100k\) \(\+/);
 
   await tools.get("token_watch").execute("", { enabled: false }, undefined, undefined, ctx);
   handlers.get("session_compact")!({}, ctx);
