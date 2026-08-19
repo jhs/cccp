@@ -16,7 +16,8 @@ spawn-comrade -m <model> -e <effort> [--captain @@COMRADE_ID@@] <Name> <slug> [d
 
 | Flag | Purpose |
 |---|---|
-| `-m MODEL` | **Required.** `cheap`, `normal`, or `premium` selects an implementation-appropriate model; a raw model id also works. Never rely on ambient defaults. |
+| `--harness HARNESS` | Harness to launch: `claude` (default) or `pi`. |
+| `-m MODEL` | **Required.** `cheap`, `normal`, or `premium` selects a harness-appropriate model; a raw model id also works. Never rely on ambient defaults. |
 | `-e EFFORT` | **Required.** The comrade's effort/thinking level. Never rely on ambient defaults. |
 | `--captain ID` | Your comrade ID — the comrade introduces itself to you on join. |
 | `--skill SK` | cccp skill variant (default: `team`). |
@@ -39,7 +40,7 @@ spawn-comrade -m premium -e high --captain @@COMRADE_ID@@ Builder infra docs/bui
 Install CCCP for Pi once (`pi install git:github.com/jhs/cccp`), then select Pi explicitly:
 
 ```
-spawn-comrade --impl pi -m premium -e high --captain @@COMRADE_ID@@ Builder infra docs/builder-brief.md
+spawn-comrade --harness pi -m premium -e high --captain @@COMRADE_ID@@ Builder infra docs/builder-brief.md
 ```
 
 Pi uses the installed CCCP package and its `cccp-chat` skill; it needs no symlink or project settings file. `--skill` and `--no-skip` are Claude-only.

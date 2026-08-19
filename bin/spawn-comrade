@@ -9,7 +9,7 @@
 #   DOC...      docs to point the comrade at on join, in order
 #
 # Options:
-#   --impl IMPL    claude (default) or pi
+#   --harness HARNESS  claude (default) or pi
 #   -m MODEL      Required. cheap|normal|premium, or a raw model id
 #   -e EFFORT     Required. claude --effort / pi --thinking value
 #   -s SESSION    tmux session (default: current)
@@ -28,8 +28,8 @@ usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 # A named tier is portable across harnesses. Raw ids deliberately pass through:
 # callers sometimes need a model which is not one of these three defaults.
 model_for() {
-  local impl=$1 model=$2
-  case "$impl:$model" in
+  local harness=$1 model=$2
+  case "$harness:$model" in
     claude:cheap) echo 'claude-opus-4-8[1m]' ;;
     claude:normal) echo 'claude-opus-5' ;;
     claude:premium) echo 'claude-fable-5' ;;
@@ -68,7 +68,7 @@ pi_prompt() {
 
 session=""
 cwd=""
-impl="claude"
+harness="claude"
 model=""
 effort=""
 captain=""
@@ -78,7 +78,7 @@ force=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --impl) [[ $# -ge 2 ]] || { echo "spawn-comrade: --impl needs a value" >&2; exit 1; }; impl="$2"; shift 2 ;;
+    --harness) [[ $# -ge 2 ]] || { echo "spawn-comrade: --harness needs a value" >&2; exit 1; }; harness="$2"; shift 2 ;;
     -s) [[ $# -ge 2 ]] || { echo "spawn-comrade: -s needs a value" >&2; exit 1; }; session="$2"; shift 2 ;;
     -c) [[ $# -ge 2 ]] || { echo "spawn-comrade: -c needs a value" >&2; exit 1; }; cwd="$2"; shift 2 ;;
     -m|--model) [[ $# -ge 2 ]] || { echo "spawn-comrade: $1 needs a value" >&2; exit 1; }; model="$2"; shift 2 ;;
@@ -99,19 +99,19 @@ name="$1"; slug="$2"; shift 2
 extra_docs=("$@")
 [[ -z "$cwd" ]] && cwd="$(pwd)"
 
-case "$impl" in claude|pi) ;; *) echo "spawn-comrade: --impl must be claude or pi: $impl" >&2; exit 1 ;; esac
+case "$harness" in claude|pi) ;; *) echo "spawn-comrade: --harness must be claude or pi: $harness" >&2; exit 1 ;; esac
 [[ -n "$model" ]] || { echo "spawn-comrade: -m/--model is required" >&2; exit 1; }
 [[ -n "$effort" ]] || { echo "spawn-comrade: -e/--effort is required" >&2; exit 1; }
-model="$(model_for "$impl" "$model")"
+model="$(model_for "$harness" "$model")"
 
-if [[ "$impl" == "pi" ]]; then
+if [[ "$harness" == "pi" ]]; then
   [[ "$skill" == "team" ]] || { echo "spawn-comrade: --skill is Claude-only" >&2; exit 1; }
   (( skip )) || { echo "spawn-comrade: --no-skip is Claude-only" >&2; exit 1; }
   pi_model_ok "$model" || exit 1
 fi
 
 command -v tmux >/dev/null || { echo "spawn-comrade: tmux not found" >&2; exit 1; }
-if [[ "$impl" == "claude" ]]; then
+if [[ "$harness" == "claude" ]]; then
   command -v claude >/dev/null || { echo "spawn-comrade: claude not found" >&2; exit 1; }
 else
   command -v pi >/dev/null || { echo "spawn-comrade: pi not found" >&2; exit 1; }
@@ -135,7 +135,7 @@ if tmux list-windows -t "$session" -F '#W' 2>/dev/null | grep -qxF "$name"; then
   fi
 fi
 
-if [[ "$impl" == "pi" ]]; then
+if [[ "$harness" == "pi" ]]; then
   prompt="$(pi_prompt "$name" "$slug" "$captain" "${extra_docs[@]}")"
   # Pi loads CCCP through its installed package. Source the target project's
   # optional .env so its own tools have the same configuration as the captain.
