@@ -1487,9 +1487,9 @@ class WakePattern(unittest.TestCase):
     WRAP_FLAGS = ("bash -c cd /x && eval 'bin/cccp watchtower demo "
                   "--quiet filesystem' < /dev/null && echo done")
 
-    def _hits(self, cmdline, slug="demo"):
+    def _hits(self, cmdline, slug="demo", comrade=None):
         import re as _re
-        return bool(_re.search(cccp.wake_pattern(slug), cmdline))
+        return bool(_re.search(cccp.wake_pattern(slug, comrade), cmdline))
 
     def test_matches_bare_watchtower(self):
         self.assertTrue(self._hits(self.WT_BARE))
@@ -1506,6 +1506,58 @@ class WakePattern(unittest.TestCase):
     def test_slug_is_word_bounded(self):
         other = self.WT_BARE.replace("watchtower demo", "watchtower demo-x")
         self.assertFalse(self._hits(other))
+
+    def test_comrade_anchor_selects_one_watchtower(self):
+        """The narrowed pattern is what makes an automatic wake targeted."""
+        sibling = self.WT_BARE.replace("u@h:aaaaaa", "u@h:bbbbbb")
+        self.assertTrue(self._hits(self.WT_BARE, comrade="u@h:aaaaaa"))
+        self.assertFalse(self._hits(sibling, comrade="u@h:aaaaaa"))
+
+    def test_comrade_anchor_still_spares_the_wrapper(self):
+        wrap = self.WRAP_BARE.replace("watchtower demo", "watchtower demo -- u@h:aaaaaa")
+        self.assertFalse(self._hits(wrap, comrade="u@h:aaaaaa"))
+
+
+class WakeRecipients(unittest.TestCase):
+    """#20: a send wakes the watchtowers it is addressed to, so a targeted
+    message lands now instead of waiting out the recipient's poll ladder. pkill
+    reaches only this user on this host, so that is exactly the set this may
+    signal - a remote recipient must produce no signal at all."""
+
+    def _signalled(self, to, mine="u@h"):
+        seen = []
+
+        def fake_wake(slug, comrade=None):
+            seen.append((slug, comrade))
+            return mock.Mock(returncode=0)
+
+        with mock.patch.object(cccp, "base_comrade_id", return_value=mine), \
+             mock.patch.object(cccp, "wake_watchtowers", fake_wake):
+            cccp.wake_recipients("demo", to)
+        return seen
+
+    def test_broadcast_wakes_every_local_watchtower(self):
+        self.assertEqual(self._signalled(["*"]), [("demo", None)],
+                         "a broadcast IS addressed to every local watchtower")
+
+    def test_targeted_wakes_only_the_named_comrades(self):
+        self.assertEqual(self._signalled(["u@h:aaaaaa", "u@h:bbbbbb"]),
+                         [("demo", "u@h:aaaaaa"), ("demo", "u@h:bbbbbb")])
+
+    def test_remote_recipient_is_never_signalled(self):
+        self.assertEqual(self._signalled(["far@box:cccccc"]), [],
+                         "no host-local signal can reach another machine; that "
+                         "recipient's latency stays bounded by POLL_LADDER")
+
+    def test_mixed_targets_signal_only_the_local_half(self):
+        self.assertEqual(self._signalled(["u@h:aaaaaa", "far@box:cccccc"]),
+                         [("demo", "u@h:aaaaaa")],
+                         "an unaddressed sibling keeps its ladder, and a remote "
+                         "target costs no local signal")
+
+    def test_same_user_on_another_host_is_remote(self):
+        self.assertEqual(self._signalled(["u@other:aaaaaa"]), [],
+                         "user@host must match whole, not just the user")
 
 
 class DeadlineEventAttribution(unittest.TestCase):
