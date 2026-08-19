@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# spawn-comrade — launch a cccp comrade in a new tmux window.
+# spawn-comrade — launch a CCCP comrade in a new tmux window.
 #
 # Usage:
 #   spawn-comrade -m MODEL -e EFFORT [OPTIONS] NAME SLUG [DOC...]
@@ -9,23 +9,66 @@
 #   DOC...      docs to point the comrade at on join, in order
 #
 # Options:
-#   -m MODEL      Required. claude --model value (e.g. 'claude-opus-4-8[1m]')
-#   -e EFFORT     Required. claude --effort value (low|medium|high|xhigh|max)
+#   --impl IMPL    claude (default) or pi
+#   -m MODEL      Required. cheap|normal|premium, or a raw model id
+#   -e EFFORT     Required. claude --effort / pi --thinking value
 #   -s SESSION    tmux session (default: current)
 #   -c CWD        working directory (default: current)
 #   --captain ID  Captain comrade ID for targeted intro on join
-#   --skill SK    cccp skill variant (default: team)
-#   --no-skip     don't pass --dangerously-skip-permissions
+#   --skill SK    cccp skill variant (default: team; Claude only)
+#   --no-skip     don't pass --dangerously-skip-permissions (Claude only)
 #   --force       allow duplicate window names
 #
 # Observe:  tmux capture-pane -t SESSION:NAME -p | tail -40
 # Retire:   tmux kill-window -t SESSION:NAME
 set -euo pipefail
 
-usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+
+# A named tier is portable across harnesses. Raw ids deliberately pass through:
+# callers sometimes need a model which is not one of these three defaults.
+model_for() {
+  local impl=$1 model=$2
+  case "$impl:$model" in
+    claude:cheap) echo 'claude-opus-4-8[1m]' ;;
+    claude:normal) echo 'claude-opus-5' ;;
+    claude:premium) echo 'claude-fable-5' ;;
+    pi:cheap) echo 'gpt-5.5' ;;
+    pi:normal) echo 'gpt-5.6-terra' ;;
+    pi:premium) echo 'gpt-5.6-sol' ;;
+    *) echo "$model" ;;
+  esac
+}
+
+pi_model_ok() {
+  local model=$1
+  if [[ "$model" == *'[1m]'* ]]; then
+    echo "spawn-comrade: Pi cannot use the Claude-only [1m] suffix: $model" >&2
+    return 1
+  fi
+}
+
+pi_prompt() {
+  local name=$1 slug=$2 captain=$3
+  shift 3
+  local docs="" doc
+  for doc in "$@"; do docs+=" @$doc"; done
+  printf 'Use /skill:cccp-chat %s to join the cell as %s.%s' "$slug" "$name" \
+    "${docs:+ Read these task documents first:$docs.}"
+  if [[ -n "$captain" ]]; then
+    printf ' Then send %s a targeted introduction beginning exactly "Comrade Introduction: %s".' \
+      "$captain" "$name"
+  else
+    printf ' Then broadcast an introduction beginning exactly "Comrade Introduction: %s".' "$name"
+  fi
+}
+
+# Sourcing exposes the helpers to their unit test without attempting a launch.
+[[ -n "${SPAWN_COMRADE_LIB:-}" ]] && return 0
 
 session=""
 cwd=""
+impl="claude"
 model=""
 effort=""
 captain=""
@@ -35,6 +78,7 @@ force=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --impl) [[ $# -ge 2 ]] || { echo "spawn-comrade: --impl needs a value" >&2; exit 1; }; impl="$2"; shift 2 ;;
     -s) [[ $# -ge 2 ]] || { echo "spawn-comrade: -s needs a value" >&2; exit 1; }; session="$2"; shift 2 ;;
     -c) [[ $# -ge 2 ]] || { echo "spawn-comrade: -c needs a value" >&2; exit 1; }; cwd="$2"; shift 2 ;;
     -m|--model) [[ $# -ge 2 ]] || { echo "spawn-comrade: $1 needs a value" >&2; exit 1; }; model="$2"; shift 2 ;;
@@ -53,12 +97,25 @@ done
 [[ $# -ge 2 ]] || usage
 name="$1"; slug="$2"; shift 2
 extra_docs=("$@")
+[[ -z "$cwd" ]] && cwd="$(pwd)"
 
-[[ -n "$model" ]] || { echo "spawn-comrade: -m/--model is required — pass the comrade's model explicitly; never rely on claude's ambient default" >&2; exit 1; }
-[[ -n "$effort" ]] || { echo "spawn-comrade: -e/--effort is required — pass the comrade's effort explicitly; never rely on claude's ambient default" >&2; exit 1; }
+case "$impl" in claude|pi) ;; *) echo "spawn-comrade: --impl must be claude or pi: $impl" >&2; exit 1 ;; esac
+[[ -n "$model" ]] || { echo "spawn-comrade: -m/--model is required" >&2; exit 1; }
+[[ -n "$effort" ]] || { echo "spawn-comrade: -e/--effort is required" >&2; exit 1; }
+model="$(model_for "$impl" "$model")"
+
+if [[ "$impl" == "pi" ]]; then
+  [[ "$skill" == "team" ]] || { echo "spawn-comrade: --skill is Claude-only" >&2; exit 1; }
+  (( skip )) || { echo "spawn-comrade: --no-skip is Claude-only" >&2; exit 1; }
+  pi_model_ok "$model" || exit 1
+fi
 
 command -v tmux >/dev/null || { echo "spawn-comrade: tmux not found" >&2; exit 1; }
-command -v claude >/dev/null || { echo "spawn-comrade: claude not found" >&2; exit 1; }
+if [[ "$impl" == "claude" ]]; then
+  command -v claude >/dev/null || { echo "spawn-comrade: claude not found" >&2; exit 1; }
+else
+  command -v pi >/dev/null || { echo "spawn-comrade: pi not found" >&2; exit 1; }
+fi
 
 # Default the session to the one we're running inside.
 if [[ -z "$session" ]]; then
@@ -78,29 +135,37 @@ if tmux list-windows -t "$session" -F '#W' 2>/dev/null | grep -qxF "$name"; then
   fi
 fi
 
-# Build the /cccp:<skill> prompt.
-prompt="/cccp:$skill $slug"
-if [[ ${#extra_docs[@]} -gt 0 ]]; then
-  refs="${extra_docs[0]}"
-  for d in "${extra_docs[@]:1}"; do refs+=" then $d"; done
-  prompt+=" # See $refs"
-fi
-if [[ -n "$captain" ]]; then
-  prompt+=" -- then introduce yourself to your Captain at ${captain},"
+if [[ "$impl" == "pi" ]]; then
+  prompt="$(pi_prompt "$name" "$slug" "$captain" "${extra_docs[@]}")"
+  # Pi loads CCCP through its installed package. Source the target project's
+  # optional .env so its own tools have the same configuration as the captain.
+  envload=""
+  [[ -f "$cwd/.env" ]] && envload='set -a; . "$PWD/.env"; set +a; '
+  esc=${prompt//\'/\'\\\'\'}
+  cmd="${envload}pi --provider openai-codex --model '${model//\'/\'\\\'\'}' --thinking '${effort//\'/\'\\\'\'}' --name '${name//\'/\'\\\'\'}' '${esc}'"
 else
-  prompt+=" -- then introduce yourself to the cell,"
+  # Build the /cccp:<skill> prompt.
+  prompt="/cccp:$skill $slug"
+  if [[ ${#extra_docs[@]} -gt 0 ]]; then
+    refs="${extra_docs[0]}"
+    for d in "${extra_docs[@]:1}"; do refs+=" then $d"; done
+    prompt+=" # See $refs"
+  fi
+  if [[ -n "$captain" ]]; then
+    prompt+=" -- then introduce yourself to your Captain at ${captain},"
+  else
+    prompt+=" -- then introduce yourself to the cell,"
+  fi
+  prompt+=" beginning with the literal prefix Intro: followed by your alias ${name}"
+
+  # Escape single-quotes for the sh -c string ( ' -> '\'' ).
+  esc=${prompt//\'/\'\\\'\'}
+  flag=""; (( skip )) && flag=" --dangerously-skip-permissions"
+  mflag=" --model '${model//\'/\'\\\'\'}'"
+  eflag=" --effort '${effort//\'/\'\\\'\'}'"
+  nflag=" --name '${name//\'/\'\\\'\'}'"
+  cmd="claude${flag}${mflag}${eflag}${nflag} '${esc}'"
 fi
-prompt+=" beginning with the literal prefix Intro: followed by your alias ${name}"
-
-# Escape single-quotes for the sh -c string ( ' -> '\'' ).
-esc=${prompt//\'/\'\\\'\'}
-flag=""; (( skip )) && flag=" --dangerously-skip-permissions"
-mflag=" --model '${model//\'/\'\\\'\'}'"
-eflag=" --effort '${effort//\'/\'\\\'\'}'"
-nflag=" --name '${name//\'/\'\\\'\'}'"
-cmd="claude${flag}${mflag}${eflag}${nflag} '${esc}'"
-
-[[ -z "$cwd" ]] && cwd="$(pwd)"
 
 # Trailing ':' so tmux reads it as the SESSION and picks the next free window index.
 tmux new-window -d -t "${session}:" -n "$name" -c "$cwd" "$cmd"
