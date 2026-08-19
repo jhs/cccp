@@ -38,6 +38,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 EXTENSION = REPO / "integrations" / "pi" / "cccp-comrade.ts"
+SKILL = REPO / ".pi" / "skills" / "cccp-chat" / "SKILL.md"
 CCCP = REPO / "bin" / "cccp"
 ALIAS_TRIGGER = "Comrade Introduction:"
 
@@ -254,6 +255,52 @@ class EnvSurface(unittest.TestCase):
             self.assertEqual(out["data"], str(claude))
             self.assertFalse((Path(td) / ".pi" / "cccp").exists(),
                              "must not create ~/.pi/cccp when the Claude dir exists")
+
+
+class EventSurface(unittest.TestCase):
+    """A joined Pi comrade gets concise event turns and an explicit idle knob."""
+
+    def _extension_values(self):
+        script = (
+            'import("./integrations/pi/cccp-comrade.ts").then(m => {'
+            '  console.log(JSON.stringify({'
+            '    event: m.eventMessage("second-cell", "idle quiet=30m"),'
+            '    defaultArgs: m.watchtowerArgs("second-cell"),'
+            '    disabledArgs: m.watchtowerArgs("second-cell", 0)'
+            '  }));'
+            '}, e => { console.error(e.message); process.exit(1); });'
+        )
+        with tempfile.TemporaryDirectory() as td:
+            env = dict(os.environ, CCCP_PLUGIN_DATA=td)
+            r = subprocess.run(["node", "--no-warnings", "-e", script], cwd=REPO,
+                               env=env, capture_output=True, text=True, timeout=60)
+        if r.returncode != 0 and "Unknown file extension" in r.stderr + r.stdout:
+            self.skipTest("SKIPPED LOUDLY: this node cannot import TypeScript "
+                          "natively (needs Node >= 23) - event-surface test not run")
+        self.assertEqual(r.returncode, 0, f"node failed:\n{r.stderr}")
+        return json.loads(r.stdout.strip().splitlines()[-1])
+
+    def test_event_turn_is_the_raw_line_behind_one_label(self):
+        out = self._extension_values()
+        self.assertEqual(out["event"], "CCCP cell event second-cell: idle quiet=30m",
+                         "an event turn is the label, the slug, and the untouched watchtower line")
+        for doctrine in ("cccp_dispatch", "JSON-encoded", "cccp read"):
+            self.assertNotIn(doctrine, out["event"],
+                             f"{doctrine!r} is skill doctrine; it must not ride along on every event")
+
+    def test_event_label_still_matches_the_skill_trigger(self):
+        """The skill's frontmatter triggers on the literal label, so the two move together."""
+        out = self._extension_values()
+        trigger = re.search(r'"([^"]*cell event[^"]*)"', SKILL.read_text(), re.IGNORECASE)
+        self.assertIsNotNone(trigger, "cccp-chat's description no longer quotes an event-label trigger")
+        self.assertIn(trigger.group(1), out["event"],
+                      "every event must contain the phrase the cccp-chat skill triggers on")
+
+    def test_idle_zero_reaches_watchtower_and_default_stays_unchanged(self):
+        out = self._extension_values()
+        self.assertEqual(out["defaultArgs"], ["watchtower", "second-cell"],
+                         "omitting idle_minutes must leave cccp's own default in force")
+        self.assertEqual(out["disabledArgs"], ["watchtower", "second-cell", "--idle", "0"])
 
 
 class TypeCheck(unittest.TestCase):

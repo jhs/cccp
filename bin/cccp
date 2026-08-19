@@ -1292,7 +1292,7 @@ def inbox_send(slug, me, records):
     return wake_watchtowers(slug)
 
 
-def wake_pattern(slug):
+def wake_pattern(slug, comrade=None):
     """The pkill -f ERE matching ONLY live watchtower processes for `slug` -
     never the Monitor bash wrapper that carries the same words quoted inside
     its own cmdline. Getting this wrong is fatal, not cosmetic: SIGUSR1's
@@ -1309,19 +1309,53 @@ def wake_pattern(slug):
 
     The trailing space after the slug also keeps `foo` from matching
     `foo-bar`. POSIX ERE only (BSD pkill on macOS, procps on Linux): [^ ]
-    instead of \\S, literal alternations, no PCRE."""
-    return rf"cccp watchtower {re.escape(slug)} (.* )?-- [^ ]+$"
+    instead of \\S, literal alternations, no PCRE.
+
+    `comrade` narrows the same anchor from "any watchtower on this cell" to one
+    named comrade's, which is what lets an automatic wake signal only the
+    session a message was actually addressed to."""
+    tail = re.escape(comrade) if comrade else "[^ ]+"
+    return rf"cccp watchtower {re.escape(slug)} (.* )?-- {tail}$"
 
 
-def wake_watchtowers(slug):
-    """SIGUSR1 every local watchtower for `slug` - "poll now". Returns the completed
-    pkill process: rc 0 = at least one signalled, 1 = none running (which is NOT an
-    error - an inbox record simply waits for a watchtower that may never come).
+def wake_watchtowers(slug, comrade=None):
+    """SIGUSR1 every local watchtower for `slug` - "poll now" - or just `comrade`'s
+    when one is named. Returns the completed pkill process: rc 0 = at least one
+    signalled, 1 = none running (which is NOT an error - an inbox record simply
+    waits for a watchtower that may never come).
 
     Shared by `cccp wake` and by anything that drops a record in an inbox. See
     cmd_wake for the sibling-session caveat."""
-    return subprocess.run(["pkill", "-USR1", "-f", wake_pattern(slug)],
+    return subprocess.run(["pkill", "-USR1", "-f", wake_pattern(slug, comrade)],
                           capture_output=True)
+
+
+def wake_recipients(slug, to, log=None):
+    """SIGUSR1 the local watchtowers a just-appended event is FOR, so a targeted
+    send lands now instead of waiting out the recipient's poll ladder (#20).
+
+    Reach is what makes this safe to do automatically rather than on request:
+    pkill signals only this user's processes on this host, so the only comrades
+    this can reach are the ones already sharing our user@host. A recipient on
+    another box is unreachable by any host-local signal, and their latency stays
+    bounded by the POLL_LADDER cap - the half of #20 that needs a store-side
+    hint, not a signal.
+
+    Broadcast wakes every local watchtower on the cell, since it IS addressed to
+    all of them. A targeted send wakes only the named local comrades: an
+    unaddressed same-host sibling keeps its ladder, which on a metered backend is
+    one LIST per sibling per message not spent."""
+    if "*" in to:
+        r = wake_watchtowers(slug)
+        if log:
+            log.debug(f"ev=wake_broadcast slug={_kv(slug)} pkill_rc={r.returncode}")
+        return
+    mine = base_comrade_id()
+    local = [cid for cid in to if cid.rsplit(":", 1)[0] == mine]
+    woke = sum(1 for cid in local if wake_watchtowers(slug, cid).returncode == 0)
+    if log:
+        log.debug(f"ev=wake_targeted slug={_kv(slug)} to_count={len(to)} "
+                  f"local={len(local)} woke={woke}")
 
 
 # ---------- aliases (opt-in, view-layer) ----------
@@ -2508,6 +2542,9 @@ def cmd_dispatch(args):
             with TimeLogger(log, "dispatch_append", body_chars=len(body),
                             to_count=len(args.to) if args.to else 0):
                 append_dispatch(client, cfg["PREFIX"], slug, me, d)
+            # After the append, never before: a woken watchtower polls at once,
+            # and must find the message already there.
+            wake_recipients(slug, to, log)
 
         # Deadlines are local watchtower state - nothing about them goes on the
         # wire. One record per recipient, so multiple --to fan out to independent
@@ -2787,6 +2824,7 @@ def cmd_publish(args):
             d["lines"] = data.count(b"\n")
         with TimeLogger(log, "publish_announce", path=rel):
             append_dispatch(client, cfg["PREFIX"], slug, me, d)
+        wake_recipients(slug, to, log)
         print(f"published {rel} ({size} bytes)")
 
 
@@ -2807,6 +2845,7 @@ def cmd_unpublish(args):
         d = {"type": "filesystem", "op": "unpublish", "ts": now_iso(), "from": me,
              "to": to, "path": f"files/{rel}"}
         append_dispatch(client, cfg["PREFIX"], slug, me, d)
+        wake_recipients(slug, to, log)
         print(f"unpublished {rel}")
 
 

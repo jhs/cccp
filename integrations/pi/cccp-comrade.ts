@@ -9,7 +9,7 @@
  *   session_start     Resolve the session-scoped environment, unconditionally — the user enabled this
  *                     extension, so `cccp` (e.g. `cccp config` before any join) must work in the bash tool
  *                     from the first turn. All idempotent, explicit env always wins:
- *                       CCCP_COMRADE_ID   derived as user@shorthost:<last-6-hex-of-Pi-session-id>
+ *                       CCCP_COMRADE_ID   derived as user@shorthost:pi-<last-6-hex-of-Pi-session-id>
  *                                         and exported, so every watchtower, dispatch, and bash call shares one
  *                                         stable identity, inspectable all session via `echo $CCCP_COMRADE_ID`.
  *                       CCCP_PLUGIN_DATA  the Claude plugin's conventional data dir when it exists (a shared
@@ -20,8 +20,9 @@
  *
  *   cccp_join         Membership, per cell. The cell slug is always a tool argument — never env, never session
  *                     state. A session may join any number of cells (or none: sessions that never join stay
- *                     dormant). Each join spawns `cccp watchtower <slug>` and injects its stdout lines into the
- *                     session via pi.sendMessage({deliverAs: "followUp", triggerTurn: true}) — the same
+ *                     dormant). Each join spawns `cccp watchtower <slug>` (with `--idle <minutes>` only when the caller
+ *                     asked for one) and injects its stdout lines into the session via
+ *                     pi.sendMessage({deliverAs: "followUp", triggerTurn: true}) — the same
  *                     full-parity behavior a Claude Code comrade gets from the Monitor tool. Telemetry lines
  *                     (ready/idle/alias/shutdown) are delivered too; emission policy belongs to cccp's own knobs
  *                     (idle intervals, --quiet, alias opt-in), never to this extension.
@@ -116,13 +117,15 @@ export function resolveEnvironment(sessionId: string | undefined): EnvResolution
 	return { created, problem: null };
 }
 
-function eventPreamble(slug: string, line: string): string {
-	return (
-		`CCCP cell event on '${slug}' (from the cell's shared watchtower; body= values are JSON-encoded strings). ` +
-		`If a reply carries content, use the cccp_dispatch tool with cell '${slug}' targeted to the sender; telemetry lines (ready/idle/alias/shutdown) need no reply. ` +
-		`For a line with truncated=true, read the remainder with the bash tool: cccp read ${slug} --from <sender> --ts <ts>\n` +
-		line
-	);
+/** The event turn: the raw watchtower line, labeled with its cell. Handling doctrine lives in the cccp-chat skill, never
+ *  here — and "CCCP cell event" is that skill's trigger phrase, so the label is load-bearing, not decoration. */
+export function eventMessage(slug: string, line: string): string {
+	return `CCCP cell event ${slug}: ${line}`;
+}
+
+/** Omit --idle to preserve cccp's default; zero explicitly disables heartbeats. */
+export function watchtowerArgs(cell: string, idleMinutes?: number): string[] {
+	return ["watchtower", cell, ...(idleMinutes === undefined ? [] : ["--idle", String(idleMinutes)])];
 }
 
 type ComradeState = {
@@ -179,8 +182,9 @@ export default function (pi: ExtensionAPI) {
 			"Join a CCCP cell (a chat room shared with other AI agents) as a comrade. Starts a listener for that cell; its incoming events then arrive automatically as messages. A session may join any number of cells.",
 		parameters: Type.Object({
 			cell: Type.String({ description: "Cell slug to join — lowercase, hyphenated, shell-safe, e.g. 'demo-cell'" }),
+			idle_minutes: Type.Optional(Type.Integer({ minimum: 0, description: "Minutes before idle heartbeats; 0 disables them. Omit for cccp's default." })),
 		}),
-		async execute(_toolCallId: string, params: { cell: string }) {
+		async execute(_toolCallId: string, params: { cell: string; idle_minutes?: number }) {
 			const cell = params.cell;
 			if (state.towers.has(cell)) {
 				return { content: [{ type: "text" as const, text: `Already joined cell '${cell}' as ${process.env.CCCP_COMRADE_ID}` }], details: { cell } };
@@ -193,12 +197,12 @@ export default function (pi: ExtensionAPI) {
 			}
 			log("INFO", `Join cell ${cell} as comrade: ${process.env.CCCP_COMRADE_ID}`);
 			const stderrTail: string[] = [];
-			const tower = spawn(CCCP, ["watchtower", cell], { stdio: ["ignore", "pipe", "pipe"] });
+			const tower = spawn(CCCP, watchtowerArgs(cell, params.idle_minutes), { stdio: ["ignore", "pipe", "pipe"] });
 			state.towers.set(cell, tower);
 			readline.createInterface({ input: tower.stdout! }).on("line", (line) => {
 				log("INFO", `Cell ${cell} event: ${JSON.stringify(line)}`);
 				pi.sendMessage(
-					{ customType: "cccp-event", content: eventPreamble(cell, line), display: true },
+					{ customType: "cccp-event", content: eventMessage(cell, line), display: true },
 					{ deliverAs: "followUp", triggerTurn: true },
 				);
 			});
