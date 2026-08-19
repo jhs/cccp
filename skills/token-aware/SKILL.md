@@ -11,7 +11,7 @@ To ascertain how much of the context window this session has consumed, use these
 
 | Command | Purpose |
 |---|---|
-| `claude-tokens status` | One-shot: print current usage (pct, used/size, model, cost, snapshot age) |
+| `claude-tokens status` | One-shot: print current usage (pct, used/size, snapshot age) |
 | `claude-tokens watch` | Stream milestone events (50/75/90/95%) for the Monitor tool |
 
 If `claude-tokens` fails (not found, non-zero exit, traceback, etc.) do not troubleshoot but instead halt and inform the user. A "no snapshot yet" message is not an error; it means data is not yet available.
@@ -28,7 +28,7 @@ Run as a normal Bash call:
 claude-tokens status
 ```
 
-Prints one line, e.g. `38% (76k/200k) | model Opus 4.8 | cost \$1.20 | snapshot 4s old | session 09ba6f12`. The snapshot reflects the last prompt/response Claude turn, so it lags the current turn slightly.
+Prints one line, e.g. `38% (76k/200k) | snapshot 4s old`. The snapshot reflects the last prompt/response Claude turn, so it lags the current turn slightly.
 
 ## Watch milestones during long work (Monitor)
 
@@ -41,14 +41,14 @@ claude-tokens watch
 Its **first line** is the current reading, similar to `status`. Example:
 
 ```
-Start watch: 8% (82.9k/1M) | model Fable 5 | cost $2.72 | session 3a0c5a8e
+Start watch: 8% (82.9k/1M)
 ```
 
 Subsequent lines fire only when usage crosses a milestone. These lines include the latest reading, plus: elapsed time since the previous event, interval-average velocity, and an ETA to every remaining milestone. Example:
 
 ```
-Crossed 20%: 20% (196.0k/1M) | model Fable 5 | cost $42.05 | session 3a0c5a8e (+12h39m since 8%/82.9k, ~149/min avg, ETA to 50% ~34h01m, to 70% ~56h24m, to 85% ~73h11m, to 92% ~81h01m, to 95% ~84h23m)
-Crossed 50%: 50% (495.1k/1M) | model Fable 5 | cost $300.94 | session 3a0c5a8e (+48h54m since 20%/196.0k, ~102/min avg, ETA to 70% ~33h30m, to 85% ~58h02m, to 92% ~69h29m, to 95% ~84h23m)
+Crossed 20%: 20% (196.0k/1M) (+12h39m since 8%/82.9k, ~149/min avg, ETA to 50% ~34h01m, to 70% ~56h24m, to 85% ~73h11m, to 92% ~81h01m, to 95% ~84h23m)
+Crossed 50%: 50% (495.1k/1M) (+48h54m since 20%/196.0k, ~102/min avg, ETA to 70% ~33h30m, to 85% ~58h02m, to 92% ~69h29m, to 95% ~84h23m)
 ```
 
 Milestones default to 50/75/90/95%. Override them with one or more `--threshold PCT` (repeatable):

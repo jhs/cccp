@@ -104,25 +104,13 @@ def metrics(payload):
     pct = cw.get("used_percentage")
     if pct is None:
         pct = used / size * 100
-    return {
-        "pct": pct,
-        "used": used,
-        "size": size,
-        "model": (payload.get("model") or {}).get("display_name") or "?",
-        "cost": (payload.get("cost") or {}).get("total_cost_usd"),
-    }
+    return {"pct": pct, "used": used, "size": size}
 
 
-def summary(m, sid, age=None):
-    cost = f"${m['cost']:.2f}" if m["cost"] is not None else "n/a"
-    parts = [
-        f"{m['pct']:.0f}% ({humanize(m['used'])}/{humanize(m['size'])})",
-        f"model {m['model']}",
-        f"cost {cost}",
-    ]
+def summary(m, age=None):
+    parts = [f"{m['pct']:.0f}% ({humanize(m['used'])}/{humanize(m['size'])})"]
     if age is not None:
         parts.append(f"snapshot {fmt_elapsed(age)} old")
-    parts.append(f"session {sid[:8]}")
     return " | ".join(parts)
 
 
@@ -134,17 +122,17 @@ def cmd_status(args):
         return 1
     path = snapshot_path(sid)
     if not path.exists():
-        print(f"No snapshot yet for session {sid[:8]} ({source}). The statusLine "
-              "side-write may not be wired up (see skills/token-aware/SKILL.md Setup) "
-              "or no render has fired since this session started.")
+        print("No snapshot yet. The statusLine side-write may not be wired up "
+              "(see skills/token-aware/SKILL.md Setup) or no render has fired "
+              "since this session started.")
         return 0
     m = metrics(json.loads(path.read_text()))
     if m is None:
-        print(f"Snapshot for {sid[:8]} has no context_window data yet "
+        print("Snapshot has no context_window data yet "
               "(fresh session or just compacted)")
         return 0
     age = time.time() - path.stat().st_mtime
-    print(summary(m, sid, age))
+    print(summary(m, age))
     return 0
 
 
@@ -170,14 +158,14 @@ def cmd_watch(args):
 
         if m is None:
             if not waiting:
-                print(f"Waiting for first snapshot for session {sid[:8]} ({source})...",
+                print("Waiting for first snapshot...",
                       flush=True)
                 waiting = True
             time.sleep(args.interval)
             continue
 
         if prev is None:
-            print("Start watch: " + summary(m, sid), flush=True)
+            print("Start watch: " + summary(m), flush=True)
             prev = {"t": now, "pct": m["pct"], "used": m["used"]}
             armed = {t for t in thresholds if m["pct"] >= t}
             time.sleep(args.interval)
@@ -196,7 +184,7 @@ def cmd_watch(args):
                     if target > m["used"]:
                         etas.append(f"to {x:g}% ~{fmt_elapsed((target - m['used']) / vel * 60)}")
             eta = f", ETA {', '.join(etas)}" if etas else ""
-            print(f"Crossed {t:g}%: {summary(m, sid)} "
+            print(f"Crossed {t:g}%: {summary(m)} "
                   f"(+{fmt_elapsed(dt)} since {prev['pct']:.0f}%/{humanize(prev['used'])}, "
                   f"~{humanize(vel)}/min avg{eta})", flush=True)
             prev = {"t": now, "pct": m["pct"], "used": m["used"]}
