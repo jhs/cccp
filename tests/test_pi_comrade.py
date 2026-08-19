@@ -38,7 +38,9 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 EXTENSION = REPO / "integrations" / "pi" / "cccp-comrade.ts"
+TOKEN_WATCH = REPO / "integrations" / "pi" / "token-watch.ts"
 SKILL = REPO / ".pi" / "skills" / "cccp-chat" / "SKILL.md"
+TOKEN_SKILL = REPO / ".pi" / "skills" / "token-aware" / "SKILL.md"
 CCCP = REPO / "bin" / "cccp"
 ALIAS_TRIGGER = "Comrade Introduction:"
 
@@ -47,14 +49,16 @@ class PackageManifest(unittest.TestCase):
     def setUp(self):
         self.pkg = json.loads((REPO / "package.json").read_text())
 
-    def test_extension_exists_at_agreed_path(self):
-        self.assertTrue(EXTENSION.is_file(), f"missing: {EXTENSION}")
+    def test_extensions_exist_at_agreed_paths(self):
+        for extension in (EXTENSION, TOKEN_WATCH):
+            self.assertTrue(extension.is_file(), f"missing: {extension}")
 
     def test_pi_manifest_points_at_extension_dir(self):
         dirs = self.pkg["pi"]["extensions"]
         resolved = [REPO / d for d in dirs]
-        self.assertTrue(any(EXTENSION.parent == r.resolve() for r in resolved),
-                        f"pi.extensions {dirs} does not cover {EXTENSION.parent}")
+        for extension in (EXTENSION, TOKEN_WATCH):
+            self.assertTrue(any(extension.parent == r.resolve() for r in resolved),
+                            f"pi.extensions {dirs} does not cover {extension.parent}")
 
     def test_pi_package_keyword_present(self):
         self.assertIn("pi-package", self.pkg["keywords"])
@@ -96,6 +100,27 @@ class ChatSkill(unittest.TestCase):
     def test_skill_teaches_the_essentials(self):
         for needle in ("cccp_join", "cccp_dispatch", "truncated=true",
                        "CCCP_COMRADE_ID", "never start one"):
+            self.assertIn(needle, self.text)
+
+
+class TokenAwareSkill(unittest.TestCase):
+    def setUp(self):
+        self.text = TOKEN_SKILL.read_text()
+
+    def test_skill_exists_with_frontmatter(self):
+        head, sep, _body = self.text.partition("\n---\n")
+        self.assertTrue(head.startswith("---\n") and sep)
+        self.assertIn("name: token-aware", head)
+        self.assertIn("description:", head)
+
+    def test_pi_manifest_covers_skill_dir(self):
+        pkg = json.loads((REPO / "package.json").read_text())
+        dirs = [(REPO / d).resolve() for d in pkg["pi"]["skills"]]
+        self.assertTrue(any(str(TOKEN_SKILL).startswith(str(d) + os.sep) for d in dirs),
+                        f"pi.skills does not cover {TOKEN_SKILL}")
+
+    def test_skill_teaches_status_and_opt_in_watch(self):
+        for needle in ("token_status", "token_watch", "inert until", "enabled: false"):
             self.assertIn(needle, self.text)
 
 
