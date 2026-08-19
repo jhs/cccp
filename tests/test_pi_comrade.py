@@ -41,6 +41,7 @@ EXTENSION = REPO / "integrations" / "pi" / "cccp-comrade.ts"
 TOKEN_WATCH = REPO / "integrations" / "pi" / "token-watch.ts"
 SKILL = REPO / ".pi" / "skills" / "cccp-chat" / "SKILL.md"
 TOKEN_SKILL = REPO / ".pi" / "skills" / "token-aware" / "SKILL.md"
+PI_SETTINGS = REPO / ".pi" / "settings.json"
 CCCP = REPO / "bin" / "cccp"
 ALIAS_TRIGGER = "Comrade Introduction:"
 
@@ -53,15 +54,18 @@ class PackageManifest(unittest.TestCase):
         for extension in (EXTENSION, TOKEN_WATCH):
             self.assertTrue(extension.is_file(), f"missing: {extension}")
 
-    def test_pi_manifest_points_at_extension_dir(self):
-        dirs = self.pkg["pi"]["extensions"]
-        resolved = [REPO / d for d in dirs]
-        for extension in (EXTENSION, TOKEN_WATCH):
-            self.assertTrue(any(extension.parent == r.resolve() for r in resolved),
-                            f"pi.extensions {dirs} does not cover {extension.parent}")
+    def test_pi_manifest_names_the_single_extension_entrypoint(self):
+        configured = {(REPO / path).resolve() for path in self.pkg["pi"]["extensions"]}
+        self.assertEqual(configured, {EXTENSION.resolve()})
 
     def test_pi_package_keyword_present(self):
         self.assertIn("pi-package", self.pkg["keywords"])
+
+    def test_checkout_settings_load_the_single_extension_entrypoint(self):
+        settings = json.loads(PI_SETTINGS.read_text())
+        configured = {(PI_SETTINGS.parent / path).resolve()
+                      for path in settings["extensions"]}
+        self.assertEqual(configured, {EXTENSION.resolve()})
 
     def test_version_lockstep_with_plugin(self):
         plugin = json.loads((REPO / ".claude-plugin" / "plugin.json").read_text())

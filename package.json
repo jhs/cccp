@@ -19,7 +19,7 @@
   },
   "pi": {
     "extensions": [
-      "./integrations/pi"
+      "./integrations/pi/cccp-comrade.ts"
     ],
     "skills": [
       "./.pi/skills"

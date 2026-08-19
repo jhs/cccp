@@ -10,7 +10,7 @@ function formatUsage(usage: ContextUsage | undefined): string {
   return `${Math.round(usage.percent)}% (${usage.tokens.toLocaleString()}/${usage.contextWindow.toLocaleString()} tokens)`;
 }
 
-export default function (pi: ExtensionAPI) {
+export function registerTokenWatch(pi: ExtensionAPI) {
   let watch: TokenWatch | undefined;
   let lastUsage: ContextUsage | undefined;
 

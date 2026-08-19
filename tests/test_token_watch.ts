@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import tokenWatchExtension from "../integrations/pi/token-watch.ts";
+import cccpExtension from "../integrations/pi/cccp-comrade.ts";
 import { DEFAULT_THRESHOLDS, TokenWatch, normalizeThresholds } from "../integrations/pi/token-watch-core.ts";
 
 test("fires each threshold once as context grows", () => {
@@ -42,7 +42,7 @@ test("is inert until token_watch starts it, and token_status reports usage", asy
   const handlers = new Map<string, Function>();
   const tools = new Map<string, any>();
   const messages: any[] = [];
-  tokenWatchExtension({
+  cccpExtension({
     on: (event: string, handler: Function) => handlers.set(event, handler),
     registerTool: (tool: any) => tools.set(tool.name, tool),
     sendMessage: (message: any) => messages.push(message),

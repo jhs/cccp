@@ -43,6 +43,7 @@ import * as readline from "node:readline";
 import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { registerTokenWatch } from "./token-watch.ts";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -136,6 +137,7 @@ type ComradeState = {
 
 export default function (pi: ExtensionAPI) {
 	const state: ComradeState = { towers: new Map(), shuttingDown: false };
+	registerTokenWatch(pi);
 
 	pi.on("session_start", (_event, ctx) => {
 		state.sessionId = ctx.sessionManager.getSessionId();
