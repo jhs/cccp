@@ -698,6 +698,13 @@ class AzureBlobBackend:
         the 409 from a conditional create or a 416 past end-of-blob.
         """
         h = {"x-ms-version": API_VERSION}
+        # Gazettes and container listings are mutable but keep a stable URL. A
+        # shared HTTP cache can otherwise return an older complete gazette to
+        # `read` while the watchtower's ranged GET sees newly appended records
+        # (#30). Require revalidation for every read; Azure remains the source
+        # of truth and can still answer cheaply with its normal validators.
+        if method in ("GET", "HEAD"):
+            h["Cache-Control"] = "no-cache"
         if headers:
             h.update(headers)
         url = self._url(path, query)

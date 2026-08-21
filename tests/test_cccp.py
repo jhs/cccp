@@ -434,6 +434,35 @@ class _FakeBlobClient:
         return (404, b"") if b is None else (206, b[:nbytes])
 
 
+class AzureReadFreshness(unittest.TestCase):
+    """#30: mutable Azure URLs must not be served from a stale HTTP cache."""
+
+    def test_get_and_head_require_cache_revalidation(self):
+        be = cccp.AzureBlobBackend("acct", "cont", "sig=x")
+        seen = []
+
+        class Response:
+            status = 200
+            headers = {}
+
+            @staticmethod
+            def read():
+                return b""
+
+        def fake_urlopen(req, timeout):
+            seen.append((req.method, req.get_header("Cache-control")))
+            return Response()
+
+        with mock.patch.object(cccp.urllib.request, "urlopen",
+                               side_effect=fake_urlopen):
+            be.get("cell/gazettes/u@h:aaa.jsonl")
+            be.stat("cell/gazettes/u@h:aaa.jsonl")
+            be.put_block("cell/file", b"data")
+
+        self.assertEqual(seen, [("GET", "no-cache"), ("HEAD", "no-cache"),
+                                ("PUT", None)])
+
+
 class AzureListPagination(unittest.TestCase):
     """list() must follow NextMarker: Azure caps List Blobs at 5000 results per
     page, and a truncated view silently hides comrades past the marker."""
