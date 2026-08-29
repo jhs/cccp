@@ -47,9 +47,7 @@ sleep 1
 tmux send-keys -t <name> Enter
 ```
 
-Bundling them into one call is **length-dependent**, which is worse than simply broken — it works until your input grows. Measured against a live Claude Code TUI: `send-keys 'ABCTEST' Enter` submitted immediately, while the same form with a 330-character string tripped the TUI's paste detection, which absorbed the `Enter` and left the text sitting in the input box. Text alone, then `Enter`, behaves identically in both regimes.
-
-(This is not bracketed paste — `send-keys` sends raw keys. It is the TUI's own detection of bulk input.)
+Never bundle the `Enter` into the first call. It works for short input and silently stops working as the input grows, because the TUI's paste detection eats the trailing `Enter` and the message sits unsent. The skill states the rule and the measurements — see [Citing the skill](#citing-the-skill).
 
 ### 3. Wait for it to settle, then look
 
@@ -75,7 +73,7 @@ tmux_settle <name> && tmux capture-pane -p -t <name> | tail -30
 
 **The pane is not the record.** It holds one screenful, and a TUI redraws over itself. For anything you intend to assert on, read the process's own log file. Use the pane to see *where* it is; use logs to prove *what happened*.
 
-**The input line is not evidence either.** Claude Code renders an LLM-generated auto-suggestion there as faded ghost text, and `capture-pane` gives you no way to tell it from real input — during testing the box read `Reply with the single word DONE and nothing else.`, which nobody had typed. To confirm a message actually landed, use the transcript above the box, the token counter, or the agent's reply. Never the input line.
+**The input line is not evidence either.** Claude Code renders an LLM auto-suggestion there as faded ghost text that `capture-pane` cannot distinguish from real input. Confirm from the transcript, the token counter, or the reply — never the input line.
 
 ## Cheat sheet
 
@@ -92,7 +90,22 @@ tmux_settle <name> && tmux capture-pane -p -t <name> | tail -30
 | Kill a window (and its children) | `tmux kill-window -t NAME` |
 | New detached session | `tmux new-session -d -s NAME 'CMD'` |
 
-For spawning *cccp comrades* specifically — roles, models, succession, termination doctrine — use `spawn-comrade` and the `captain-with-tmux` skill instead of raw `new-window`.
+## Citing the skill
+
+The mechanics of driving a comrade's terminal — observing, terminating, `send-keys` and its traps — are owned by `skills/captain-with-tmux/body.template.md` and are **not** restated here. They were, once; the two copies drifted into contradicting each other, which is how the `send-keys` bug survived. Pull them when you need them:
+
+```bash
+awk '/^## /{f=0} /^## (Observing a comrade|Terminating a comrade|Driving a comrade TUI)/{f=1} f' \
+  skills/captain-with-tmux/body.template.md
+```
+
+That is a template, so `@@COMRADE_ID@@` and friends appear unsubstituted — read them as "your own comrade id". Headings are the citation handle: they are unique across every skill and carry no apostrophes (a test enforces both, because an apostrophe breaks the quoted pattern above). Reword a heading and you must re-point its citations.
+
+## Do not spawn a comrade to test a harness
+
+`spawn-comrade` builds a *working comrade*: it joins a cell and loads the cccp skill stack. That is the right tool when the thing under test is genuinely multi-comrade behavior, and the wrong one for isolating harness behavior — it injects a cell join and several thousand tokens of doctrine into the very session whose behavior you are trying to characterize.
+
+For reproduction work, launch the bare harness yourself (`tmux new-window` above, plus `--no-extensions` and a single `--extension`) and inject cell traffic from a shell instead. It has no hidden setup: it checks for `tmux`, the harness binary, a live session, and explicit `--model`/`--effort`, then fails loudly on any of them.
 
 ## Harness notes
 
@@ -109,7 +122,7 @@ pi --list-models                  # resolve a model name to an id
 
 ### Claude Code
 
-`tmux kill-window` is the only exit path — a Claude Code process will not exit because you asked it to.
+A Claude Code process will not exit because you asked it to; `tmux kill-window` is the only exit path. Wind-down doctrine for a real comrade lives in the skill's `## Terminating a comrade`.
 
 ## Zero-cost harness probes
 

@@ -63,7 +63,7 @@ This kills the `claude` process and all its children (watchtower included). One 
 
 **No dispatch right before termination.** Once the comrade confirms it's parked, send it nothing more — just kill the window. A farewell dispatch forces one more LLM turn on a potentially near-full context.
 
-## Interacting with a comrade's TUI via send-keys
+## Driving a comrade TUI with send-keys
 
 Send the text and the Enter as TWO separate calls, with the text **alone** in the first:
 

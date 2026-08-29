@@ -9,10 +9,12 @@ byte, the truncated event must fit the Monitor envelope, and escapes must never
 be split. cccp is an executable script (no .py), so load it by path.
 """
 import contextlib
+import glob
 import importlib.util
 import io
 import json
 import os
+import re
 import signal
 import tempfile
 import unittest
@@ -276,6 +278,42 @@ class SkillTemplateFile(unittest.TestCase):
         self.assertIn("@@BACKEND@@", self._template())
 
 
+class SkillHeadings(unittest.TestCase):
+    """Skill headings are addressable, so they are closer to code than to prose.
+
+    Developer docs cite a section instead of copying it - the duplication is what let the
+    send-keys guidance drift into contradicting itself - and the citation is an awk pattern
+    anchored on the heading text. That makes two properties load-bearing across every skill
+    body, not just the ones cited today."""
+
+    def _bodies(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        pattern = os.path.join(here, os.pardir, "skills", "*", "body.template.md")
+        paths = sorted(glob.glob(pattern))
+        self.assertTrue(paths, "no skill bodies found - re-point this test")
+        return [(os.path.basename(os.path.dirname(p)), open(p, encoding="utf-8").read()) for p in paths]
+
+    def test_no_apostrophes_in_headings(self):
+        """An apostrophe cannot survive a single-quoted awk/sed pattern: the shell dies with
+        `unexpected EOF while looking for matching '`. Possessive phrasing is never worth that."""
+        for skill, body in self._bodies():
+            for heading in re.findall(r"^#+ .*$", body, re.MULTILINE):
+                for quote in ("'", "’"):
+                    self.assertNotIn(quote, heading,
+                                     f"{skill}: heading {heading!r} contains an apostrophe, which breaks "
+                                     f"the quoted patterns that cite it - reword it possessive-free")
+
+    def test_headings_are_unique_across_every_skill(self):
+        """Skills compose, so a citation must resolve to one section in the stack, not two."""
+        seen = {}
+        for skill, body in self._bodies():
+            for heading in re.findall(r"^#+ .*$", body, re.MULTILINE):
+                self.assertNotIn(heading, seen,
+                                 f"{skill}: heading {heading!r} already used by {seen.get(heading)!r} - "
+                                 f"a citation could not tell them apart")
+                seen[heading] = skill
+
+
 class TmuxSkillSendKeys(unittest.TestCase):
     """Driving a comrade's TUI has two traps, both measured against a live Claude Code TUI,
     and both invisible to whoever falls into them - which is why the skill must keep warning
@@ -292,7 +330,7 @@ class TmuxSkillSendKeys(unittest.TestCase):
 
     def _send_keys_section(self):
         body = self._body()
-        start = body.index("## Interacting with a comrade")
+        start = body.index("## Driving a comrade TUI")
         rest = body.index("\n## ", start + 1)
         return body[start:rest]
 
@@ -347,7 +385,7 @@ class SkillCompose(unittest.TestCase):
         self.assertNotIn("@@", out)
         i_chat = out.index("# CCCP")
         i_team = out.index("Team norms")
-        i_fore = out.index("owning the cell's coordination")
+        i_fore = out.index("owning cell coordination")
         i_args = out.index("Your instructions")
         self.assertTrue(i_chat < i_team < i_fore < i_args)   # base → L1 → L2 → outro
         self.assertEqual(out.count("## Your instructions"), 1)
