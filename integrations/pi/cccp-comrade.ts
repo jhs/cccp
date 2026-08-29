@@ -29,7 +29,15 @@
  *
  *   cccp_dispatch     One message: cell is an argument, body goes over stdin (no shell-quoting hazards).
  *
- *   session_shutdown  Every watchtower dies with the session.
+ *   session_shutdown  Every watchtower dies with the session, and the cells they served are recorded in a
+ *                     custom session entry — the one thing that has to outlive an in-process /reload,
+ *                     which replaces this whole extension instance. Nothing is recorded when nothing was
+ *                     joined, so a dormant session stays dormant.
+ *
+ *                     The reverse half runs at session_start: a reload that orphaned watchtowers tells the
+ *                     model so, and lets it decide. Membership stays agent-driven even here — the comrade
+ *                     is told it went deaf and rejoins by calling cccp_join like any other join, because
+ *                     nothing in this extension may resurrect a cell behind the model's back.
  *
  * The extension log appends to $CCCP_PLUGIN_DATA/logs/pi-comrade.log.
  */
@@ -135,12 +143,63 @@ type ComradeState = {
 	sessionId?: string;
 };
 
+/** The custom session entry carrying joined cells across a `/reload`.
+ *
+ *  A reload kills every watchtower and then builds a fresh extension instance whose `state` knows
+ *  nothing of the old one — so the comrade comes back joined to nothing, and neither it nor the user is
+ *  told. That is the DEAF comrade this file already refuses to tolerate elsewhere (see the watchtower
+ *  `exit` handler): events silently stop while dispatch still works.
+ *
+ *  Module scope cannot carry the list across — pi re-evaluates this module on reload — so the hand-off
+ *  goes through `pi.appendEntry`, Pi's sanctioned extension-state persistence, which the session keeps
+ *  and never shows the LLM. There is no extension-scoped store or state directory in Pi; this is the
+ *  mechanism. Entries ACCUMULATE, so only the newest snapshot is the truth, and consuming one writes an
+ *  empty tombstone rather than deleting anything. Both facts measured against a real session, not assumed. */
+const ORPHAN_ENTRY = "cccp-cells-orphaned";
+
+/** The cells a shutdown left without a watchtower, taken not copied: reading them tombstones them, so a
+ *  resume, a fork, or a later reload can never re-announce cells the comrade long ago left behind. */
+function takeOrphanedCells(pi: ExtensionAPI, entries: readonly { type: string; customType?: string; data?: unknown }[]): string[] {
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const entry = entries[i];
+		if (entry.type !== "custom" || entry.customType !== ORPHAN_ENTRY) continue;
+		const cells = (entry.data as { cells?: unknown } | undefined)?.cells;
+		const orphaned = Array.isArray(cells) ? cells.filter((c): c is string => typeof c === "string") : [];
+		if (orphaned.length > 0) pi.appendEntry(ORPHAN_ENTRY, { cells: [] });
+		return orphaned;
+	}
+	return [];
+}
+
 export default function (pi: ExtensionAPI) {
 	const state: ComradeState = { towers: new Map(), shuttingDown: false };
 	registerTokenWatch(pi);
 
-	pi.on("session_start", (_event, ctx) => {
+	pi.on("session_start", (event, ctx) => {
 		state.sessionId = ctx.sessionManager.getSessionId();
+		// Membership never survives on its own: the slug stays an agent-driven tool argument, exactly as it
+		// is on a first join, so this reports and lets the model decide rather than rejoining behind its
+		// back. Taken on every start, reported only on a reload — a "new"/"resume"/"fork" session has no
+		// memory of the join, so naming those cells to it would be noise, but leaving them parked would
+		// misattribute them to whatever reload came next.
+		const orphaned = takeOrphanedCells(pi, ctx.sessionManager.getEntries());
+		if (event.reason === "reload" && orphaned.length > 0) {
+			log("WARN", `Watchtowers did not survive the reload for cells: ${JSON.stringify(orphaned)}`);
+			pi.sendMessage(
+				{
+					customType: "cccp-event",
+					content:
+						`The /reload stopped your CCCP watchtowers for ${orphaned.map((c) => `'${c}'`).join(", ")}. You are NO LONGER receiving those cells' events, ` +
+						`though outgoing cccp_dispatch may still work. Anything sent to you since the reload is unread — \`cccp read <cell>\` shows it. ` +
+						`Tell the user, and rejoin with cccp_join if the work is still live.`,
+					display: true,
+				},
+				// Same delivery the watchtower `exit` handler uses, for the same reason: going deaf is the
+				// one condition worth a turn of its own. On `nextTurn` the alarm would wait for the user to
+				// happen to type again, which is exactly the silence this is here to break.
+				{ deliverAs: "followUp", triggerTurn: true },
+			);
+		}
 		const res = resolveEnvironment(state.sessionId);
 		if (res.problem) {
 			log("ERROR", `Resolve cccp environment failed: ${res.problem}`);
@@ -174,7 +233,15 @@ export default function (pi: ExtensionAPI) {
 		// true of a reload with no towers too, and every later use of `pi` is gated on it.
 		state.shuttingDown = true;
 		if (state.towers.size === 0) return;
-		log("INFO", `Kill watchtowers on session shutdown: ${[...state.towers.keys()].join(", ")}`);
+		const joined = [...state.towers.keys()];
+		log("INFO", `Kill watchtowers on session shutdown: ${joined.join(", ")}`);
+		// Written only when there is something to say, so a session that never joined still ends the way
+		// the dormancy contract promises: no watchtower, no log, and now no session entry either.
+		try {
+			pi.appendEntry(ORPHAN_ENTRY, { cells: joined });
+		} catch (e) {
+			log("ERROR", `Record orphaned cells failed, a reload will not be able to report them: ${e instanceof Error ? e.message : String(e)}`);
+		}
 		for (const tower of state.towers.values()) tower.kill();
 		state.towers.clear();
 	});

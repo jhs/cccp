@@ -390,6 +390,53 @@ class ReloadSurvival(unittest.TestCase):
                          "before any early return, or a reload with no towers leaves it down")
 
 
+class DeafAfterReload(unittest.TestCase):
+    """Surviving a reload is half the job; knowing you went deaf is the other half.
+
+    A reload kills the watchtowers and then builds a fresh extension instance, so the comrade
+    comes back joined to nothing. Left there it is the exact failure the watchtower `exit`
+    handler already refuses to allow: events stop, dispatch still works, nobody notices. The
+    hand-off runs through `pi.appendEntry` - Pi has no extension-scoped store or state directory,
+    and module scope does not survive a reload - and the model is told, never auto-rejoined.
+    """
+
+    def setUp(self):
+        self.src = EXTENSION.read_text()
+
+    def test_joined_cells_are_recorded_for_the_next_instance(self):
+        shutdown = re.search(r'pi\.on\("session_shutdown".*?\n\t\}\);', self.src, re.DOTALL)
+        self.assertIsNotNone(shutdown, "the session_shutdown handler moved; re-point this test")
+        self.assertIn("pi.appendEntry", shutdown.group(0),
+                      "session_shutdown must hand the joined cells to the post-reload instance, and "
+                      "pi.appendEntry is the sanctioned carrier - module scope does not survive a reload")
+
+    def test_nothing_is_recorded_when_nothing_was_joined(self):
+        """The dormancy contract: a session that never joined leaves no trace, entries included."""
+        shutdown = re.search(r'pi\.on\("session_shutdown".*?\n\t\}\);', self.src, re.DOTALL)
+        before_append = shutdown.group(0).split("pi.appendEntry")[0]
+        self.assertIn("state.towers.size === 0", before_append,
+                      "the early return for an empty tower map must come BEFORE the entry is written, "
+                      "or a never-joined session starts leaving session entries behind")
+
+    def test_a_reload_tells_the_model_it_went_deaf_without_rejoining_for_it(self):
+        start = re.search(r'pi\.on\("session_start".*?\n\t\}\);', self.src, re.DOTALL)
+        self.assertIsNotNone(start, "the session_start handler moved; re-point this test")
+        body = start.group(0)
+        self.assertIn('event.reason === "reload"', body,
+                      "only a reload orphans watchtowers this way; a resume or fork must not be told about them")
+        self.assertIn("cccp_join", body, "the notice must name the tool the model rejoins with")
+        self.assertNotRegex(body, r'spawn\(|watchtowerArgs\(',
+                            "the extension must never rejoin a cell for the model: membership stays an "
+                            "agent-driven tool call, exactly as it is on a first join")
+
+    def test_the_notice_costs_a_turn_like_every_other_deaf_alarm(self):
+        """`nextTurn` would sit unread until the user happened to type again - that is the silence."""
+        start = re.search(r'pi\.on\("session_start".*?\n\t\}\);', self.src, re.DOTALL)
+        notice = start.group(0).split('event.reason === "reload"')[1]
+        self.assertIn('triggerTurn: true', notice.split("resolveEnvironment")[0],
+                      "going deaf is worth a turn of its own, the same way a watchtower exit is")
+
+
 class TypeCheck(unittest.TestCase):
     def test_extension_typechecks(self):
         if not (REPO / "node_modules" / ".bin" / "tsc").exists():
