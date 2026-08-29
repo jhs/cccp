@@ -276,6 +276,47 @@ class SkillTemplateFile(unittest.TestCase):
         self.assertIn("@@BACKEND@@", self._template())
 
 
+class TmuxSkillSendKeys(unittest.TestCase):
+    """Driving a comrade's TUI has two traps, both measured against a live Claude Code TUI,
+    and both invisible to whoever falls into them - which is why the skill must keep warning
+    about them. Bundling the Enter into the text works for short input and silently stops
+    working as the input grows (paste detection eats the trailing Enter, and the message sits
+    unsent). And the input line renders an LLM auto-suggestion as ghost text, so a pane read
+    back to 'confirm' delivery can show a sentence nobody typed."""
+
+    def _body(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(here, os.pardir, "skills", "captain-with-tmux", "body.template.md")
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+
+    def _send_keys_section(self):
+        body = self._body()
+        start = body.index("## Interacting with a comrade")
+        rest = body.index("\n## ", start + 1)
+        return body[start:rest]
+
+    def test_the_prescribed_form_sends_text_alone_first(self):
+        section = self._send_keys_section()
+        self.assertIn("tmux send-keys -t <Name> 'your text here'\n", section,
+                      "the first call must carry the text with NO trailing Enter")
+        self.assertNotIn("tmux send-keys -t <Name> 'your text here' Enter\n", section,
+                         "bundling the Enter is length-dependent: short input submits, longer "
+                         "input trips paste detection and the message never goes")
+
+    def test_the_length_dependence_is_explained_not_just_asserted(self):
+        section = self._send_keys_section()
+        self.assertIn("paste detection", section,
+                      "say WHY bundling fails, or the next reader will 'simplify' it back")
+
+    def test_ghost_text_is_flagged(self):
+        section = self._send_keys_section()
+        for cue in ("auto-suggest", "ghost text"):
+            self.assertIn(cue, section,
+                          f"the input line's {cue} makes capture-pane unreliable for confirming delivery")
+        self.assertIn("transcript", section, "the reader needs the alternative, not just the warning")
+
+
 class SkillCompose(unittest.TestCase):
     """compose_skill stacks a skill's templates base-first and appends the shared
     args outro exactly once, with every token resolved."""

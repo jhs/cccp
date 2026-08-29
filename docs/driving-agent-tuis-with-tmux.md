@@ -47,7 +47,9 @@ sleep 1
 tmux send-keys -t <name> Enter
 ```
 
-Both Claude Code and Pi use bracketed paste, which swallows an `Enter` bundled into the same `send-keys`. Two calls, small gap.
+Bundling them into one call is **length-dependent**, which is worse than simply broken — it works until your input grows. Measured against a live Claude Code TUI: `send-keys 'ABCTEST' Enter` submitted immediately, while the same form with a 330-character string tripped the TUI's paste detection, which absorbed the `Enter` and left the text sitting in the input box. Text alone, then `Enter`, behaves identically in both regimes.
+
+(This is not bracketed paste — `send-keys` sends raw keys. It is the TUI's own detection of bulk input.)
 
 ### 3. Wait for it to settle, then look
 
@@ -72,6 +74,8 @@ tmux_settle <name> && tmux capture-pane -p -t <name> | tail -30
 ```
 
 **The pane is not the record.** It holds one screenful, and a TUI redraws over itself. For anything you intend to assert on, read the process's own log file. Use the pane to see *where* it is; use logs to prove *what happened*.
+
+**The input line is not evidence either.** Claude Code renders an LLM-generated auto-suggestion there as faded ghost text, and `capture-pane` gives you no way to tell it from real input — during testing the box read `Reply with the single word DONE and nothing else.`, which nobody had typed. To confirm a message actually landed, use the transcript above the box, the token counter, or the agent's reply. Never the input line.
 
 ## Cheat sheet
 

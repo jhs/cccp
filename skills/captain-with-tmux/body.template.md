@@ -65,14 +65,16 @@ This kills the `claude` process and all its children (watchtower included). One 
 
 ## Interacting with a comrade's TUI via send-keys
 
-Claude Code's TUI uses bracketed paste, which absorbs an Enter bundled with the text. To submit input to a comrade's window, send the text and Enter as TWO separate calls:
+Send the text and the Enter as TWO separate calls, with the text **alone** in the first:
 
 ```
-tmux send-keys -t <Name> 'your text here' Enter
+tmux send-keys -t <Name> 'your text here'
 tmux send-keys -t <Name> Enter
 ```
 
-Verify delivery with `tmux capture-pane`.
+Bundling them — `send-keys -t <Name> 'your text here' Enter` — is unreliable because it depends on length. Short text submits on the spot; longer text trips the TUI's paste detection, which absorbs the trailing Enter and leaves the message sitting unsent in the input box while you believe it went. Text alone, then Enter, behaves the same either way.
+
+**The input box may show faded text nobody typed.** Claude Code offers an LLM-generated auto-suggestion as ghost text on the input line, and `capture-pane` renders it indistinguishably from real input — you can read back a fully-formed instruction that neither you nor the comrade ever wrote. Never confirm a message landed by reading the input line. Confirm from the transcript above it, or from the comrade's reply.
 
 ## Captain succession
 
