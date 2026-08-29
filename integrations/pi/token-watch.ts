@@ -2,6 +2,7 @@
 import { Type } from "typebox";
 import type { ContextUsage, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_THRESHOLDS, TokenWatch } from "./token-watch-core.ts";
+import * as telemetry from "./telemetry.ts";
 
 type Reading = { time: number; percent: number; tokens: number; contextWindow: number };
 
@@ -32,7 +33,8 @@ function summary(value: Reading): string {
   return `${Math.round(value.percent)}% (${humanize(value.tokens)}/${humanize(value.contextWindow)})`;
 }
 
-export function registerTokenWatch(pi: ExtensionAPI) {
+/** `log` is passed in rather than imported: cccp-comrade.ts owns the log file and imports this module. */
+export function registerTokenWatch(pi: ExtensionAPI, log: (level: string, message: string) => void) {
   let watch: TokenWatch | undefined;
   let previous: Reading | undefined;
   let lastUsage: Reading | undefined;
@@ -45,6 +47,20 @@ export function registerTokenWatch(pi: ExtensionAPI) {
   };
 
   pi.on("turn_end", (_event, ctx) => {
+    // Deliberately ABOVE the `watch` gate. That gate is a subscription: it decides whether this session gets
+    // messages about its own context. A snapshot is for observers outside the session, who cannot ask the
+    // agent to switch anything on — so it is gated only on the user having consented to files being written.
+    try {
+      telemetry.write({
+        sessionId: ctx.sessionManager.getSessionId(),
+        sessionName: ctx.sessionManager.getSessionName(),
+        model: ctx.model?.name,
+        usage: ctx.getContextUsage(),
+      });
+    } catch (e) {
+      log("ERROR", `Telemetry snapshot write failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+
     if (!watch) return;
     const value = current(ctx);
     if (!value) {

@@ -207,12 +207,20 @@ def fmt_elapsed(seconds):
 
 
 def metrics(payload):
-    """Extract usage fields, or None when context data is absent (fresh/compacted)."""
+    """Extract usage fields, or None when there is no reading yet (fresh/compacted).
+
+    Two spellings of one numerator: `total_tokens` for a producer that measures
+    context as a single number (Pi), input+output for one that reports a split
+    (the Claude Code statusLine payload). A window size with NEITHER is not a
+    reading - saying 0% because nothing counted the tokens is the confident-lie
+    failure this file exists to avoid."""
     cw = payload.get("context_window") or {}
     size = cw.get("context_window_size") or 0
-    if not size:
+    used = cw.get("total_tokens")
+    if used is None and ("total_input_tokens" in cw or "total_output_tokens" in cw):
+        used = (cw.get("total_input_tokens") or 0) + (cw.get("total_output_tokens") or 0)
+    if not size or used is None:
         return None
-    used = (cw.get("total_input_tokens") or 0) + (cw.get("total_output_tokens") or 0)
     pct = cw.get("used_percentage")
     if pct is None:
         pct = used / size * 100

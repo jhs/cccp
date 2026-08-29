@@ -39,6 +39,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 EXTENSION = REPO / "integrations" / "pi" / "cccp-comrade.ts"
 TOKEN_WATCH = REPO / "integrations" / "pi" / "token-watch.ts"
+TELEMETRY = REPO / "integrations" / "pi" / "telemetry.ts"
 SKILL = REPO / ".pi" / "skills" / "cccp-chat" / "SKILL.md"
 TOKEN_SKILL = REPO / ".pi" / "skills" / "token-aware" / "SKILL.md"
 PI_SETTINGS = REPO / ".pi" / "settings.json"
@@ -807,6 +808,130 @@ class LiveControl(_LiveHarness, unittest.TestCase):
             return  # the silence we want
         self.fail("a Pi session WITHOUT the extension reached the cell, so the "
                   f"live assertions prove nothing. Leaked event: {leaked}")
+
+
+class TelemetrySnapshots(unittest.TestCase):
+    """Writing a snapshot is a SECOND consent, separate from where cccp data lives.
+
+    Loading this extension so a session can see its own context must not also
+    mean leaving files in the user's home directory for other processes - so the
+    write is gated on CCCP_DO_PI_TELEMETRY, and a gate that is on but cannot
+    write says so loudly instead of degrading to silence."""
+
+    SESSION = "01920000-2222-7c9a-9f1e-3b7a5599ff01"   # comrade pi-99ff01
+
+    def _node(self, body, env_overrides, cwd=None):
+        """Run a snippet against telemetry.ts, returning its parsed JSON line."""
+        script = ('import("./integrations/pi/telemetry.ts").then(t => {' + body
+                  + '}, e => { console.error(e.message); process.exit(1); });')
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("CCCP_PLUGIN_DATA", "CCCP_DO_PI_TELEMETRY")}
+        env.update({k: v for k, v in env_overrides.items() if v is not None})
+        r = subprocess.run(["node", "--no-warnings", "-e", script],
+                           cwd=cwd or REPO, env=env, capture_output=True,
+                           text=True, timeout=60)
+        if r.returncode != 0 and "Unknown file extension" in r.stderr + r.stdout:
+            self.skipTest("SKIPPED LOUDLY: this node cannot import TypeScript "
+                          "natively (needs Node >= 23) - telemetry tests not run")
+        self.assertEqual(r.returncode, 0, f"node failed:\n{r.stderr}")
+        return json.loads(r.stdout.strip().splitlines()[-1])
+
+    def _write(self, data, gate, usage="{tokens: 76000, contextWindow: 200000, percent: 38}",
+               name='"a lane"', model='"Opus 5"'):
+        body = ('  const problem = t.initialize();'
+                '  t.write({sessionId: ' + json.dumps(self.SESSION) + ','
+                '    sessionName: ' + name + ', model: ' + model + ','
+                '    usage: ' + usage + '});'
+                '  console.log(JSON.stringify({problem, ready: t.ready(),'
+                '    dir: t.snapshotDir()}));')
+        return self._node(body, {"CCCP_PLUGIN_DATA": str(data),
+                                 "CCCP_DO_PI_TELEMETRY": gate})
+
+    def _files(self, data):
+        return sorted(str(p.relative_to(data)) for p in Path(data).rglob("*")
+                      if p.is_file())
+
+    def test_the_gate_is_off_by_default_and_nothing_is_written(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = self._write(td, gate=None)
+            self.assertIsNone(out["problem"], "an unset gate is not a problem")
+            self.assertFalse(out["ready"])
+            self.assertEqual(self._files(td), [], "wrote files without consent")
+
+    def test_falsy_spellings_of_the_gate_write_nothing(self):
+        for value in ("", "0", "false", "no", "off", "FALSE", " off "):
+            with self.subTest(gate=value), tempfile.TemporaryDirectory() as td:
+                out = self._write(td, gate=value)
+                self.assertFalse(out["ready"], f"{value!r} armed the write")
+                self.assertEqual(self._files(td), [])
+
+    def test_a_truthy_gate_writes_one_snapshot_the_reader_can_find(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = self._write(td, gate="1")
+            self.assertIsNone(out["problem"])
+            self.assertTrue(out["ready"])
+            written = self._files(td)
+            self.assertEqual(len(written), 1, f"expected one snapshot, got {written}")
+            self.assertTrue(written[0].endswith(f"/pi/{self.SESSION}.json"), written[0])
+            self.assertNotIn(".tmp", written[0], "left a temp file behind")
+
+            payload = json.loads((Path(td) / written[0]).read_text())
+            self.assertEqual(payload["session_id"], self.SESSION)
+            self.assertEqual(payload["session_name"], "a lane")
+            self.assertEqual(payload["model"], {"display_name": "Opus 5"})
+            self.assertEqual(payload["context_window"], {
+                "context_window_size": 200_000,
+                "total_tokens": 76_000,
+                "used_percentage": 38,
+            })
+            self.assertLess(abs(payload["updated_at"] - time.time()), 60)
+
+    def test_the_snapshot_omits_what_pi_has_no_value_for(self):
+        """Omitted, never faked: an invented field re-breaks whenever the
+        harness it was imitating changes shape."""
+        with tempfile.TemporaryDirectory() as td:
+            self._write(td, gate="1", name="undefined", model="undefined",
+                        usage="{tokens: null, contextWindow: 200000, percent: null}")
+            path = next(Path(td).rglob("*.json"))
+            payload = json.loads(path.read_text())
+            self.assertEqual(sorted(payload), ["session_id", "updated_at"])
+            # A window size with no tokens behind it would read as a confident 0%.
+            self.assertNotIn("context_window", payload)
+
+    def test_a_gate_with_nowhere_to_write_fails_loudly(self):
+        out = self._node(
+            '  console.log(JSON.stringify({problem: t.initialize(), ready: t.ready()}));',
+            {"CCCP_DO_PI_TELEMETRY": "1"})
+        self.assertIsNotNone(out["problem"], "silently disabled instead of complaining")
+        self.assertIn("CCCP_PLUGIN_DATA", out["problem"])
+        self.assertFalse(out["ready"])
+
+    @unittest.skipIf(os.geteuid() == 0, "SKIPPED LOUDLY: root ignores the mode "
+                     "bits this test relies on")
+    def test_a_gate_pointed_at_an_unwritable_place_fails_loudly(self):
+        with tempfile.TemporaryDirectory() as td:
+            locked = Path(td) / "locked"
+            locked.mkdir(mode=0o500)
+            try:
+                out = self._write(locked, gate="1")
+            finally:
+                locked.chmod(0o700)   # or TemporaryDirectory cannot clean up
+            self.assertIsNotNone(out["problem"], "silently disabled instead of complaining")
+            self.assertIn("not writable", out["problem"])
+            self.assertFalse(out["ready"])
+
+    def test_claude_tokens_reads_what_the_pi_writer_writes(self):
+        """The point of the whole issue: one contract, two harnesses, one reader."""
+        with tempfile.TemporaryDirectory() as td:
+            self._write(td, gate="1")
+            env = {k: v for k, v in os.environ.items()
+                   if k not in ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID")}
+            env["CCCP_PLUGIN_DATA"] = td
+            r = subprocess.run([str(REPO / "bin" / "claude-tokens"), "status",
+                                "pi-99ff01"], env=env, capture_output=True,
+                               text=True, timeout=60)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertRegex(r.stdout.strip(), r"^38% \(76k/200k\) \| snapshot \d+s old$")
 
 
 if __name__ == "__main__":

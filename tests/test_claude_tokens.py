@@ -158,6 +158,33 @@ class ComradeTargets(TreeCase):
         self.assertEqual(r["matches"], sorted([CC_SID, twin]))
 
 
+class Numerator(unittest.TestCase):
+    """Two spellings of used tokens, because harnesses genuinely differ."""
+
+    def cw(self, **fields):
+        return {"session_id": "s", "context_window": dict(context_window_size=200_000, **fields)}
+
+    def test_a_single_total_is_a_complete_reading(self):
+        m = claude_tokens.metrics(self.cw(total_tokens=76_000, used_percentage=38))
+        self.assertEqual((m["used"], m["size"], m["pct"]), (76_000, 200_000, 38))
+
+    def test_an_input_output_split_is_summed(self):
+        m = claude_tokens.metrics(
+            self.cw(total_input_tokens=70_000, total_output_tokens=6_000))
+        self.assertEqual(m["used"], 76_000)
+        self.assertAlmostEqual(m["pct"], 38)
+
+    def test_total_tokens_wins_when_a_producer_writes_both(self):
+        m = claude_tokens.metrics(
+            self.cw(total_tokens=76_000, total_input_tokens=1, total_output_tokens=1))
+        self.assertEqual(m["used"], 76_000)
+
+    def test_a_window_size_with_no_numerator_is_not_a_reading(self):
+        """Nothing counted the tokens, so 0% would be a confident lie."""
+        self.assertIsNone(claude_tokens.metrics(self.cw()))
+        self.assertIsNone(claude_tokens.metrics(self.cw(used_percentage=38)))
+
+
 class ReadingAge(unittest.TestCase):
     """Staleness comes from the payload, never from filesystem metadata."""
 

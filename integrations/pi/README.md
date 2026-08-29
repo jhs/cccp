@@ -69,11 +69,17 @@ It needs the `pi` binary plus credentials (an `ANTHROPIC_API_KEY`/`PI_API_KEY` e
 
 ## Env contract
 
-**No environment variables are required.** The cell is always a `cccp_join`/`cccp_dispatch` tool parameter, never env. Everything session-scoped resolves at **session start** — the user enabled the extension, so `cccp config` and the comrade id are usable in the bash tool before any join. Explicit env always wins; both variables are pre-existing cccp surface, not Pi inventions:
+**No environment variables are required.** The cell is always a `cccp_join`/`cccp_dispatch` tool parameter, never env. Everything session-scoped resolves at **session start** — the user enabled the extension, so `cccp config` and the comrade id are usable in the bash tool before any join. Explicit env always wins. The first two are pre-existing cccp surface rather than Pi inventions; the third exists because nothing pre-existing could carry what it means:
 
 | Variable | Meaning |
 |---|---|
 | `CCCP_COMRADE_ID` | Optional override. By default derived Claude-Code-style at session start — `user@shorthost:pi-<last-6-hex-of-Pi-session-id>` — and exported, so the watchtowers, dispatches, and the bash tool share one stable identity for the whole session (`echo $CCCP_COMRADE_ID`). |
 | `CCCP_PLUGIN_DATA` | Optional cccp data directory. Defaults to the Claude plugin's conventional `${CLAUDE_CONFIG_DIR:-~/.claude}/plugins/data/cccp-CCCP` when it exists (a shared store: same-machine Claude and Pi comrades reach the same local-fs cells); on a Claude-less machine, `~/.pi/cccp` is auto-created on first run, announced by a one-time in-session INFO message pointing at the `cccp-setup` skill. |
+
+| `CCCP_DO_PI_TELEMETRY` | Off by default. Truthy (anything but empty, `0`, `false`, `no`, `off`) makes each turn leave a context-usage snapshot at `$CCCP_PLUGIN_DATA/telemetry/<v-major|inline>/pi/<session-id>.json`, so `claude-tokens status <comrade-id>` can report on this session from outside it. See [docs/telemetry-snapshots.md](../../docs/telemetry-snapshots.md). |
+
+`CCCP_DO_PI_TELEMETRY` is the one variable this integration adds, and it earns that by carrying something no existing variable can: **consent to write files**. `CCCP_PLUGIN_DATA` says where cccp data lives and is filled in automatically when unset, so it cannot double as a yes. Loading this extension so a session can watch its own context is one decision; leaving files on disk for other processes to read is another, and the second is not implied by the first.
+
+Snapshot writing does **not** sit behind `token_watch`. That tool gates a subscription — whether this session gets told about its own context — whereas a snapshot is for observers outside the session, who cannot ask the agent to switch anything on. Switched on but unable to write (no `CCCP_PLUGIN_DATA`, or an unwritable one) is reported to the model at session start rather than silently skipped: from outside, a session writing nothing looks exactly like a dead one.
 
 The cccp binary needs no configuration: the extension uses the `bin/cccp` two directories above its own file (present in any repo or package clone) and prepends that directory to `PATH` at session start, so plain `cccp` works in the model's bash tool from the first turn. The extension's own log appends to `$CCCP_PLUGIN_DATA/logs/pi-comrade.log`.

@@ -1084,11 +1084,12 @@ class BackendConfigWrite(unittest.TestCase):
 
 class TelemetryVersionSegment(unittest.TestCase):
     """Telemetry is partitioned by the writing plugin's major version so two
-    releases sharing one marketplace data root cannot collide. Three programs
-    derive that segment independently - bin/cccp-statusline (bash, the writer),
-    bin/claude-tokens (the reader) and bin/cccp (setup detection) - so this
-    exercises all three against one fake plugin root and asserts they agree.
-    A divergence here strands the reader silently: jhs/cccp#14's failure mode."""
+    releases sharing one marketplace data root cannot collide. FOUR programs
+    derive that segment independently - bin/cccp-statusline (bash, the Claude
+    Code writer), bin/claude-tokens (the reader), bin/cccp (setup detection) and
+    integrations/pi/telemetry.ts (the Pi writer) - so this exercises all four
+    against one fake plugin root and asserts they agree. A divergence here
+    strands the reader silently: jhs/cccp#14's failure mode."""
 
     BINS = ("cccp", "cccp-statusline", "claude-tokens")
 
@@ -1106,6 +1107,27 @@ class TelemetryVersionSegment(unittest.TestCase):
         if git:
             (root / ".git").mkdir()
         return root
+
+    def _pi_segment(self, root):
+        """The Pi writer's segment, or None when this node cannot import TypeScript.
+
+        telemetry.ts resolves the plugin root as its own ../.., so a copy of that
+        one file under integrations/pi/ sees the fake root the others see."""
+        import shutil
+        import subprocess
+        pi = root / "integrations" / "pi"
+        pi.mkdir(parents=True, exist_ok=True)
+        here = Path(__file__).resolve().parent.parent / "integrations" / "pi"
+        shutil.copy2(here / "telemetry.ts", pi / "telemetry.ts")
+        script = ('import("./integrations/pi/telemetry.ts")'
+                  '.then(m => console.log(m.versionSegment()),'
+                  ' e => { console.error(e.message); process.exit(1); });')
+        r = subprocess.run(["node", "--no-warnings", "-e", script], cwd=root,
+                           capture_output=True, text=True, timeout=60)
+        if r.returncode != 0 and "Unknown file extension" in r.stderr + r.stdout:
+            return None
+        self.assertEqual(r.returncode, 0, f"node failed:\n{r.stderr}")
+        return r.stdout.strip()
 
     def _segments(self, root):
         """(statusline, claude-tokens, cccp) as each program computes it."""
@@ -1130,19 +1152,25 @@ class TelemetryVersionSegment(unittest.TestCase):
                for n in ("claude-tokens", "cccp")]
         return (written[0].parent.parent.name, out[0], out[1])
 
+    def _assert_all_agree(self, root, want, label):
+        self.assertEqual(self._segments(root), (want, want, want), label)
+        pi = self._pi_segment(root)
+        if pi is None:
+            self.skipTest("SKIPPED LOUDLY: this node cannot import TypeScript "
+                          "natively (needs Node >= 23) - Pi writer not compared")
+        self.assertEqual(pi, want, f"{label}: the Pi writer disagrees")
+
     def test_release_versions_agree(self):
         for version, want in (("3.0.0", "v3"), ("4.2.1", "v4"),
                               ("12.0.0-rc1", "v12")):
-            segs = self._segments(self._root(version))
-            self.assertEqual(segs, (want, want, want), f"version {version}")
+            self._assert_all_agree(self._root(version), want, f"version {version}")
 
-    def test_checkout_is_inline_in_all_three(self):
-        segs = self._segments(self._root("3.0.0", git=True))
-        self.assertEqual(segs, ("inline", "inline", "inline"))
+    def test_checkout_is_inline_in_all_four(self):
+        self._assert_all_agree(self._root("3.0.0", git=True), "inline", "checkout")
 
     def test_unparseable_version_agrees_on_unknown(self):
-        segs = self._segments(self._root("not-a-version"))
-        self.assertEqual(segs, ("unknown", "unknown", "unknown"))
+        self._assert_all_agree(self._root("not-a-version"), "unknown",
+                               "unparseable version")
 
 
 class ParseSize(unittest.TestCase):

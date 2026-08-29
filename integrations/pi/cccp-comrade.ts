@@ -17,6 +17,10 @@
  *                                         cells), else ~/.pi/cccp — auto-created on first run with a one-time
  *                                         INFO message pointing at the cccp-setup skill.
  *                       PATH              the cccp binary's directory is prepended.
+ *                     Also where telemetry snapshots are armed: CCCP_DO_PI_TELEMETRY is READ, never set, and
+ *                     only here can it be judged, because the writable path it needs is what this step just
+ *                     resolved. On but unable to write is reported to the model, never swallowed — see
+ *                     telemetry.ts.
  *
  *   cccp_join         Membership, per cell. The cell slug is always a tool argument — never env, never session
  *                     state. A session may join any number of cells (or none: sessions that never join stay
@@ -52,6 +56,7 @@ import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerTokenWatch } from "./token-watch.ts";
+import * as telemetry from "./telemetry.ts";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -71,12 +76,21 @@ function logPath(): string {
 }
 
 function log(level: string, message: string): void {
-	const p = logPath();
-	if (!logDirReady) {
-		fs.mkdirSync(path.dirname(p), { recursive: true });
-		logDirReady = true;
+	// A logger that throws turns a reportable problem into a dead extension. This runs inside session_start,
+	// where the very condition most worth reporting - an unwritable CCCP_PLUGIN_DATA - is also what breaks
+	// the write: measured, the EACCES from this mkdir aborted extension binding entirely and the session came
+	// up with no cccp at all. Losing a log line is survivable; losing the session is not, and pi.sendMessage
+	// still carries the alarm to the model.
+	try {
+		const p = logPath();
+		if (!logDirReady) {
+			fs.mkdirSync(path.dirname(p), { recursive: true });
+			logDirReady = true;
+		}
+		fs.appendFileSync(p, `${new Date().toISOString()} ${level} ${message}\n`);
+	} catch {
+		// Reporting a logging failure would need the logger.
 	}
-	fs.appendFileSync(p, `${new Date().toISOString()} ${level} ${message}\n`);
 }
 
 export type EnvResolution = {
@@ -173,7 +187,7 @@ function takeOrphanedCells(pi: ExtensionAPI, entries: readonly { type: string; c
 
 export default function (pi: ExtensionAPI) {
 	const state: ComradeState = { towers: new Map(), shuttingDown: false };
-	registerTokenWatch(pi);
+	registerTokenWatch(pi, log);
 
 	pi.on("session_start", (event, ctx) => {
 		state.sessionId = ctx.sessionManager.getSessionId();
@@ -212,6 +226,23 @@ export default function (pi: ExtensionAPI) {
 				{ deliverAs: "nextTurn" },
 			);
 			return;
+		}
+		// Only now can this be judged: the writable path it needs is what resolveEnvironment just filled in.
+		// A misconfiguration is reported rather than swallowed - silently-no-telemetry looks exactly like a
+		// dead agent to whatever is watching this session from outside, which is the whole point of writing.
+		const telemetryProblem = telemetry.initialize();
+		if (telemetryProblem) {
+			log("ERROR", `Telemetry snapshots disabled: ${telemetryProblem}`);
+			pi.sendMessage(
+				{
+					customType: "cccp-info",
+					content:
+						`CCCP telemetry snapshots are switched on but cannot be written: ${telemetryProblem}. ` +
+						`Nothing outside this session can see its context usage until that is corrected - tell the user.`,
+					display: true,
+				},
+				{ deliverAs: "nextTurn" },
+			);
 		}
 		if (res.created) {
 			log("INFO", `Data directory created: ${res.created}`);

@@ -20,3 +20,7 @@ Call `token_watch` to opt in to notifications after future turns cross a context
 - A crossing reports the current usage, elapsed time and usage velocity since the prior reading, and ETAs for later milestones.
 
 Call `token_watch` with `enabled: false` when monitoring is no longer wanted. It sends no more notifications until you start it again.
+
+## Being seen from outside
+
+Both tools above report only to you. When `CCCP_DO_PI_TELEMETRY` is set, each turn also leaves a snapshot on disk, so a coordinator can read this session's context usage with `claude-tokens status $CCCP_COMRADE_ID` without asking you. That is off by default; when it is off, nobody outside this session can see how full your context is, so say so yourself before going quiet.

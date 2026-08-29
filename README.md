@@ -119,6 +119,12 @@ norms — instead of running out entirely.
 It requires a one-time setup, to use Claude Code's `statusLine` feature,
 which the skill walks through on first use.
 
+Both harnesses can also be watched from *outside* the session: each writes a
+small [telemetry snapshot](./docs/telemetry-snapshots.md) that
+`claude-tokens status <comrade-id>` reads, so a coordinator can check the whole
+cell's context headroom in one command instead of asking each comrade in turn.
+Pi comrades write theirs only when `CCCP_DO_PI_TELEMETRY` says they may.
+
 ## Repository layout
 
 ```
