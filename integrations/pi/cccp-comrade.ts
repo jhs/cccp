@@ -170,9 +170,11 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", () => {
+		// The flag goes up first and unconditionally: it means "this captured ctx is finished", which is
+		// true of a reload with no towers too, and every later use of `pi` is gated on it.
+		state.shuttingDown = true;
 		if (state.towers.size === 0) return;
 		log("INFO", `Kill watchtowers on session shutdown: ${[...state.towers.keys()].join(", ")}`);
-		state.shuttingDown = true;
 		for (const tower of state.towers.values()) tower.kill();
 		state.towers.clear();
 	});
@@ -202,11 +204,30 @@ export default function (pi: ExtensionAPI) {
 			const tower = spawn(CCCP, watchtowerArgs(cell, params.idle_minutes), { stdio: ["ignore", "pipe", "pipe"] });
 			state.towers.set(cell, tower);
 			readline.createInterface({ input: tower.stdout! }).on("line", (line) => {
+				// Both guards exist because pi's `/reload` invalidates this captured `pi` in place, and a
+				// throw from an unguarded readline callback is an uncaughtException that kills the whole
+				// comrade — the pi process exits, and with it the window hosting it (#33).
+				//
+				// The flag is not a race guard: killing the tower is itself what produces the last line.
+				// `cccp watchtower` emits a final `shutdown ... reason=signal_15` on SIGTERM, so our own
+				// session_shutdown kill provokes exactly the line that then lands on a stale ctx. Without
+				// this check, every /reload with a joined cell was a certain crash, not an unlucky one.
+				//
+				// The try/catch is the belt: a line already in the pipe when the flag went up, or any
+				// other way pi stops accepting messages, must cost one dropped event and nothing more.
+				if (state.shuttingDown) {
+					log("INFO", `Drop cell ${cell} event after shutdown: ${JSON.stringify(line)}`);
+					return;
+				}
 				log("INFO", `Cell ${cell} event: ${JSON.stringify(line)}`);
-				pi.sendMessage(
-					{ customType: "cccp-event", content: eventMessage(cell, line), display: true },
-					{ deliverAs: "followUp", triggerTurn: true },
-				);
+				try {
+					pi.sendMessage(
+						{ customType: "cccp-event", content: eventMessage(cell, line), display: true },
+						{ deliverAs: "followUp", triggerTurn: true },
+					);
+				} catch (e) {
+					log("ERROR", `Drop cell ${cell} event, the session refused it (${e instanceof Error ? e.message : String(e)}): ${JSON.stringify(line)}`);
+				}
 			});
 			readline.createInterface({ input: tower.stderr! }).on("line", (line) => {
 				log("WARN", `Cell ${cell} watchtower stderr: ${line}`);

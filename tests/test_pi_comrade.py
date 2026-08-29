@@ -332,6 +332,64 @@ class EventSurface(unittest.TestCase):
         self.assertEqual(out["disabledArgs"], ["watchtower", "second-cell", "--idle", "0"])
 
 
+class ReloadSurvival(unittest.TestCase):
+    """Pi's `/reload` must not kill a joined comrade (#33).
+
+    Reload is in-process: pi emits session_shutdown, then invalidates the `pi` handle every
+    extension captured at load time, so any later call on it throws. The extension's own
+    session_shutdown handler kills its watchtowers - and that kill is what produces the last
+    stdout line, because `cccp watchtower` signs off with a `shutdown` event on SIGTERM. That
+    line then lands in the readline callback holding the now-stale handle. Unguarded, the throw
+    escapes an async callback as an uncaughtException and pi exits, taking the comrade's window
+    with it. Both halves are pinned here: the sign-off that creates the hazard, and the guard.
+    """
+
+    def test_sigterm_makes_the_watchtower_sign_off_on_stdout(self):
+        """The hazard itself: killing a watchtower yields one MORE line, it does not just stop."""
+        with tempfile.TemporaryDirectory() as td:
+            env = dict(os.environ, CCCP_PLUGIN_DATA=td, CCCP_COMRADE_ID="dev@test:cc-reload")
+            env.pop("CCCP_ACTIVE_BACKEND", None)
+            tower = subprocess.Popen([str(CCCP), "watchtower", f"reload-probe-{uuid.uuid4().hex[:6]}", "--idle", "0"],
+                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, env=env)
+            try:
+                lines: queue.Queue = queue.Queue()
+                threading.Thread(target=lambda: [lines.put(x) for x in tower.stdout], daemon=True).start()
+                try:
+                    ready = lines.get(timeout=30)
+                except queue.Empty:
+                    self.skipTest("SKIPPED LOUDLY: the watchtower never reached `ready` - backend unreachable?")
+                self.assertTrue(ready.startswith("ready "), f"expected a ready line, got: {ready!r}")
+                # SIGTERM is armed only after `ready`, which is exactly when a join has a live tower.
+                tower.terminate()
+                try:
+                    farewell = lines.get(timeout=15)
+                except queue.Empty:
+                    self.fail("the watchtower stopped emitting on SIGTERM - if this is now true by design, "
+                              "#33's guard is still required for lines already in the pipe, so keep it")
+                self.assertTrue(farewell.startswith("shutdown "),
+                                f"expected a shutdown sign-off after SIGTERM, got: {farewell!r}")
+            finally:
+                tower.kill()
+                tower.wait(timeout=10)
+
+    def test_event_handler_never_lets_a_post_reload_line_reach_pi(self):
+        """The guard: no path from a watchtower line to an unprotected sendMessage."""
+        src = EXTENSION.read_text()
+        handler = re.search(r'input: tower\.stdout!.*?\n(\t\t\t)\}\);', src, re.DOTALL)
+        self.assertIsNotNone(handler, "the watchtower stdout line handler moved; re-point this test")
+        body = handler.group(0)
+        self.assertIn("state.shuttingDown", body,
+                      "a line arriving after session_shutdown must be dropped, not sent on a stale pi ctx (#33)")
+        self.assertTrue(re.search(r'try\s*\{.*?pi\.sendMessage.*?\}\s*catch', body, re.DOTALL),
+                        "the sendMessage for a cell event must sit in a try/catch: a throw here is an "
+                        "uncaughtException in an async callback, which exits pi outright (#33)")
+        shutdown = re.search(r'pi\.on\("session_shutdown".*?\n\t\}\);', src, re.DOTALL)
+        self.assertIsNotNone(shutdown, "the session_shutdown handler moved; re-point this test")
+        self.assertRegex(shutdown.group(0).split("state.towers.size === 0")[0], r'state\.shuttingDown = true;',
+                         "session_shutdown must raise the flag the line handler reads, and raise it "
+                         "before any early return, or a reload with no towers leaves it down")
+
+
 class TypeCheck(unittest.TestCase):
     def test_extension_typechecks(self):
         if not (REPO / "node_modules" / ".bin" / "tsc").exists():
