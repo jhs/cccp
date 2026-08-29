@@ -14,7 +14,7 @@ To ascertain how much of the context window this session has consumed, use these
 | `claude-tokens status` | One-shot: print current usage (pct, used/size, snapshot age) |
 | `claude-tokens watch` | Stream milestone events (50/75/90/95%) for the Monitor tool |
 
-If `claude-tokens` fails (not found, non-zero exit, traceback, etc.) do not troubleshoot but instead halt and inform the user. A "no snapshot yet" message is not an error; it means data is not yet available.
+If `claude-tokens` fails (not found, non-zero exit, traceback, etc.) do not troubleshoot but instead halt and inform the user. A "no snapshot yet" message is not an error; it means data is not yet available. Neither is `snapshot age unknown`: the reading is good, but the snapshot predates self-dating and its age cannot be established (see [Telemetry snapshots](../../docs/telemetry-snapshots.md)). Report the usage and say the age is unknown rather than substituting a guess.
 
 ## One-Time Setup
 

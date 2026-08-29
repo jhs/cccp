@@ -220,9 +220,11 @@ def current_session_id():
 #                         authoritative local cell store, azure-blob/ holds only
 #                         connection config
 #   mirror/               cache: pulled files, aliases, per-cell debug + watchtower logs
-#   telemetry/<version>/  cache: harvested session data (token-aware), keyed by
-#                         the writing plugin's major version (or "inline"), so
-#                         releases sharing one data root never collide
+#   telemetry/<version>/  cache: per-session snapshots (token-aware) under one
+#                         directory per producing harness, keyed by the writing
+#                         plugin's major version (or "inline") so releases
+#                         sharing one data root never collide; contract in
+#                         docs/telemetry-snapshots.md
 #   run/                  ephemeral inter-process runtime state (the /var/run of
 #                         the tree): watchtower inboxes today, pidfiles later
 #
@@ -2370,11 +2372,12 @@ def telemetry_version_segment():
 
 
 def _ds_detect(plugin_data):
-    # Harvested session telemetry lives under
-    # telemetry/<v-major|inline>/claude-code/ (see bin/cccp-statusline and the
-    # plugin data tree above): an auth-status.json plus one <session-uuid>.json
-    # per session. Detection is per-version: a v3 tree says nothing about
-    # whether THIS copy's statusLine write is wired up.
+    # Unlike a reader, this names claude-code/ deliberately: the question is
+    # whether THIS copy's Claude Code statusLine write is wired up, and only that
+    # producer's own directory can answer it - an auth-status.json plus one
+    # <session-uuid>.json per session (see bin/cccp-statusline, the plugin data
+    # tree above, and docs/telemetry-snapshots.md). Detection is also
+    # per-version: a v3 tree says nothing about this copy.
     tele = (Path(plugin_data) / "telemetry" / telemetry_version_segment()
             / "claude-code")
     if not (tele / "auth-status.json").exists():

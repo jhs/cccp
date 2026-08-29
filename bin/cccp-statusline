@@ -2,8 +2,9 @@
 #
 # Collect session status data for CCCP.
 #
-# Reads the statusLine JSON payload from stdin and atomically writes it to
-# <data_dir>/<session_id>.json for use by other programs in this plugin.
+# Reads the statusLine JSON payload from stdin and atomically writes it, plus an
+# `updated_at` stamp, as this session's telemetry snapshot for other programs in
+# this plugin. Snapshot tree and field contract: docs/telemetry-snapshots.md.
 # 
 # Produces no output
 #
@@ -31,20 +32,15 @@ fi
 
 input=$(cat)
 
-# Harvested Claude Code session telemetry lives under
-# telemetry/<v-major|inline>/claude-code/ in the plugin data tree (see the map
-# in bin/cccp). --plugin-data is still the tree root.
+# This is the Claude Code producer of the snapshot tree:
+# telemetry/<v-major|inline>/claude-code/ under --plugin-data, which is the tree
+# root (the map is in bin/cccp; the contract is docs/telemetry-snapshots.md).
 #
-# One data root holds every version installed from one marketplace (the root is
-# keyed by marketplace, not version), so the tree is partitioned by the WRITING
-# plugin's major version - v3, v4 - and two releases can never scribble on each
-# other's snapshots. A checkout writes to "inline" instead: its plugin.json
-# version is whatever the branch happens to say, which is not a release.
-#
-# claude-tokens reads this same directory and derives the segment from the same
-# file by the same rule (major digits before the first dot, .git means inline).
-# The two rules must stay identical: a divergence silently strands the reader,
-# which is exactly the failure jhs/cccp#14 was.
+# Readers glob the producer level, so `claude-code` here is a free choice. The
+# version segment above it is not: claude-tokens and cccp derive it from the same
+# plugin.json by the same rule (major digits before the first dot, .git means
+# inline), and the three must stay identical. A divergence silently strands the
+# reader, which is exactly the failure jhs/cccp#14 was.
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 if [[ -d "$root/.git" ]]; then
     version_segment="inline"
@@ -72,10 +68,21 @@ if ! [[ -f "$auth_file" ]] || [[ -z $(find "$auth_file" -mmin -300 -print 2>/dev
 fi
 
 # Write session status data to a per-session file for claude-tokens.
+#
+# The payload goes out verbatim apart from `updated_at`: it already satisfies
+# every field the snapshot contract requires (docs/telemetry-snapshots.md), so
+# there is nothing to translate. `updated_at` is the one thing the payload cannot
+# supply - it is when THIS read happened, and it has to travel inside the file
+# because a snapshot copied to another machine takes its mtime from the copy.
 sid=$(printf '%s' "$input" | jq -r '.session_id // empty')
 if [[ -n "$sid" ]]; then
     mkdir -p "$tele_dir" 2>/dev/null
-    printf '%s' "$input" > "$tele_dir/$sid.json.tmp" && mv "$tele_dir/$sid.json.tmp" "$tele_dir/$sid.json"
+    tmp="$tele_dir/$sid.json.tmp"
+    if printf '%s' "$input" | jq --argjson now "$(date +%s)" '. + {updated_at: $now}' > "$tmp"; then
+        mv "$tmp" "$tele_dir/$sid.json"
+    else
+        rm -f "$tmp"
+    fi
 fi
 
 if $passthrough; then

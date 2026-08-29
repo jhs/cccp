@@ -124,7 +124,7 @@ which the skill walks through on first use.
 ```
 .claude-plugin/       plugin manifest and marketplace catalog
 bin/cccp              the single-file implementation (on $PATH as bare `cccp` while the plugin is enabled)
-bin/cccp-statusline   side-writes session JSON for claude-tokens; no visible output (see Staying context-aware)
+bin/cccp-statusline   side-writes this session's telemetry snapshot for claude-tokens; no visible output (see Staying context-aware)
 bin/claude-tokens     token-aware's CLI (on $PATH as bare `claude-tokens`)
 skills/               the /cccp:* skills — chat, team, … stacked at render time by `cccp skill`, plus standalone setup (backends) and token-aware (context budget)
 infra/azure/          Terraform + apply.sh for an Azure Blob hub

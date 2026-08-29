@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""claude-tokens - report or watch this Claude session's context/token usage.
+"""claude-tokens - report or watch an agent session's context/token usage.
 
 See skills/token-aware/SKILL.md for usage.
 
-Reads the per-session snapshot the statusLine side-write drops at
-$CCCP_PLUGIN_DATA/telemetry/<v-major|inline>/claude-code/<session_id>.json
-(see bin/cccp-statusline). 'status'
-prints a one-shot summary; 'watch' streams milestone events for the Monitor
-tool. Session id resolves from the optional positional arg, else
-$CLAUDE_CODE_SESSION_ID, else the newest snapshot on disk.
+Reads the per-session snapshots under
+$CCCP_PLUGIN_DATA/telemetry/<v-major|inline>/<producer>/<session_id>.json -
+tree, field contract and the reason for the producer glob are in
+docs/telemetry-snapshots.md. bin/cccp-statusline writes the Claude Code ones.
+'status' prints a one-shot summary; 'watch' streams milestone events for the
+Monitor tool. Session id resolves from the optional positional arg, else
+$CLAUDE_CODE_SESSION_ID, else the most recent snapshot on disk.
 """
 
 import argparse
+import glob
 import json
 import os
 import re
@@ -41,34 +43,86 @@ def _version_segment():
 
 
 def _data_dir():
+    """The version partition holding every producer's snapshots."""
     d = os.environ.get("CCCP_PLUGIN_DATA")
     if not d:
         print("CCCP_PLUGIN_DATA is not set -- is the cccp plugin enabled?",
               file=sys.stderr)
         sys.exit(1)
-    return Path(d) / "telemetry" / _version_segment() / "claude-code"
+    return Path(d) / "telemetry" / _version_segment()
 
 
 DEFAULT_THRESHOLDS = (50, 75, 90, 95)
 
 
+def load_snapshot(path):
+    """Parse one snapshot, or None if it is unreadable or not a snapshot.
+
+    The producer glob sweeps whole directories, which hold sidecar files too
+    (claude-code/auth-status.json). `session_id` is what makes a file a snapshot,
+    so requiring it is both the contract check and the sidecar filter."""
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict) or not payload.get("session_id"):
+        return None
+    return payload
+
+
+def newest_session():
+    """Session id of the most recent snapshot in the partition, or None."""
+    best = None
+    for path in _data_dir().glob("*/*.json"):
+        payload = load_snapshot(path)
+        if payload is None:
+            continue
+        try:
+            # Ordering only, so mtime is a fair stand-in for a snapshot written
+            # before `updated_at` existed. A reported AGE is not: see reading_age.
+            when = payload.get("updated_at") or path.stat().st_mtime
+        except OSError:
+            continue
+        if best is None or when > best[0]:
+            best = (when, payload["session_id"])
+    return best[1] if best else None
+
+
 def resolve_session(arg):
-    """Return (session_id, source). Positional arg > env > newest snapshot."""
+    """Return (session_id, source). Positional arg > env > most recent snapshot."""
     if arg:
         return arg, "argument"
     for var in ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID"):
         v = os.environ.get(var)
         if v:
             return v, var
-    snaps = sorted(_data_dir().glob("*.json"),
-                   key=lambda p: p.stat().st_mtime, reverse=True)
-    if snaps:
-        return snaps[0].stem, "newest-snapshot"
+    sid = newest_session()
+    return (sid, "newest-snapshot") if sid else (None, None)
+
+
+def find_snapshot(sid):
+    """The snapshot for one session id, in whichever producer directory holds it.
+
+    The producer level is globbed, not named: a session id is unique, so which
+    program wrote the file is not part of its identity, and a harness added later
+    is found for free (docs/telemetry-snapshots.md). Only the producer level is
+    a wildcard - the id is escaped, so a target of `*` finds nothing rather than
+    quietly reporting on whichever session sorts first."""
+    for path in sorted(_data_dir().glob(f"*/{glob.escape(sid)}.json")):
+        payload = load_snapshot(path)
+        if payload is not None:
+            return path, payload
     return None, None
 
 
-def snapshot_path(sid):
-    return _data_dir() / f"{sid}.json"
+def reading_age(payload):
+    """Seconds since the reading was taken, or None when the snapshot says.
+
+    Deliberately no mtime fallback. Snapshots are portable between machines, so
+    mtime can be the time of a copy rather than of a reading, and a stale reading
+    that looks fresh is worse than one that admits it does not know."""
+    when = payload.get("updated_at")
+    return None if when is None else time.time() - when
 
 
 def humanize(n):
@@ -107,9 +161,15 @@ def metrics(payload):
     return {"pct": pct, "used": used, "size": size}
 
 
+AGE_UNKNOWN = "unknown"
+
+
 def summary(m, age=None):
+    """One usage line. `age` is seconds, AGE_UNKNOWN, or None to omit it."""
     parts = [f"{m['pct']:.0f}% ({humanize(m['used'])}/{humanize(m['size'])})"]
-    if age is not None:
+    if age == AGE_UNKNOWN:
+        parts.append("snapshot age unknown")
+    elif age is not None:
         parts.append(f"snapshot {fmt_elapsed(age)} old")
     return " | ".join(parts)
 
@@ -120,19 +180,19 @@ def cmd_status(args):
         print("No session id and no snapshots in data dir "
               "-- is the statusLine side-write installed?", file=sys.stderr)
         return 1
-    path = snapshot_path(sid)
-    if not path.exists():
+    path, payload = find_snapshot(sid)
+    if payload is None:
         print("No snapshot yet. The statusLine side-write may not be wired up "
               "(see skills/token-aware/SKILL.md Setup) or no render has fired "
               "since this session started.")
         return 0
-    m = metrics(json.loads(path.read_text()))
+    m = metrics(payload)
     if m is None:
         print("Snapshot has no context_window data yet "
               "(fresh session or just compacted)")
         return 0
-    age = time.time() - path.stat().st_mtime
-    print(summary(m, age))
+    age = reading_age(payload)
+    print(summary(m, AGE_UNKNOWN if age is None else age))
     return 0
 
 
@@ -145,15 +205,17 @@ def cmd_watch(args):
 
     thresholds = sorted(set(args.thresholds)) if args.thresholds else list(DEFAULT_THRESHOLDS)
 
-    path = snapshot_path(sid)
     prev = None
     armed = set()
     waiting = False
+    path = None
     while True:
-        try:
-            m = metrics(json.loads(path.read_text())) if path.exists() else None
-        except (ValueError, OSError):
-            m = None
+        # Re-resolve until a snapshot exists: watch may start before the session
+        # has written its first one, and only then is its producer known.
+        payload = load_snapshot(path) if path else None
+        if payload is None:
+            path, payload = find_snapshot(sid)
+        m = metrics(payload) if payload else None
         now = time.time()
 
         if m is None:
