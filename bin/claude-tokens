@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""claude-tokens - report or watch an agent session's context/token usage.
+"""claude-tokens - report or watch agent sessions' context/token usage.
 
 See skills/token-aware/SKILL.md for usage.
 
@@ -8,12 +8,12 @@ $CCCP_PLUGIN_DATA/telemetry/<v-major|inline>/<producer>/<session_id>.json -
 tree, field contract and the reason for the producer glob are in
 docs/telemetry-snapshots.md. bin/cccp-statusline writes the Claude Code ones.
 'status' prints a one-shot summary; 'watch' streams milestone events for the
-Monitor tool. Session id resolves from the optional positional arg, else
-$CLAUDE_CODE_SESSION_ID, else the most recent snapshot on disk.
+Monitor tool. Both take any number of targets - session ids or comrade ids (see
+match_target) - and answer for each in one process off one directory scan. With
+no target at all: $CLAUDE_CODE_SESSION_ID, else the most recent snapshot.
 """
 
 import argparse
-import glob
 import json
 import os
 import re
@@ -70,13 +70,26 @@ def load_snapshot(path):
     return payload
 
 
-def newest_session():
-    """Session id of the most recent snapshot in the partition, or None."""
-    best = None
+def scan():
+    """Every snapshot in the partition, as (path, payload).
+
+    One pass, however many targets are being answered for: the alternative is a
+    directory scan per target, which is what made watching a fleet cost a process
+    per member. Producer directories are globbed rather than named - a session id
+    is unique, so which program wrote the file is not part of its identity, and a
+    harness added later is found for free (docs/telemetry-snapshots.md)."""
+    snaps = []
     for path in _data_dir().glob("*/*.json"):
         payload = load_snapshot(path)
-        if payload is None:
-            continue
+        if payload is not None:
+            snaps.append((path, payload))
+    return snaps
+
+
+def newest_session(snaps):
+    """Session id of the most recent snapshot, or None when there are none."""
+    best = None
+    for path, payload in snaps:
         try:
             # Ordering only, so mtime is a fair stand-in for a snapshot written
             # before `updated_at` existed. A reported AGE is not: see reading_age.
@@ -88,31 +101,50 @@ def newest_session():
     return best[1] if best else None
 
 
-def resolve_session(arg):
-    """Return (session_id, source). Positional arg > env > most recent snapshot."""
-    if arg:
-        return arg, "argument"
+def resolve_targets(given, snaps):
+    """What to report on: what was asked for, else this session, else the newest.
+
+    An empty list means there was nothing to report on and nothing to guess."""
+    if given:
+        return given
     for var in ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID"):
         v = os.environ.get(var)
         if v:
-            return v, var
-    sid = newest_session()
-    return (sid, "newest-snapshot") if sid else (None, None)
+            return [v]
+    sid = newest_session(snaps)
+    return [sid] if sid else []
 
 
-def find_snapshot(sid):
-    """The snapshot for one session id, in whichever producer directory holds it.
+COMRADE_TAIL = re.compile(r"(cc|pi)-([0-9a-f]{6})", re.I)
 
-    The producer level is globbed, not named: a session id is unique, so which
-    program wrote the file is not part of its identity, and a harness added later
-    is found for free (docs/telemetry-snapshots.md). Only the producer level is
-    a wildcard - the id is escaped, so a target of `*` finds nothing rather than
-    quietly reporting on whichever session sorts first."""
-    for path in sorted(_data_dir().glob(f"*/{glob.escape(sid)}.json")):
-        payload = load_snapshot(path)
-        if payload is not None:
-            return path, payload
-    return None, None
+
+def match_target(target, snaps):
+    """The snapshots one target names, as a list of (path, payload).
+
+    A target is either a full session id, matched exactly, or a comrade id whose
+    6-hex tail is an anchored match - and the two harnesses anchor at OPPOSITE
+    ends, because they derive that tail differently: `cc-` from the first 6 chars
+    of the session id (bin/cccp comrade_id), `pi-` from the last 6 hex of it,
+    since Pi session ids are UUIDv7 and siblings share a leading timestamp
+    (integrations/pi/cccp-comrade.ts resolveEnvironment). Keeping that rule here
+    is the point of accepting comrade ids: every caller was hand-rolling it as a
+    shell pipeline, and one of the two anchors is backwards from the obvious.
+
+    Any `user@host:` head is dropped. Snapshots are portable between machines by
+    design, so the host a file sits on is not a reliable filter on whose reading
+    it holds."""
+    tail = target.rsplit(":", 1)[-1]
+    m = COMRADE_TAIL.fullmatch(tail)
+    if not m:
+        return [(p, s) for p, s in snaps if s["session_id"] == target]
+    harness, want = m.group(1).lower(), m.group(2).lower()
+    hits = []
+    for path, payload in snaps:
+        sid = str(payload["session_id"])
+        got = sid[:6] if harness == "cc" else sid.replace("-", "")[-6:]
+        if got.lower() == want:
+            hits.append((path, payload))
+    return hits
 
 
 def reading_age(payload):
@@ -123,6 +155,32 @@ def reading_age(payload):
     that looks fresh is worse than one that admits it does not know."""
     when = payload.get("updated_at")
     return None if when is None else time.time() - when
+
+
+def report(target, snaps):
+    """What one target resolves to: a reading, or why there is not one.
+
+    Both counts an anchored match can get wrong are named rather than papered
+    over. Zero is `no snapshot`; more than one is `ambiguous`, never the first
+    hit - 6 hex is short enough to collide as snapshots accumulate, and silently
+    answering for the wrong session is the failure worth avoiding here."""
+    r = {"target": target}
+    hits = match_target(target, snaps)
+    if not hits:
+        return dict(r, error="no snapshot")
+    if len(hits) > 1:
+        return dict(r, error="ambiguous",
+                    matches=sorted(s["session_id"] for _, s in hits))
+    path, payload = hits[0]
+    r.update(session_id=payload["session_id"],
+             session_name=payload.get("session_name"),
+             producer=path.parent.name,
+             model=(payload.get("model") or {}).get("display_name"))
+    m = metrics(payload)
+    if m is None:
+        return dict(r, error="no reading")
+    return dict(r, **m, updated_at=payload.get("updated_at"),
+                age=reading_age(payload))
 
 
 def humanize(n):
@@ -174,100 +232,160 @@ def summary(m, age=None):
     return " | ".join(parts)
 
 
+def status_line(r, terse):
+    """One target's reading, or the reason there is not one, as text.
+
+    `terse` is on once targets are labelled: a setup hint is worth spelling out
+    when a session asks about itself, and is noise repeated down a fleet."""
+    err = r.get("error")
+    if err == "ambiguous":
+        return (f"ambiguous: {len(r['matches'])} match ("
+                + ", ".join(sid[:8] + "\u2026" for sid in r["matches"]) + ")")
+    if err == "no snapshot":
+        return "no snapshot" if terse else (
+            "No snapshot yet. The statusLine side-write may not be wired up "
+            "(see skills/token-aware/SKILL.md Setup) or no render has fired "
+            "since this session started.")
+    if err == "no reading":
+        return "no reading yet" if terse else (
+            "Snapshot has no context_window data yet "
+            "(fresh session or just compacted)")
+    age = r.get("age")
+    return summary(r, AGE_UNKNOWN if age is None else age)
+
+
+def no_targets(stream):
+    """Nothing named, nothing in the env, nothing on disk to fall back to.
+
+    `watch` says this on stdout because that is the stream the Monitor tool
+    reads; `status` keeps it on stderr, where a shell caller expects it."""
+    print("No session id and no snapshots in data dir "
+          "-- is the statusLine side-write installed?", file=stream, flush=True)
+    return 1
+
+
 def cmd_status(args):
-    sid, source = resolve_session(args.session)
-    if not sid:
-        print("No session id and no snapshots in data dir "
-              "-- is the statusLine side-write installed?", file=sys.stderr)
-        return 1
-    path, payload = find_snapshot(sid)
-    if payload is None:
-        print("No snapshot yet. The statusLine side-write may not be wired up "
-              "(see skills/token-aware/SKILL.md Setup) or no render has fired "
-              "since this session started.")
+    snaps = scan()
+    targets = resolve_targets(args.sessions, snaps)
+    if not targets:
+        return no_targets(sys.stderr)
+    results = [report(t, snaps) for t in targets]
+    if args.json:
+        print(json.dumps(results, indent=2))
         return 0
-    m = metrics(payload)
-    if m is None:
-        print("Snapshot has no context_window data yet "
-              "(fresh session or just compacted)")
-        return 0
-    age = reading_age(payload)
-    print(summary(m, AGE_UNKNOWN if age is None else age))
+    # One target is answering about itself and needs no label, which also keeps
+    # the single-session output the token-aware skill documents byte-identical.
+    label = len(results) > 1
+    for r in results:
+        line = status_line(r, terse=label)
+        print(f"{r['target']}: {line}" if label else line)
     return 0
 
 
+def advance(w, r, now, thresholds):
+    """Fold one reading into one target's watch, yielding the events it earns.
+
+    A problem is announced when it starts, not every poll: a fleet watch that
+    reprinted `no snapshot` per target per interval would bury the crossings it
+    exists to surface."""
+    if "pct" not in r:
+        if r.get("error") != w["problem"]:
+            w["problem"] = r.get("error")
+            yield dict(r, event="waiting")
+        return
+    w["problem"] = None
+
+    if w["prev"] is None:
+        yield dict(r, event="start")
+        w["prev"] = {"t": now, "pct": r["pct"], "used": r["used"]}
+        w["armed"] = {t for t in thresholds if r["pct"] >= t}
+        return
+
+    for t in thresholds:
+        if t in w["armed"] or r["pct"] < t:
+            continue
+        w["armed"].add(t)
+        prev = w["prev"]
+        dt = now - prev["t"]
+        vel = (r["used"] - prev["used"]) / dt * 60 if dt > 0 else 0
+        etas = {}
+        if vel > 0:
+            for x in (x for x in thresholds if x > t):
+                want = x / 100 * r["size"]
+                if want > r["used"]:
+                    etas[x] = (want - r["used"]) / vel * 60
+        yield dict(r, event="crossed", threshold=t, since_seconds=dt,
+                   since_pct=prev["pct"], since_used=prev["used"],
+                   velocity_per_min=vel, eta_seconds=etas)
+        w["prev"] = {"t": now, "pct": r["pct"], "used": r["used"]}
+
+
+def watch_line(e):
+    """One watch event as text, without its label."""
+    if e["event"] == "waiting":
+        if e.get("error") == "no snapshot":
+            return "Waiting for first snapshot..."
+        if e.get("error") == "no reading":
+            return "Waiting for first reading..."
+        return status_line(e, terse=True)
+    if e["event"] == "start":
+        return "Start watch: " + summary(e)
+    etas = ", ".join(f"to {x:g}% ~{fmt_elapsed(secs)}"
+                     for x, secs in e["eta_seconds"].items())
+    return (f"Crossed {e['threshold']:g}%: {summary(e)} "
+            f"(+{fmt_elapsed(e['since_seconds'])} since "
+            f"{e['since_pct']:.0f}%/{humanize(e['since_used'])}, "
+            f"~{humanize(e['velocity_per_min'])}/min avg"
+            + (f", ETA {etas}" if etas else "") + ")")
+
+
 def cmd_watch(args):
-    sid, source = resolve_session(args.session)
-    if not sid:
-        print("No session id and no snapshots in data dir "
-              "-- is the statusLine side-write installed?", flush=True)
-        return 1
-
+    targets = resolve_targets(args.sessions, scan())
+    if not targets:
+        return no_targets(sys.stdout)
     thresholds = sorted(set(args.thresholds)) if args.thresholds else list(DEFAULT_THRESHOLDS)
+    # A list, not a dict: the same target twice is a caller's business, not a
+    # collision to silently collapse.
+    watches = [{"target": t, "prev": None, "armed": set(), "problem": None}
+               for t in targets]
+    label = len(watches) > 1
 
-    prev = None
-    armed = set()
-    waiting = False
-    path = None
     while True:
-        # Re-resolve until a snapshot exists: watch may start before the session
-        # has written its first one, and only then is its producer known.
-        payload = load_snapshot(path) if path else None
-        if payload is None:
-            path, payload = find_snapshot(sid)
-        m = metrics(payload) if payload else None
+        # Re-scanned every poll: a session that has not written its first
+        # snapshot yet, or writes it from a producer directory nobody named, is
+        # picked up whenever it appears.
+        snaps = scan()
         now = time.time()
-
-        if m is None:
-            if not waiting:
-                print("Waiting for first snapshot...",
-                      flush=True)
-                waiting = True
-            time.sleep(args.interval)
-            continue
-
-        if prev is None:
-            print("Start watch: " + summary(m), flush=True)
-            prev = {"t": now, "pct": m["pct"], "used": m["used"]}
-            armed = {t for t in thresholds if m["pct"] >= t}
-            time.sleep(args.interval)
-            continue
-
-        for t in thresholds:
-            if t in armed or m["pct"] < t:
-                continue
-            armed.add(t)
-            dt = now - prev["t"]
-            vel = (m["used"] - prev["used"]) / dt * 60 if dt > 0 else 0
-            etas = []
-            if vel > 0:
-                for x in (x for x in thresholds if x > t):
-                    target = x / 100 * m["size"]
-                    if target > m["used"]:
-                        etas.append(f"to {x:g}% ~{fmt_elapsed((target - m['used']) / vel * 60)}")
-            eta = f", ETA {', '.join(etas)}" if etas else ""
-            print(f"Crossed {t:g}%: {summary(m)} "
-                  f"(+{fmt_elapsed(dt)} since {prev['pct']:.0f}%/{humanize(prev['used'])}, "
-                  f"~{humanize(vel)}/min avg{eta})", flush=True)
-            prev = {"t": now, "pct": m["pct"], "used": m["used"]}
-
+        for w in watches:
+            for e in advance(w, report(w["target"], snaps), now, thresholds):
+                if args.json:
+                    print(json.dumps(e), flush=True)
+                else:
+                    line = watch_line(e)
+                    print(f"{e['target']}: {line}" if label else line, flush=True)
         time.sleep(args.interval)
 
 
+TARGET_HELP = ("Session id or comrade id (`user@host:cc-4f2a1b`, `pi-99ff01`); "
+               "repeatable (default: $CLAUDE_CODE_SESSION_ID)")
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Report or watch this session's token usage")
+    ap = argparse.ArgumentParser(description="Report or watch context/token usage")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("status", help="Print a one-shot usage summary")
-    s.add_argument("session", nargs="?", help="Session id (default: $CLAUDE_CODE_SESSION_ID)")
+    s.add_argument("sessions", nargs="*", metavar="TARGET", help=TARGET_HELP)
+    s.add_argument("--json", action="store_true", help="Emit one JSON array of results")
     s.set_defaults(func=cmd_status)
 
     w = sub.add_parser("watch", help="Stream milestone events for the Monitor tool")
-    w.add_argument("session", nargs="?", help="Session id (default: $CLAUDE_CODE_SESSION_ID)")
+    w.add_argument("sessions", nargs="*", metavar="TARGET", help=TARGET_HELP)
     w.add_argument("--interval", type=float, default=5.0, help="Poll seconds (default 5)")
     w.add_argument("--threshold", "-t", type=float, action="append", dest="thresholds",
                    metavar="PCT", help="Milestone percent to alert on; repeatable "
                    "(default: 50 75 90 95)")
+    w.add_argument("--json", action="store_true", help="Emit one JSON object per event")
     w.set_defaults(func=cmd_watch)
 
     args = ap.parse_args()
