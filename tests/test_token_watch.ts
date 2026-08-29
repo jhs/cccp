@@ -54,9 +54,15 @@ test("reminders survive the compaction re-arm, which is when they matter most", 
 
 test("priming names the thresholds it skipped so none is lost silently", () => {
   const watch = new TokenWatch(at(25, 50, 90));
-  assert.deepEqual(watch.prime(62), [25, 50]);
+  assert.deepEqual(watch.prime(62), at(25, 50));
   assert.deepEqual(watch.crossed(62), []);
   assert.deepEqual(watch.crossed(91), at(90));
+});
+
+test("a skipped threshold comes back with its reminder, not just its percentage", () => {
+  // Being told something was lost without being told what is the same silent loss.
+  const watch = new TokenWatch([{ percent: 25, reminder: "check status of Foo Bar" }, { percent: 90, reminder: "prepare to terminate" }]);
+  assert.deepEqual(watch.prime(62), [{ percent: 25, reminder: "check status of Foo Bar" }]);
 });
 
 test("priming on an unreadable percentage skips nothing", () => {

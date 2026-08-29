@@ -22,13 +22,18 @@ export class TokenWatch {
     return this.thresholds.map((threshold) => threshold.percent);
   }
 
-  /** Establish a starting point without reporting thresholds already passed, and name the ones skipped. */
-  prime(percent: number | null): number[] {
+  /**
+   * Establish a starting point without reporting thresholds already passed, and return the ones skipped.
+   *
+   * They come back whole, reminder included, rather than as bare percentages: a caller told only that "25%
+   * already passed" knows it lost something but not what, which is the silent loss this all exists to prevent.
+   */
+  prime(percent: number | null): Threshold[] {
     if (percent === null || !Number.isFinite(percent) || percent < 0) return [];
-    const passed: number[] = [];
-    for (const { percent: threshold } of this.thresholds) {
-      if (percent >= threshold) {
-        this.fired.add(threshold);
+    const passed: Threshold[] = [];
+    for (const threshold of this.thresholds) {
+      if (percent >= threshold.percent) {
+        this.fired.add(threshold.percent);
         passed.push(threshold);
       }
     }

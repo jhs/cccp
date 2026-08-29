@@ -398,10 +398,26 @@ class ReminderPlayback(TreeCase):
         self.assertEqual(self.crossing("do the thing")[-1]["reminder"], "do the thing")
 
     def test_a_breakpoint_below_the_starting_reading_is_reported_as_never_firing(self):
-        start = self.crossing("too late", pct=20)[0]
-        self.assertEqual(start["already_passed"], [20.0])
+        start = self.crossing("check status of Foo Bar", pct=20)[0]
+        # Whole, not just the percentage: being told something was lost without
+        # being told what is the same silent loss, moved to the other end of the run.
+        self.assertEqual(start["already_passed"],
+                         [{"threshold": 20.0, "reminder": "check status of Foo Bar"}])
         self.assertEqual(claude_tokens.watch_line(start),
-                         "Start watch: 38% (76k/200k) | 20% already passed, will not fire")
+                         "Start watch: 38% (76k/200k) | SET TOO LATE, WILL NOT FIRE: "
+                         "20% check status of Foo Bar")
+
+    def test_skipped_breakpoints_are_echoed_as_the_caller_wrote_them(self):
+        w = {"target": "t", "prev": None, "armed": set(), "problem": None}
+        plan = {10.0: None, 20.0: "check status of Foo Bar", 90.0: "prepare to terminate"}
+        start = next(claude_tokens.advance(
+            w, claude_tokens.report(CC_SID, claude_tokens.scan()), 1_000.0, plan))
+        # `PCT[ REMINDER]` each - the --threshold arguments handed straight back,
+        # so the words are recognisably the caller's own. `;` separates, because a
+        # reminder is free to contain a comma.
+        self.assertEqual(claude_tokens.watch_line(start),
+                         "Start watch: 38% (76k/200k) | SET TOO LATE, WILL NOT FIRE: "
+                         "10%; 20% check status of Foo Bar")
 
     def test_a_start_below_every_breakpoint_says_nothing_extra(self):
         start = self.crossing("in good time")[0]

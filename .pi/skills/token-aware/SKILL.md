@@ -20,7 +20,7 @@ Call `token_watch` to opt in to notifications after future turns cross a context
 - A crossing reports the current usage, elapsed time and usage velocity since the prior reading, ETAs for later milestones, and the reminder if the milestone carried one.
 - A `reminder` is your own note to your future self, played back verbatim at the end of the crossing line behind `| REMINDER:`. Write it as an instruction rather than a label — `prepare to terminate`, not `nearly full` — because that line is all you get, and it matters most after a compaction, which re-arms every milestone and takes the surrounding plan out of your context at the same time.
 - A percentage repeated, or outside 0 to 100, fails the call instead of quietly narrowing the watch. Fix it and call again.
-- A milestone below the reading the watch starts at never fires; the opening line names it rather than leaving you expecting it.
+- A milestone below the reading the watch starts at never fires. The opening line hands those back with their reminders — `SET TOO LATE, WILL NOT FIRE: 25%; 50% check status of Foo Bar` — so you can see what is not coming and reissue anything that still matters at a percentage you have not reached.
 
 Call `token_watch` with `enabled: false` when monitoring is no longer wanted. It sends no more notifications until you start it again.
 

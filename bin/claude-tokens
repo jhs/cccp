@@ -341,9 +341,14 @@ def advance(w, r, now, plan):
 
     if w["prev"] is None:
         # Armed before the event is yielded, because breakpoints this session
-        # started too late to see are part of what the start line reports.
+        # started too late to see are part of what the start line reports - and
+        # they are reported with their reminders, not just their percentages. A
+        # caller told only that "25% already passed" has been told it lost
+        # something without being told what, which is the silent loss this
+        # feature exists to prevent, merely moved to the other end of the run.
         w["armed"] = {t for t in plan if r["pct"] >= t}
-        yield dict(r, event="start", already_passed=sorted(w["armed"]))
+        yield dict(r, event="start",
+                   already_passed=[{"threshold": t, "reminder": plan[t]} for t in sorted(w["armed"])])
         w["prev"] = {"t": now, "pct": r["pct"], "used": r["used"]}
         return
 
@@ -381,8 +386,14 @@ def watch_line(e):
         # A breakpoint below where the watch started never speaks. Saying so once
         # is the difference between an agent knowing an instruction is not coming
         # and assuming one is: see the `ambiguous` case for the same instinct.
+        # Each is echoed as the caller wrote it - `PCT[ REMINDER]`, its own
+        # --threshold argument handed back - so the words are recognisably its
+        # own, and "SET TOO LATE" says whose fault that is without shouting the
+        # instruction itself, which is the one thing here that will not happen.
         if e["already_passed"]:
-            line += " | " + ", ".join(f"{t:g}%" for t in e["already_passed"]) + " already passed, will not fire"
+            entries = "; ".join(f"{p['threshold']:g}%" + (f" {p['reminder']}" if p["reminder"] else "")
+                                for p in e["already_passed"])
+            line += f" | SET TOO LATE, WILL NOT FIRE: {entries}"
         return line
     etas = ", ".join(f"to {x:g}% ~{fmt_elapsed(secs)}"
                      for x, secs in e["eta_seconds"].items())

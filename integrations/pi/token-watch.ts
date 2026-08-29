@@ -1,7 +1,7 @@
 /** On-demand context status and milestone watch for Pi. */
 import { Type } from "typebox";
 import type { ContextUsage, ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { TokenWatch } from "./token-watch-core.ts";
+import { TokenWatch, type Threshold } from "./token-watch-core.ts";
 import * as telemetry from "./telemetry.ts";
 
 type Reading = { time: number; percent: number; tokens: number; contextWindow: number };
@@ -33,10 +33,16 @@ function summary(value: Reading): string {
   return `${Math.round(value.percent)}% (${humanize(value.tokens)}/${humanize(value.contextWindow)})`;
 }
 
-/** The opening line, naming any breakpoint the watch started above — one that is never going to speak. */
-function startLine(value: Reading, passed: number[]): string {
-  const skipped = passed.length ? ` | ${passed.map((percent) => `${percent}%`).join(", ")} already passed, will not fire` : "";
-  return `Start watch: ${summary(value)}${skipped}`;
+/**
+ * The opening line, naming any breakpoint the watch started above — one that is never going to speak.
+ *
+ * Each is echoed with its reminder, in the caller's own words, so what is being lost is legible rather than
+ * merely counted; "SET TOO LATE" says why without shouting the instruction, which is the one thing here that
+ * is not going to happen. Worded as `bin/claude-tokens` words it.
+ */
+function startLine(value: Reading, passed: Threshold[]): string {
+  const entries = passed.map(({ percent, reminder }) => (reminder ? `${percent}% ${reminder}` : `${percent}%`)).join("; ");
+  return `Start watch: ${summary(value)}${passed.length ? ` | SET TOO LATE, WILL NOT FIRE: ${entries}` : ""}`;
 }
 
 /** A crossing, worded exactly as `bin/claude-tokens watch` words it: one grammar, two harnesses, one thing to document. */

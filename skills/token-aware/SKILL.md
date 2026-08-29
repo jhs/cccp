@@ -80,11 +80,13 @@ Write reminders as instructions rather than labels — `prepare to terminate`, n
 
 Two inputs are refused rather than absorbed, both because the alternative is losing an instruction quietly: the same percentage given twice (deduplicating would drop one of the reminders, and you would not discover it until the crossing it was meant to speak at), and a `--threshold` that does not begin with a number. Both fail immediately — correct the command and rerun it.
 
-A milestone below the reading the watch starts at can never fire. The start line names it, rather than leaving you to wait for something that is not coming:
+A milestone below the reading the watch starts at can never fire. The start line hands those back to you — each one written as you wrote it, reminder and all, so you can see what is not coming rather than merely being told how many:
 
 ```
-Start watch: 62% (620.1k/1M) | 25%, 50% already passed, will not fire
+Start watch: 62% (620.1k/1M) | SET TOO LATE, WILL NOT FIRE: 25%; 50% check status of Foo Bar
 ```
+
+Reissue anything there that still matters, at a percentage you have not reached yet.
 
 ## Reporting on other comrades
 
