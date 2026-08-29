@@ -53,10 +53,37 @@ Crossed 20%: 20% (196.0k/1M) (+12h39m since 8%/82.9k, ~149/min avg, ETA to 50% ~
 Crossed 50%: 50% (495.1k/1M) (+48h54m since 20%/196.0k, ~102/min avg, ETA to 70% ~33h30m, to 85% ~58h02m, to 92% ~69h29m, to 95% ~84h23m)
 ```
 
-Milestones default to 50/75/90/95%. Override them with one or more `--threshold PCT` (repeatable):
+Milestones default to 50/75/90/95%. Override them with one or more `--threshold` (repeatable), each written as `PCT[% REMINDER]`:
 
 ```bash
 claude-tokens watch --threshold 80 --threshold 95
+```
+
+### Reminders
+
+A milestone can carry a **reminder**: your own note to your future self, played back verbatim when that milestone is crossed. Everything after the percentage is the reminder, so there is no separator to escape:
+
+```bash
+claude-tokens watch \
+  --threshold '50% check status of Foo Bar' \
+  --threshold '75% show debugging report to user' \
+  --threshold '90% prepare to terminate'
+```
+
+It arrives at the end of the crossing line, behind a shouted label:
+
+```
+Crossed 90%: 90% (900.4k/1M) (+12m since 75%/750.2k, ~205/min avg, ETA to 97% ~9m) | REMINDER: prepare to terminate
+```
+
+Write reminders as instructions rather than labels — `prepare to terminate`, not `nearly full` — because that one line is all you get, possibly hours later and possibly after a compaction has taken the surrounding plan out of your context. Set them when you start the watch, while you still know what each milestone was for.
+
+Two inputs are refused rather than absorbed, both because the alternative is losing an instruction quietly: the same percentage given twice (deduplicating would drop one of the reminders, and you would not discover it until the crossing it was meant to speak at), and a `--threshold` that does not begin with a number. Both fail immediately — correct the command and rerun it.
+
+A milestone below the reading the watch starts at can never fire. The start line names it, rather than leaving you to wait for something that is not coming:
+
+```
+Start watch: 62% (620.1k/1M) | 25%, 50% already passed, will not fire
 ```
 
 ## Reporting on other comrades

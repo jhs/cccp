@@ -114,7 +114,10 @@ stalled comrade — nobody can tell "thinking" from "dead" from the outside.
 streams milestone notifications (50/75/90/95%) via the Monitor tool during
 long-running work, so a comrade knows when to wrap a lane, write a hand-off
 note, and go quiet on its own terms — matching the `team` skill's wind-down
-norms — instead of running out entirely.
+norms — instead of running out entirely. Each milestone can carry a reminder
+(`--threshold '90% prepare to terminate'`) that is played back when it is
+crossed, so the intended action arrives together with the warning rather than
+having to be remembered.
 
 It requires a one-time setup, to use Claude Code's `statusLine` feature,
 which the skill walks through on first use.

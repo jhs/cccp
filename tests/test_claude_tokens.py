@@ -312,6 +312,103 @@ class WatchOutput(TreeCase):
         self.assertGreater(crossed["velocity_per_min"], 0)
 
 
+class ThresholdSpecs(unittest.TestCase):
+    """The `PCT[% REMINDER]` grammar and the plan it builds."""
+
+    def parse(self, spec):
+        return claude_tokens.parse_threshold(spec)
+
+    def test_a_bare_percent_is_an_unlabelled_breakpoint(self):
+        for spec in ("90", "90%", " 90 % ", "90.5"):
+            self.assertEqual(self.parse(spec)[1], None, spec)
+        self.assertEqual(self.parse("90.5")[0], 90.5)
+
+    def test_everything_after_the_percent_is_the_reminder(self):
+        self.assertEqual(self.parse("90% prepare to terminate"),
+                         (90.0, "prepare to terminate"))
+        # No separator punctuation to escape, so a reminder is free to contain any.
+        self.assertEqual(self.parse("50% check Foo: then Bar | not Baz")[1],
+                         "check Foo: then Bar | not Baz")
+        # The percent sign is the agent's habit, not the grammar's requirement.
+        self.assertEqual(self.parse("50 check status")[1], "check status")
+
+    def test_a_reminder_that_trails_off_to_nothing_is_simply_unlabelled(self):
+        self.assertEqual(self.parse("90%   ")[1], None)
+
+    def test_a_percent_outside_the_window_is_refused(self):
+        for spec in ("0", "0%", "101", "120% too late"):
+            with self.assertRaises(claude_tokens.argparse.ArgumentTypeError, msg=spec):
+                self.parse(spec)
+
+    def test_something_that_does_not_start_with_a_number_is_refused(self):
+        for spec in ("", "ninety", "prepare to terminate"):
+            with self.assertRaises(claude_tokens.argparse.ArgumentTypeError, msg=spec):
+                self.parse(spec)
+
+    def test_the_plan_is_ordered_by_percent_whatever_order_it_was_given(self):
+        plan = claude_tokens.threshold_plan(
+            [(90.0, "prepare to terminate"), (50.0, None), (75.0, "report")])
+        self.assertEqual(list(plan), [50.0, 75.0, 90.0])
+        self.assertEqual(plan[90.0], "prepare to terminate")
+
+    def test_a_repeated_percent_is_fatal_rather_than_deduplicated(self):
+        # Both reminders survive to the crossing, or the command is refused. What
+        # must not happen is one of them being dropped and the run continuing.
+        for specs in ([(90.0, "first"), (90.0, "second")],
+                      [(90.0, None), (90.0, None)],
+                      [(90.0, "text"), (90.0, None)]):
+            with self.assertRaises(SystemExit) as caught:
+                claude_tokens.threshold_plan(specs)
+            self.assertEqual(caught.exception.code, 1)
+
+
+class ReminderPlayback(TreeCase):
+    """What a labelled breakpoint puts on the line, and where."""
+
+    def crossing(self, reminder, pct=90):
+        # Re-seeded per call, so a test may build two independent climbs.
+        self.write("claude-code", CC_SID, snapshot(CC_SID, pct=38, used=76_000))
+        w = {"target": "t", "prev": None, "armed": set(), "problem": None}
+        r = claude_tokens.report(CC_SID, claude_tokens.scan())
+        plan = {float(pct): reminder}
+        events = list(claude_tokens.advance(w, r, 1_000.0, plan))
+        self.write("claude-code", CC_SID, snapshot(CC_SID, pct=pct, used=pct * 2_000))
+        r = claude_tokens.report(CC_SID, claude_tokens.scan())
+        events += list(claude_tokens.advance(w, r, 1_060.0, plan))
+        return events
+
+    def setUp(self):
+        super().setUp()
+        self.write("claude-code", CC_SID, snapshot(CC_SID, pct=38, used=76_000))
+
+    def test_the_reminder_lands_last_behind_a_shouted_label(self):
+        crossed = self.crossing("prepare to terminate")[-1]
+        line = claude_tokens.watch_line(crossed)
+        self.assertTrue(line.startswith("Crossed 90%: 90% (180k/200k) (+"), line)
+        self.assertTrue(line.endswith(" | REMINDER: prepare to terminate"), line)
+
+    def test_an_unlabelled_crossing_is_worded_exactly_as_it_always_was(self):
+        line = claude_tokens.watch_line(self.crossing(None)[-1])
+        self.assertNotIn("REMINDER", line)
+        self.assertTrue(line.endswith(")"), line)
+
+    def test_the_event_always_carries_a_reminder_key(self):
+        # A --json consumer must never have to tell a missing key from no reminder.
+        self.assertIsNone(self.crossing(None)[-1]["reminder"])
+        self.assertEqual(self.crossing("do the thing")[-1]["reminder"], "do the thing")
+
+    def test_a_breakpoint_below_the_starting_reading_is_reported_as_never_firing(self):
+        start = self.crossing("too late", pct=20)[0]
+        self.assertEqual(start["already_passed"], [20.0])
+        self.assertEqual(claude_tokens.watch_line(start),
+                         "Start watch: 38% (76k/200k) | 20% already passed, will not fire")
+
+    def test_a_start_below_every_breakpoint_says_nothing_extra(self):
+        start = self.crossing("in good time")[0]
+        self.assertEqual(start["already_passed"], [])
+        self.assertEqual(claude_tokens.watch_line(start), "Start watch: 38% (76k/200k)")
+
+
 @unittest.skipUnless(shutil.which("jq"), "cccp-statusline needs jq")
 class WriterAgreesWithReader(TreeCase):
     """What cccp-statusline writes is what claude-tokens expects to read."""

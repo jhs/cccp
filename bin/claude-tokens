@@ -54,6 +54,42 @@ def _data_dir():
 
 DEFAULT_THRESHOLDS = (50, 75, 90, 95)
 
+THRESHOLD_SPEC = re.compile(r"\s*(\d+(?:\.\d+)?)\s*%?\s*(.*)", re.S)
+
+
+def parse_threshold(spec):
+    """One `--threshold` value as (percent, reminder or None).
+
+    The grammar is `PCT[%][ REMINDER]` - a number, an optional percent sign, and
+    everything after it is a reminder to be played back when that milestone is
+    crossed. No separator punctuation, so a breakpoint is written the way it
+    would be said (`90% prepare to terminate`), and one whose text trails off to
+    nothing is simply unlabelled rather than an error to explain."""
+    m = THRESHOLD_SPEC.fullmatch(spec)
+    if not m:
+        raise argparse.ArgumentTypeError(f"expected `PCT[%][ REMINDER]`, got {spec!r}")
+    pct = float(m.group(1))
+    if not 0 < pct <= 100:
+        raise argparse.ArgumentTypeError(f"percent must be over 0 and at most 100, got {pct:g}")
+    return pct, (m.group(2).strip() or None)
+
+
+def threshold_plan(specs):
+    """The watch's breakpoints as an ordered {percent: reminder or None}.
+
+    A percent given twice is fatal rather than deduplicated. Collapsing two
+    breakpoints silently drops whichever reminder lost, and a dropped reminder
+    does not go wrong until the crossing it was meant to speak at - by which
+    time the run is hours old. Refusing at parse time costs an agent one
+    corrected command."""
+    plan = {}
+    for pct, reminder in specs:
+        if pct in plan:
+            print(f"--threshold {pct:g} given twice", file=sys.stderr)
+            sys.exit(1)
+        plan[pct] = reminder
+    return dict(sorted(plan.items()))
+
 
 def load_snapshot(path):
     """Parse one snapshot, or None if it is unreadable or not a snapshot.
@@ -290,12 +326,12 @@ def cmd_status(args):
     return 0
 
 
-def advance(w, r, now, thresholds):
+def advance(w, r, now, plan):
     """Fold one reading into one target's watch, yielding the events it earns.
 
-    A problem is announced when it starts, not every poll: a fleet watch that
-    reprinted `no snapshot` per target per interval would bury the crossings it
-    exists to surface."""
+    `plan` is {percent: reminder or None}. A problem is announced when it starts,
+    not every poll: a fleet watch that reprinted `no snapshot` per target per
+    interval would bury the crossings it exists to surface."""
     if "pct" not in r:
         if r.get("error") != w["problem"]:
             w["problem"] = r.get("error")
@@ -304,12 +340,14 @@ def advance(w, r, now, thresholds):
     w["problem"] = None
 
     if w["prev"] is None:
-        yield dict(r, event="start")
+        # Armed before the event is yielded, because breakpoints this session
+        # started too late to see are part of what the start line reports.
+        w["armed"] = {t for t in plan if r["pct"] >= t}
+        yield dict(r, event="start", already_passed=sorted(w["armed"]))
         w["prev"] = {"t": now, "pct": r["pct"], "used": r["used"]}
-        w["armed"] = {t for t in thresholds if r["pct"] >= t}
         return
 
-    for t in thresholds:
+    for t in plan:
         if t in w["armed"] or r["pct"] < t:
             continue
         w["armed"].add(t)
@@ -318,11 +356,13 @@ def advance(w, r, now, thresholds):
         vel = (r["used"] - prev["used"]) / dt * 60 if dt > 0 else 0
         etas = {}
         if vel > 0:
-            for x in (x for x in thresholds if x > t):
+            for x in (x for x in plan if x > t):
                 want = x / 100 * r["size"]
                 if want > r["used"]:
                     etas[x] = (want - r["used"]) / vel * 60
-        yield dict(r, event="crossed", threshold=t, since_seconds=dt,
+        # `reminder` is always present, null when the breakpoint carried none, so
+        # a --json consumer never has to tell a missing key from an unlabelled one.
+        yield dict(r, event="crossed", threshold=t, reminder=plan[t], since_seconds=dt,
                    since_pct=prev["pct"], since_used=prev["used"],
                    velocity_per_min=vel, eta_seconds=etas)
         w["prev"] = {"t": now, "pct": r["pct"], "used": r["used"]}
@@ -337,21 +377,34 @@ def watch_line(e):
             return "Waiting for first reading..."
         return status_line(e, terse=True)
     if e["event"] == "start":
-        return "Start watch: " + summary(e)
+        line = "Start watch: " + summary(e)
+        # A breakpoint below where the watch started never speaks. Saying so once
+        # is the difference between an agent knowing an instruction is not coming
+        # and assuming one is: see the `ambiguous` case for the same instinct.
+        if e["already_passed"]:
+            line += " | " + ", ".join(f"{t:g}%" for t in e["already_passed"]) + " already passed, will not fire"
+        return line
     etas = ", ".join(f"to {x:g}% ~{fmt_elapsed(secs)}"
                      for x, secs in e["eta_seconds"].items())
-    return (f"Crossed {e['threshold']:g}%: {summary(e)} "
+    line = (f"Crossed {e['threshold']:g}%: {summary(e)} "
             f"(+{fmt_elapsed(e['since_seconds'])} since "
             f"{e['since_pct']:.0f}%/{humanize(e['since_used'])}, "
             f"~{humanize(e['velocity_per_min'])}/min avg"
             + (f", ETA {etas}" if etas else "") + ")")
+    # Last, behind the `|` that `status` already separates with, and shouted. The
+    # numbers are why the line is believable; the reminder is the only part that
+    # asks for an action, and the end of a notification is where an agent's
+    # attention actually lands. The caps carry it there - the same device the
+    # logging style guide spends on WARN and ERROR, and it survives being read by
+    # a human in a terminal, which `**bold**` would not.
+    return line + (f" | REMINDER: {e['reminder']}" if e["reminder"] else "")
 
 
 def cmd_watch(args):
     targets = resolve_targets(args.sessions, scan())
     if not targets:
         return no_targets(sys.stdout)
-    thresholds = sorted(set(args.thresholds)) if args.thresholds else list(DEFAULT_THRESHOLDS)
+    plan = threshold_plan(args.thresholds) if args.thresholds else {t: None for t in DEFAULT_THRESHOLDS}
     # A list, not a dict: the same target twice is a caller's business, not a
     # collision to silently collapse.
     watches = [{"target": t, "prev": None, "armed": set(), "problem": None}
@@ -365,7 +418,7 @@ def cmd_watch(args):
         snaps = scan()
         now = time.time()
         for w in watches:
-            for e in advance(w, report(w["target"], snaps), now, thresholds):
+            for e in advance(w, report(w["target"], snaps), now, plan):
                 if args.json:
                     print(json.dumps(e), flush=True)
                 else:
@@ -390,9 +443,9 @@ def main():
     w = sub.add_parser("watch", help="Stream milestone events for the Monitor tool")
     w.add_argument("sessions", nargs="*", metavar="TARGET", help=TARGET_HELP)
     w.add_argument("--interval", type=float, default=5.0, help="Poll seconds (default 5)")
-    w.add_argument("--threshold", "-t", type=float, action="append", dest="thresholds",
-                   metavar="PCT", help="Milestone percent to alert on; repeatable "
-                   "(default: 50 75 90 95)")
+    w.add_argument("--threshold", "-t", type=parse_threshold, action="append", dest="thresholds",
+                   metavar="SPEC", help="Milestone to alert on as `PCT[%% REMINDER]`; repeatable. The reminder, "
+                   "if any, is played back verbatim on the crossing (default: 50 75 90 95, unlabelled)")
     w.add_argument("--json", action="store_true", help="Emit one JSON object per event")
     w.set_defaults(func=cmd_watch)
 

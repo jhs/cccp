@@ -1,11 +1,15 @@
 /** Context-threshold crossing logic for Pi's CCCP token watch. */
+
+/** A breakpoint: the usage percentage that trips it, and the note played back when it does. */
+export type Threshold = { percent: number; reminder?: string };
+
 export const DEFAULT_THRESHOLDS = [50, 75, 90, 95];
 
 export class TokenWatch {
-  private readonly thresholds: number[];
+  private readonly thresholds: Threshold[];
   private fired = new Set<number>();
 
-  constructor(thresholds: number[] = DEFAULT_THRESHOLDS) {
+  constructor(thresholds: Threshold[] = DEFAULT_THRESHOLDS.map((percent) => ({ percent }))) {
     this.thresholds = normalizeThresholds(thresholds);
   }
 
@@ -15,24 +19,29 @@ export class TokenWatch {
   }
 
   armed(): number[] {
-    return [...this.thresholds];
+    return this.thresholds.map((threshold) => threshold.percent);
   }
 
-  /** Establish a starting point without reporting thresholds already passed. */
-  prime(percent: number | null): void {
-    if (percent === null || !Number.isFinite(percent) || percent < 0) return;
-    for (const threshold of this.thresholds) {
-      if (percent >= threshold) this.fired.add(threshold);
+  /** Establish a starting point without reporting thresholds already passed, and name the ones skipped. */
+  prime(percent: number | null): number[] {
+    if (percent === null || !Number.isFinite(percent) || percent < 0) return [];
+    const passed: number[] = [];
+    for (const { percent: threshold } of this.thresholds) {
+      if (percent >= threshold) {
+        this.fired.add(threshold);
+        passed.push(threshold);
+      }
     }
+    return passed;
   }
 
   /** Return the thresholds newly reached by this usage percentage. */
-  crossed(percent: number | null): number[] {
+  crossed(percent: number | null): Threshold[] {
     if (percent === null || !Number.isFinite(percent) || percent < 0) return [];
-    const crossed: number[] = [];
+    const crossed: Threshold[] = [];
     for (const threshold of this.thresholds) {
-      if (percent >= threshold && !this.fired.has(threshold)) {
-        this.fired.add(threshold);
+      if (percent >= threshold.percent && !this.fired.has(threshold.percent)) {
+        this.fired.add(threshold.percent);
         crossed.push(threshold);
       }
     }
@@ -40,7 +49,20 @@ export class TokenWatch {
   }
 }
 
-export function normalizeThresholds(thresholds: number[]): number[] {
-  return [...new Set(thresholds.filter((n) => Number.isFinite(n) && n > 0 && n <= 100))]
-    .sort((a, b) => a - b);
+/**
+ * Thresholds in crossing order, or a throw.
+ *
+ * Nothing is quietly dropped or deduplicated here, which is a change of heart now that a threshold can carry a
+ * reminder: collapsing a repeated percentage discards whichever reminder lost, and a discarded reminder does not
+ * go wrong until the crossing it was meant to speak at, hours later. Throwing costs the caller one corrected call.
+ * `bin/claude-tokens` refuses the same input for the same reason.
+ */
+export function normalizeThresholds(thresholds: Threshold[]): Threshold[] {
+  const seen = new Set<number>();
+  for (const { percent } of thresholds) {
+    if (!Number.isFinite(percent) || percent <= 0 || percent > 100) throw new Error(`Threshold percent must be over 0 and at most 100: ${percent}`);
+    if (seen.has(percent)) throw new Error(`Threshold percent given twice: ${percent}`);
+    seen.add(percent);
+  }
+  return [...thresholds].sort((a, b) => a.percent - b.percent);
 }
