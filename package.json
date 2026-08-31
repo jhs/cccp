@@ -1,6 +1,6 @@
 {
   "name": "@jhs/cccp",
-  "version": "3.11.0",
+  "version": "3.11.1",
   "type": "module",
   "description": "CCCP comrade support for the Pi coding agent — a Pi session joins CCCP cells as a full peer",
   "keywords": [
