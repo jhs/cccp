@@ -158,6 +158,107 @@ class ComradeTargets(TreeCase):
         self.assertEqual(r["matches"], sorted([CC_SID, twin]))
 
 
+class Identity(TreeCase):
+    """Who a target is, and where to go read them (#37).
+
+    The snapshot is already open when a target resolves, so answering "which
+    session is this comrade, and where does it live" costs a projection rather
+    than the anchored directory glob every caller was hand-rolling."""
+
+    def setUp(self):
+        super().setUp()
+        self.write("claude-code", CC_SID, snapshot(
+            CC_SID,
+            transcript_path=f"/home/dev/.claude/projects/-home-dev-src-cccp/{CC_SID}.jsonl",
+            cwd="/home/dev/src/cccp"))
+
+    def resolved(self, target):
+        return claude_tokens.report(target, claude_tokens.scan())
+
+    def test_a_comrade_id_resolves_to_a_transcript_and_a_working_tree(self):
+        """The pain #37 reports: an id in hand, and nowhere supported to take it."""
+        r = self.resolved("cc-4f2a1b")
+        self.assertEqual(r["session_id"], CC_SID)
+        self.assertEqual(r["cwd"], "/home/dev/src/cccp")
+        self.assertTrue(r["transcript_path"].endswith(f"{CC_SID}.jsonl"))
+        self.assertEqual(Path(r["snapshot_path"]).name, f"{CC_SID}.json")
+
+    def test_a_comrade_id_is_echoed_back_whole(self):
+        """Forward lookup already knows the id, `user@host:` head and all - there
+        is nothing to derive and nothing to drop."""
+        self.assertEqual(self.resolved("dev@fs:cc-4f2a1b")["comrade_id"],
+                         "dev@fs:cc-4f2a1b")
+
+    def test_a_session_id_derives_the_comrade_id_at_its_own_anchor(self):
+        """The reverse lookup, and the reason the producer directory is read at
+        all: the two harnesses anchor at opposite ends and a bare session id
+        cannot say which."""
+        self.write("pi", PI_SID, snapshot(PI_SID))
+        self.assertEqual(self.resolved(CC_SID)["comrade_id"], "cc-4f2a1b")
+        self.assertEqual(self.resolved(PI_SID)["comrade_id"], "pi-99ff01")
+
+    def test_a_derived_id_carries_no_user_or_host(self):
+        """A snapshot records neither, deliberately - it is portable, and a host
+        baked into one becomes a lie the moment it is copied to another machine.
+        The bare tag is the honest answer, not a `user@host:` guessed from cwd."""
+        r = self.resolved(CC_SID)
+        self.assertEqual(r["comrade_id"], "cc-4f2a1b")
+        self.assertNotIn("@", r["comrade_id"])
+
+    def test_an_unknown_producer_derives_no_id_rather_than_guessing(self):
+        """A harness added tomorrow writes into its own directory and is still
+        found by session id (that is the producer glob). What cannot be invented
+        for it is which end its ids anchor at, so no id is offered."""
+        sid = "aaaaaaaa-2222-4c9a-9f1e-3b7a55d0beef"
+        self.write("harness-invented-tomorrow", sid, snapshot(sid))
+        r = self.resolved(sid)
+        self.assertEqual(r["session_id"], sid)
+        self.assertIsNone(r["comrade_id"])
+
+    def test_identity_survives_a_session_with_no_reading_yet(self):
+        """WHICH session a target names is known the moment it resolves. A fresh
+        or just-compacted session has no usage to report and still has an
+        identity, so `no reading` must not take the answer down with it."""
+        fresh = "bbbbbbbb-3333-4c9a-9f1e-3b7a55d0cafe"
+        self.write("claude-code", fresh,
+                   {"session_id": fresh, "cwd": "/home/dev/src/other"})
+        r = self.resolved(fresh)
+        self.assertEqual(r["error"], "no reading")
+        self.assertEqual(r["comrade_id"], "cc-bbbbbb")
+        self.assertEqual(r["cwd"], "/home/dev/src/other")
+
+    def test_workspace_supplies_the_directory_when_cwd_is_absent(self):
+        sid = "cccccccc-4444-4c9a-9f1e-3b7a55d0f00d"
+        self.write("claude-code", sid, snapshot(
+            sid, workspace={"current_dir": "/home/dev/src/elsewhere"}))
+        self.assertEqual(self.resolved(sid)["cwd"], "/home/dev/src/elsewhere")
+
+    def test_a_producer_with_no_paths_says_so_rather_than_inventing_them(self):
+        """Pi writes no cwd and no transcript path today. An absent field is
+        reported absent - the contract's own rule - not filled with a plausible
+        guess assembled from the session id."""
+        self.write("pi", PI_SID, snapshot(PI_SID))
+        r = self.resolved("pi-99ff01")
+        self.assertEqual(r["comrade_id"], "pi-99ff01")
+        self.assertIsNone(r["transcript_path"])
+        self.assertIsNone(r["cwd"])
+
+    def test_the_usage_line_is_unchanged_by_any_of_this(self):
+        """The identity fields ride in the record, which `--json` emits. The text
+        contract that skills/token-aware/SKILL.md documents must not move."""
+        p = self.run_cli("status", "cc-4f2a1b")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout.strip(), "50% (100k/200k) | snapshot age unknown")
+
+    def test_json_carries_the_identity_fields(self):
+        p = self.run_cli("status", "cc-4f2a1b", "--json")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        [r] = json.loads(p.stdout)
+        self.assertEqual(r["comrade_id"], "cc-4f2a1b")
+        self.assertEqual(r["cwd"], "/home/dev/src/cccp")
+        self.assertTrue(r["transcript_path"])
+
+
 class Numerator(unittest.TestCase):
     """Two spellings of used tokens, because harnesses genuinely differ."""
 

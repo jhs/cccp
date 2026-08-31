@@ -114,6 +114,18 @@ Targets are labelled once there is more than one; a single target prints the usa
 
 Add `--json` when a program rather than a person consumes the output: `status --json` prints one array of results, `watch --json` one JSON object per event.
 
+## Resolving who a comrade is
+
+`status --json` also answers identity, because it has already opened the snapshot: alongside the usage fields each result carries `comrade_id`, `session_id`, `session_name`, `producer`, `transcript_path`, `cwd` and `snapshot_path`. Use it whenever you have an id and need the session behind it — where that comrade's transcript is, which working tree they are in — instead of globbing the snapshot directory yourself.
+
+```bash
+claude-tokens status cc-4f2a1b --json | jq -r '.[0].transcript_path'
+```
+
+It works in reverse too: give it a bare **session id** and `comrade_id` comes back derived (`cc-4f2a1b`), which is how you find out who a transcript or a log line belongs to. That derived id has no `user@host` head — a snapshot records neither, because snapshots are portable between machines and a host stored in one stops being true the moment it is copied. An unfamiliar harness yields `comrade_id: null` rather than an id guessed at the wrong anchor.
+
+Identity is reported even when usage is not: a fresh or just-compacted session answers `"error": "no reading"` and still tells you who it is and where it lives.
+
 ## Wind-down
 
 `watch` runs until stopped. End it with **TaskStop** on its task id when the long work is done or the user no longer needs milestone updates.

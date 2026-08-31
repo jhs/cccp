@@ -11,6 +11,13 @@ docs/telemetry-snapshots.md. bin/cccp-statusline writes the Claude Code ones.
 Monitor tool. Both take any number of targets - session ids or comrade ids (see
 match_target) - and answer for each in one process off one directory scan. With
 no target at all: $CLAUDE_CODE_SESSION_ID, else the most recent snapshot.
+
+Resolving a comrade id to its session lives here too, and 'status --json' reports
+it (comrade_id, transcript_path, cwd, snapshot_path) alongside the usage fields.
+Not scope creep: match_target already had to know how each harness anchors its
+ids, and a resolved snapshot is already open, so the alternative was every caller
+re-deriving the anchoring rule in a shell pipeline and picking a silent winner on
+a 6-hex collision (#37).
 """
 
 import argparse
@@ -153,18 +160,45 @@ def resolve_targets(given, snaps):
 
 COMRADE_TAIL = re.compile(r"(cc|pi)-([0-9a-f]{6})", re.I)
 
+# Which harness tag a producer directory implies, for the REVERSE derivation in
+# comrade_id() only. docs/telemetry-snapshots.md is emphatic that the producer
+# directory is not part of a snapshot's identity, and that still holds: a session
+# id is unique, so forward matching never consults this. But a bare session id
+# cannot say which end to anchor, and the producer is the only signal on disk. It
+# is read as a hint about how to SPELL an id, never as a claim about whose
+# session it is - so a producer missing from this table yields no comrade id at
+# all rather than a guessed one.
+PRODUCER_HARNESS = {"claude-code": "cc", "pi": "pi"}
+
+
+def comrade_tag(session_id, harness):
+    """The 6 hex a comrade id carries for this session under this harness.
+
+    THE ANCHORING RULE, in one place because it is the piece every hand-rolled
+    caller got wrong (#37). The two harnesses take their 6 hex from OPPOSITE ends:
+    `cc` the FIRST 6 characters of the session id (bin/cccp comrade_id), `pi` the
+    LAST 6 hex (integrations/pi/cccp-comrade.ts resolveEnvironment).
+
+    Pi's is not an arbitrary difference. Pi session ids are UUIDv7, which are
+    time-ordered, so the leading hex is a timestamp and siblings started in the
+    same moment share a prefix; taking the random tail is what keeps them apart.
+
+    An unknown harness returns None rather than defaulting to one end. A guess
+    here yields an id that looks right and names the wrong session."""
+    if harness == "cc":
+        return session_id[:6].lower()
+    if harness == "pi":
+        return session_id.replace("-", "")[-6:].lower()
+    return None
+
 
 def match_target(target, snaps):
     """The snapshots one target names, as a list of (path, payload).
 
     A target is either a full session id, matched exactly, or a comrade id whose
-    6-hex tail is an anchored match - and the two harnesses anchor at OPPOSITE
-    ends, because they derive that tail differently: `cc-` from the first 6 chars
-    of the session id (bin/cccp comrade_id), `pi-` from the last 6 hex of it,
-    since Pi session ids are UUIDv7 and siblings share a leading timestamp
-    (integrations/pi/cccp-comrade.ts resolveEnvironment). Keeping that rule here
-    is the point of accepting comrade ids: every caller was hand-rolling it as a
-    shell pipeline, and one of the two anchors is backwards from the obvious.
+    6-hex tail is matched at whichever end comrade_tag anchors it. Accepting
+    comrade ids at all is the point: every caller was otherwise hand-rolling this
+    as a shell pipeline, and one of the two anchors is backwards from the obvious.
 
     Any `user@host:` head is dropped. Snapshots are portable between machines by
     design, so the host a file sits on is not a reliable filter on whose reading
@@ -174,13 +208,35 @@ def match_target(target, snaps):
     if not m:
         return [(p, s) for p, s in snaps if s["session_id"] == target]
     harness, want = m.group(1).lower(), m.group(2).lower()
-    hits = []
-    for path, payload in snaps:
-        sid = str(payload["session_id"])
-        got = sid[:6] if harness == "cc" else sid.replace("-", "")[-6:]
-        if got.lower() == want:
-            hits.append((path, payload))
-    return hits
+    return [(p, s) for p, s in snaps
+            if comrade_tag(str(s["session_id"]), harness) == want]
+
+
+def comrade_id(target, session_id, producer):
+    """The comrade id a resolved snapshot belongs to, or None.
+
+    Forward lookup already has one - the caller typed it - so it is echoed back
+    unchanged, `user@host:` head and all. Only a session-id target has to build
+    one, and what it can build is the bare `cc-4f2a1b` tag: a snapshot records no
+    user and no host, deliberately, because snapshots are portable between
+    machines and a host baked into one becomes a lie the moment it is copied."""
+    if COMRADE_TAIL.fullmatch(target.rsplit(":", 1)[-1]):
+        return target
+    harness = PRODUCER_HARNESS.get(producer)
+    tag = comrade_tag(session_id, harness)
+    return f"{harness}-{tag}" if tag else None
+
+
+def workspace_dir(payload):
+    """The working tree a session is in, or None.
+
+    `cwd` is the Claude Code statusLine payload's spelling; `workspace` carries
+    the same thing when a producer reports it that way. A producer with neither
+    returns None rather than having a directory invented for it."""
+    if payload.get("cwd"):
+        return payload["cwd"]
+    ws = payload.get("workspace") or {}
+    return ws.get("current_dir") or ws.get("project_dir") or None
 
 
 def reading_age(payload):
@@ -199,7 +255,15 @@ def report(target, snaps):
     Both counts an anchored match can get wrong are named rather than papered
     over. Zero is `no snapshot`; more than one is `ambiguous`, never the first
     hit - 6 hex is short enough to collide as snapshots accumulate, and silently
-    answering for the wrong session is the failure worth avoiding here."""
+    answering for the wrong session is the failure worth avoiding here.
+
+    The identity fields (comrade_id, transcript_path, cwd, snapshot_path) are set
+    from a payload this function has already parsed, and they survive a `no
+    reading` return: WHICH session a target names is known as soon as it resolves,
+    whether or not that session has reported usage yet. Answering "who is this,
+    and where do I go read them" was otherwise a hand-rolled glob over this same
+    directory that duplicated the anchoring rule and picked a silent winner when
+    6 hex collided (#37) - and the snapshot was already open here."""
     r = {"target": target}
     hits = match_target(target, snaps)
     if not hits:
@@ -208,10 +272,16 @@ def report(target, snaps):
         return dict(r, error="ambiguous",
                     matches=sorted(s["session_id"] for _, s in hits))
     path, payload = hits[0]
+    sid = str(payload["session_id"])
+    producer = path.parent.name
     r.update(session_id=payload["session_id"],
              session_name=payload.get("session_name"),
-             producer=path.parent.name,
-             model=(payload.get("model") or {}).get("display_name"))
+             producer=producer,
+             model=(payload.get("model") or {}).get("display_name"),
+             comrade_id=comrade_id(target, sid, producer),
+             snapshot_path=str(path),
+             transcript_path=payload.get("transcript_path"),
+             cwd=workspace_dir(payload))
     m = metrics(payload)
     if m is None:
         return dict(r, error="no reading")
