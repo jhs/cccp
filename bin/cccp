@@ -1073,6 +1073,36 @@ def append_dispatch(client, prefix, slug, me, dispatch):
                             b"NOT delivered")
 
 
+def published_catalogue(client, prefix, slug):
+    """The files currently published in a cell: {(sender, wire_path): publish dispatch}.
+
+    Replays every gazette in order, so a later unpublish cancels an earlier publish of
+    the same (sender, path) - the announcements ARE the catalogue, there is no index
+    blob to consult. The value is the whole publish dispatch, so a caller keeps the
+    size and line count it claimed.
+    """
+    catalogue = {}
+    for sender in cell_roster(client, prefix, slug):
+        st, body = client.get(gazette_path(prefix, slug, sender))
+        if st != 200:
+            continue                     # listed, then gone: a live cell can race
+        for line in body.splitlines():
+            try:
+                d = json.loads(line)
+            except ValueError:
+                print(f"cccp: warning: skipping unparseable gazette line "
+                      f"from {sender}", file=sys.stderr)
+                continue
+            if d.get("type") != "filesystem":
+                continue
+            key = (sender, d.get("path", ""))
+            if d.get("op") == "publish":
+                catalogue[key] = d
+            elif d.get("op") == "unpublish":
+                catalogue.pop(key, None)
+    return catalogue
+
+
 # ---------- event rendering ----------
 
 def display_path(wire_path):
@@ -2872,28 +2902,7 @@ def cmd_pull(args):
     prefix = cfg["PREFIX"]
 
     with subcommand_footer(log):
-        # Catalogue currently-published files across all gazettes; a later unpublish
-        # cancels an earlier publish of the same (sender, path). The value is the
-        # publish dispatch, kept so its claimed size / line count can be verified.
-        catalogue = {}  # (sender, wire_path) -> publish dispatch dict
-        for sender in cell_roster(client, prefix, slug):
-            st, body = client.get(gazette_path(prefix, slug, sender))
-            if st != 200:
-                continue
-            for line in body.splitlines():
-                try:
-                    d = json.loads(line)
-                except ValueError:
-                    print(f"cccp: warning: skipping unparseable gazette line "
-                          f"from {sender}", file=sys.stderr)
-                    continue
-                if d.get("type") != "filesystem":
-                    continue
-                key = (sender, d.get("path", ""))
-                if d.get("op") == "publish":
-                    catalogue[key] = d
-                elif d.get("op") == "unpublish":
-                    catalogue.pop(key, None)
+        catalogue = published_catalogue(client, prefix, slug)
 
         # Match each published file's original path against the expressions: an exact
         # match, or the expression is a directory prefix of it.
