@@ -1073,16 +1073,20 @@ def append_dispatch(client, prefix, slug, me, dispatch):
                             b"NOT delivered")
 
 
-def published_catalogue(client, prefix, slug):
+def published_catalogue(client, prefix, slug, senders=None):
     """The files currently published in a cell: {(sender, wire_path): publish dispatch}.
 
     Replays every gazette in order, so a later unpublish cancels an earlier publish of
     the same (sender, path) - the announcements ARE the catalogue, there is no index
     blob to consult. The value is the whole publish dispatch, so a caller keeps the
     size and line count it claimed.
+
+    `senders` reads only those gazettes instead of the whole roster. It is an exact
+    narrowing, not a sample: a caller that can only act on its own announcements
+    (`unpublish`) gets the same answer from one GET that it would from hundreds.
     """
     catalogue = {}
-    for sender in cell_roster(client, prefix, slug):
+    for sender in (cell_roster(client, prefix, slug) if senders is None else senders):
         st, body = client.get(gazette_path(prefix, slug, sender))
         if st != 200:
             continue                     # listed, then gone: a live cell can race
@@ -2895,9 +2899,9 @@ def cmd_unpublish(args):
             # pull, and by wind-down time the local original may be edited or gone.
             # Strictly greater, so --larger-than <autodownload max> retracts exactly
             # what a peer's watchtower declined to auto-download.
-            catalogue = published_catalogue(client, cfg["PREFIX"], slug)
-            wire_paths = sorted(wp for (sender, wp), d in catalogue.items()
-                                if sender == me and d.get("size", 0) > limit)
+            catalogue = published_catalogue(client, cfg["PREFIX"], slug, senders=[me])
+            wire_paths = sorted(wp for (_, wp), d in catalogue.items()
+                                if d.get("size", 0) > limit)
             if not wire_paths:
                 print(f"nothing of mine is published over {args.larger_than}")
                 return

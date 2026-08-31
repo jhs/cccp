@@ -2017,6 +2017,23 @@ class PublishedCatalogue(unittest.TestCase):
         self._pub(self.PEER, "/tmp/theirs.txt")
         self.assertEqual({s for s, _ in self._cat()}, {self.ME, self.PEER})
 
+    def test_senders_narrows_exactly_rather_than_sampling(self):
+        """The optimisation `unpublish` relies on: scanning one gazette must give the
+        same answer for that comrade as scanning the whole cell, so the narrowing can
+        never change which files get retracted - only how many blobs are read."""
+        self._pub(self.ME, "/tmp/mine.txt")
+        self._pub(self.ME, "/tmp/gone.txt")
+        self._unpub(self.ME, "/tmp/gone.txt")
+        self._pub(self.PEER, "/tmp/theirs.txt")
+        whole = {k: v for k, v in self._cat().items() if k[0] == self.ME}
+        self.assertEqual(cccp.published_catalogue(self.client, self.PREFIX, self.SLUG,
+                                                  senders=[self.ME]), whole)
+        self.assertEqual(list(whole), [(self.ME, "files/tmp/mine.txt")])
+
+    def test_a_sender_with_no_gazette_yet_is_skipped_not_fatal(self):
+        self.assertEqual(cccp.published_catalogue(self.client, self.PREFIX, self.SLUG,
+                                                  senders=["ghost@h:cc-cccccc"]), {})
+
     def test_the_whole_publish_dispatch_is_kept(self):
         """Callers select on `size` and verify on `lines`, so the value must be the
         announcement itself, not a reduced tuple."""
