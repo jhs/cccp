@@ -118,7 +118,9 @@ pi -p --model <id> '<prompt>'     # non-interactive, no TUI
 pi --list-models                  # resolve a model name to an id
 ```
 
-`/reload` re-reads extensions, skills, prompts and themes **in process**. It replaces the extension instance and invalidates any `pi`/`ctx` an extension captured; module scope does not survive it.
+`/reload` re-reads extensions, skills, prompts and themes **in process**. It replaces the extension instance and invalidates any `pi`/`ctx` an extension captured; module scope does not survive it. `globalThis` does — measured across two reloads, and undocumented, so anything built on it needs a sanctioned fallback (`pi.appendEntry`) behind it.
+
+`/quit` is the exit path. `/exit` is **not** a command — it goes to the model as a prompt and costs a turn — and two `Ctrl-C`s do not exit either. So a probe you believe you have exited is probably still running: check the process before concluding anything from what its children are doing.
 
 ### Claude Code
 
