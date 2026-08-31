@@ -37,10 +37,12 @@ input=$(cat)
 # root (the map is in bin/cccp; the contract is docs/telemetry-snapshots.md).
 #
 # Readers glob the producer level, so `claude-code` here is a free choice. The
-# version segment above it is not: claude-tokens and cccp derive it from the same
-# plugin.json by the same rule (major digits before the first dot, .git means
-# inline), and the three must stay identical. A divergence silently strands the
-# reader, which is exactly the failure jhs/cccp#14 was.
+# version segment above it is not: claude-tokens (the reader), cccp (setup
+# detection) and integrations/pi/telemetry.ts (the Pi writer) derive it from the
+# same plugin.json by the same rule (major digits before the first dot, the
+# PRESENCE of .git means inline), and all four must stay identical. A divergence
+# silently strands the reader, which is exactly the failure jhs/cccp#14 was.
+# tests/test_cccp.py TelemetryVersionSegment asserts all four agree.
 #
 # -e, not -d: in a git WORKTREE `.git` is a file holding `gitdir: <path>`, not a
 # directory. A directory test calls a worktree a release install and files these
