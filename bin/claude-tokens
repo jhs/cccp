@@ -34,10 +34,16 @@ def _version_segment():
     plugin.json, or `inline` for a checkout (whose version is whatever the
     branch says, not a release).
 
-    bin/cccp-statusline WRITES the directory this names and derives it from the
-    same file by the same rule - major digits before the first dot, .git means
-    inline. Keep the two identical: a divergence strands the reader silently,
-    which is exactly the failure jhs/cccp#14 was."""
+    One of FOUR implementations of one rule: bin/cccp-statusline (the Claude Code
+    writer) and integrations/pi/telemetry.ts (the Pi writer) both WRITE the
+    directory this names, and bin/cccp derives it for setup detection. Major
+    digits before the first dot, the PRESENCE of .git means inline. Keep all four
+    identical: a divergence strands the reader silently, which is exactly the
+    failure jhs/cccp#14 was.
+
+    Presence, not shape: a worktree's .git is a file, and testing for a directory
+    reads one as a release install (#41). tests/test_cccp.py
+    TelemetryVersionSegment asserts all four agree, in both .git shapes."""
     root = Path(__file__).resolve().parent.parent
     if (root / ".git").exists():
         return "inline"

@@ -30,10 +30,18 @@ other harness, which is the whole reason for the glob.
 The `<v-major|inline>` partition above it is different, and stays: one data root
 receives writes from every version installed from one marketplace, so two
 installed majors with different payload expectations must not share a directory.
-The writer, the reader, and `bin/cccp` all derive that segment from the same
-`plugin.json` by the same rule -- major digits before the first dot, a `.git`
-directory means `inline`. A divergence strands the reader silently, which is
-exactly the failure of #14.
+**Four** programs derive that segment independently -- `bin/cccp-statusline`
+(the Claude Code writer), `integrations/pi/telemetry.ts` (the Pi writer),
+`bin/claude-tokens` (the reader) and `bin/cccp` (setup detection) -- from the
+same `plugin.json` by the same rule: major digits before the first dot, and the
+**presence** of `.git` means `inline`. A divergence strands the reader silently,
+which is exactly the failure of #14.
+
+Presence, not shape. In a git worktree `.git` is a *file* holding `gitdir:
+<path>`, not a directory, so a directory test reads a worktree as a release
+install and files snapshots where no reader looks -- #41.
+`tests/test_cccp.py::TelemetryVersionSegment` runs all four against one fake
+plugin root, in both `.git` shapes, and asserts they agree.
 
 ## Required fields
 

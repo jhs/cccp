@@ -1093,7 +1093,10 @@ class TelemetryVersionSegment(unittest.TestCase):
 
     BINS = ("cccp", "cccp-statusline", "claude-tokens")
 
-    def _root(self, version, git=False):
+    def _root(self, version, git=False, worktree=False):
+        """A fake plugin root. `git` gives it a .git DIRECTORY (an ordinary
+        checkout); `worktree` gives it a .git FILE, which is what git actually
+        leaves in a worktree - the shape that separated the four (#41)."""
         import shutil
         root = Path(tempfile.mkdtemp())
         self.addCleanup(lambda: shutil.rmtree(root, True))
@@ -1106,6 +1109,9 @@ class TelemetryVersionSegment(unittest.TestCase):
             json.dumps({"name": "cccp", "version": version}, indent=2))
         if git:
             (root / ".git").mkdir()
+        if worktree:
+            (root / ".git").write_text(
+                "gitdir: /somewhere/.git/worktrees/fake\n")
         return root
 
     def _pi_segment(self, root):
@@ -1167,6 +1173,17 @@ class TelemetryVersionSegment(unittest.TestCase):
 
     def test_checkout_is_inline_in_all_four(self):
         self._assert_all_agree(self._root("3.0.0", git=True), "inline", "checkout")
+
+    def test_worktree_is_inline_in_all_four(self):
+        """A worktree is a checkout, and .git being a FILE does not change that.
+
+        This is the case that got away. All four agreed on a .git DIRECTORY, so
+        the suite was green while bin/cccp-statusline alone tested `-d` and read
+        a worktree as a release install - writing snapshots to telemetry/v<major>/
+        while every reader looked in inline/ (#41). Nothing modelled a worktree
+        until three comrades happened to work in three of them at once."""
+        self._assert_all_agree(self._root("3.0.0", worktree=True), "inline",
+                               "worktree")
 
     def test_unparseable_version_agrees_on_unknown(self):
         self._assert_all_agree(self._root("not-a-version"), "unknown",

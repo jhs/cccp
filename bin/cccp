@@ -2390,10 +2390,16 @@ def telemetry_version_segment():
 
     One data root holds every version installed from one marketplace, so
     partitioning by major version keeps two releases from scribbling on each
-    other's snapshots. bin/cccp-statusline (the writer) and bin/claude-tokens
-    (the reader) derive this from the same file by the same rule - major digits
-    before the first dot, .git means inline. All three must stay identical: a
-    divergence strands the reader silently, which is exactly #14's failure."""
+    other's snapshots. FOUR programs derive this from the same file by the same
+    rule - bin/cccp-statusline (the Claude Code writer), integrations/pi/
+    telemetry.ts (the Pi writer), bin/claude-tokens (the reader) and this one -
+    major digits before the first dot, the PRESENCE of .git means inline. All
+    four must stay identical: a divergence strands the reader silently, which is
+    exactly #14's failure.
+
+    Presence, not shape: a worktree's .git is a file, and testing for a directory
+    reads one as a release install (#41). tests/test_cccp.py
+    TelemetryVersionSegment asserts all four agree, in both .git shapes."""
     root = plugin_root()
     if (root / ".git").exists():
         return "inline"
