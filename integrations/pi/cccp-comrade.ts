@@ -606,7 +606,7 @@ export default function (pi: ExtensionAPI) {
 				const text = joined.length
 					? `Not joined to cell '${params.cell}' — joined cells: ${joined.join(", ")}. Join it first with the cccp_join tool.`
 					: `Not in any cell — join '${params.cell}' first with the cccp_join tool.`;
-				return { content: [{ type: "text" as const, text }], details: { cell: params.cell, to: params.to ?? ["*"] } };
+				return { content: [{ type: "text" as const, text }], details: { cell: params.cell, to: params.to ?? ["*"], error: text } };
 			}
 			const args = ["dispatch", params.cell, ...(params.to ?? []).flatMap((t) => ["--to", t]), "-"];
 			log("INFO", `Dispatch to cell ${params.cell}: ${JSON.stringify(params.to ?? ["*"])}`);
@@ -618,7 +618,7 @@ export default function (pi: ExtensionAPI) {
 				child.stdin?.write(params.message);
 				child.stdin?.end();
 			});
-			return { content: [{ type: "text" as const, text: output || "Dispatch sent" }], details: { cell: params.cell, to: params.to ?? ["*"] } };
+			return { content: [{ type: "text" as const, text: output || "Dispatch sent" }], details: { cell: params.cell, to: params.to ?? ["*"], error: undefined as string | undefined } };
 		},
 		renderCall(args, theme) {
 			const recipients = args.to?.join(" ") || "*";
@@ -638,7 +638,7 @@ export default function (pi: ExtensionAPI) {
 			return row;
 		},
 		renderResult(result, _options, theme, context) {
-			if (!context.isError) return new Container();
+			if (!context.isError && !result.details?.error) return new Container();
 			const text = result.content
 				.filter((item) => item.type === "text")
 				.map((item) => item.text ?? "")
