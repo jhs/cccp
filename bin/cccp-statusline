@@ -41,8 +41,14 @@ input=$(cat)
 # plugin.json by the same rule (major digits before the first dot, .git means
 # inline), and the three must stay identical. A divergence silently strands the
 # reader, which is exactly the failure jhs/cccp#14 was.
+#
+# -e, not -d: in a git WORKTREE `.git` is a file holding `gitdir: <path>`, not a
+# directory. A directory test calls a worktree a release install and files these
+# snapshots under telemetry/v<major>/ while every reader looks in inline/ (#41).
+# The other three implementations of this rule all test existence, not shape -
+# Python's Path.exists() and Node's fs.existsSync() are both true for that file.
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-if [[ -d "$root/.git" ]]; then
+if [[ -e "$root/.git" ]]; then
     version_segment="inline"
 else
     major=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([0-9][0-9]*\)\..*/\1/p' \
