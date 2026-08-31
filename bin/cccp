@@ -1765,6 +1765,23 @@ class Watchtower:
             # exit path runs late - mid-poll on a slow backend when the SIGTERM arrived.
             # `cccp status` would then report stopped for a watchtower that is alive and
             # serving, which inverts the one question the pidfile exists to answer (#18).
+            #
+            # A residual race is left open ON PURPOSE, and this is the paragraph
+            # that says so rather than leaving the next reader to find it. Between
+            # the read and the unlink below, a successor can write its own pid; we
+            # would then delete a claim that had stopped being ours in between.
+            # Closing that needs an atomic claim - a lock file, a rename protocol,
+            # a pid-keyed path - and this is a stdlib-only reference implementation
+            # meant to be read in one sitting and rebuilt in an afternoon (README,
+            # "Simplicity first"). POSIX locking to win a microseconds-wide race is
+            # not a trade this codebase makes.
+            #
+            # What it costs when it does happen is one stale `cccp status` reading,
+            # and that layer is not where the stack is expected to catch it. A
+            # comrade learns something is wrong from a dispatch deadline that never
+            # clears, or from a peer saying so - not from a pidfile. Anything
+            # needing a hard guarantee here should build the claim protocol above
+            # cccp rather than inside it.
             p = pid_path(self.slug, self.me)
             try:
                 owner = json.loads(p.read_text()).get("pid")
