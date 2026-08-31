@@ -1759,7 +1759,19 @@ class Watchtower:
         try:
             last_stop_path(self.slug, self.me).write_text(json.dumps(
                 {"ts": now_iso(), "reason": reason, "pid": os.getpid()}))
-            pid_path(self.slug, self.me).unlink(missing_ok=True)
+            # Clear only OUR OWN record. One watchtower = one cell = one comrade, so the
+            # pid record is shared ground between a watchtower and whatever replaces it,
+            # and an unconditional unlink deletes a LIVE successor's claim whenever our
+            # exit path runs late - mid-poll on a slow backend when the SIGTERM arrived.
+            # `cccp status` would then report stopped for a watchtower that is alive and
+            # serving, which inverts the one question the pidfile exists to answer (#18).
+            p = pid_path(self.slug, self.me)
+            try:
+                owner = json.loads(p.read_text()).get("pid")
+            except (OSError, ValueError):
+                owner = None
+            if owner == os.getpid():
+                p.unlink(missing_ok=True)
         except OSError as e:
             self._log(f"stop record write failed ({type(e).__name__}: {e})")
 

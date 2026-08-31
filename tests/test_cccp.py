@@ -1795,6 +1795,41 @@ class WatchtowerStatus(unittest.TestCase):
         self.assertEqual(state, "stopped")
         self.assertIn("reason=parent_exited", detail)
 
+    def test_a_live_successors_pidfile_survives_our_stop(self):
+        """The pid record is keyed on (slug, comrade), not on a process, so it is shared
+        ground between a watchtower and its replacement. A predecessor whose exit path runs
+        LATE - it was mid-poll on a slow backend when the SIGTERM landed - must not delete
+        the successor's claim."""
+        self.wt._write_pidfile()
+        successor = os.getpid() + 1
+        cccp.pid_path(self.SLUG, self.ME).write_text(
+            json.dumps({"pid": successor, "started": cccp.now_iso()}))
+        self.wt.stop_reason = "signal_15"
+        self.wt._record_stop()
+        self.assertTrue(cccp.pid_path(self.SLUG, self.ME).exists(),
+                        "a dying watchtower deleted its live successor's pid record")
+        self.assertEqual(
+            json.loads(cccp.pid_path(self.SLUG, self.ME).read_text())["pid"], successor,
+            "the successor's claim must survive our exit untouched")
+
+    def test_status_still_reports_a_successor_alive_after_we_stop(self):
+        """The consequence the fix is actually for: `cccp status` is what someone runs to
+        ask whether they have gone deaf, and it must not answer stopped about a watchtower
+        that is alive and delivering."""
+        # The record holds THIS process, which is alive, so status can find it. The dying
+        # watchtower is made to report a different pid, which is what it would be in life.
+        cccp.pid_path(self.SLUG, self.ME).parent.mkdir(parents=True, exist_ok=True)
+        cccp.pid_path(self.SLUG, self.ME).write_text(
+            json.dumps({"pid": os.getpid(), "started": cccp.now_iso()}))
+        self.wt.stop_reason = "signal_15"
+        with mock.patch("os.getpid", return_value=os.getpid() + 1):
+            self.wt._record_stop()
+        argv = f"/usr/bin/python3 /x/bin/cccp watchtower {self.SLUG} -- {self.ME}"
+        with mock.patch.object(cccp, "process_argv", lambda pid: argv):
+            state, _ = cccp.watchtower_status(self.SLUG, self.ME)
+        self.assertEqual(state, "alive",
+                         "status reported a dead predecessor's stop for a live successor")
+
     def test_crash_in_run_records_crash_reason(self):
         self.wt.initial_scan = mock.Mock(side_effect=RuntimeError("boom"))
         with self.assertRaises(RuntimeError):
