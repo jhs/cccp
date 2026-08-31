@@ -373,70 +373,248 @@ class ReloadSurvival(unittest.TestCase):
                 tower.kill()
                 tower.wait(timeout=10)
 
-    def test_event_handler_never_lets_a_post_reload_line_reach_pi(self):
-        """The guard: no path from a watchtower line to an unprotected sendMessage."""
+    def test_no_watchtower_reader_can_ever_reach_pi_directly(self):
+        """The guard, restated for the design that replaced the kill.
+
+        #33's crash was a watchtower line reaching a `pi` handle a reload had invalidated. The old fix
+        dropped such lines; this one removes the coupling entirely. The readers are attached ONCE and
+        outlive every extension instance, so they must not close over `pi` at all - they hand lines to
+        `emit`, which routes to whichever instance currently owns the session or buffers until one does.
+        """
         src = EXTENSION.read_text()
-        handler = re.search(r'input: tower\.stdout!.*?\n(\t\t\t)\}\);', src, re.DOTALL)
-        self.assertIsNotNone(handler, "the watchtower stdout line handler moved; re-point this test")
-        body = handler.group(0)
-        self.assertIn("state.shuttingDown", body,
-                      "a line arriving after session_shutdown must be dropped, not sent on a stale pi ctx (#33)")
-        self.assertTrue(re.search(r'try\s*\{.*?pi\.sendMessage.*?\}\s*catch', body, re.DOTALL),
-                        "the sendMessage for a cell event must sit in a try/catch: a throw here is an "
-                        "uncaughtException in an async callback, which exits pi outright (#33)")
+        arm = re.search(r'function armWatchtower.*?\n\t\}', src, re.DOTALL)
+        self.assertIsNotNone(arm, "armWatchtower moved; re-point this test")
+        self.assertNotIn("pi.sendMessage", arm.group(0),
+                         "the readers outlive the instance that created them, so nothing attached in "
+                         "armWatchtower may capture `pi` - route through emit() and the stash sink (#33)")
         shutdown = re.search(r'pi\.on\("session_shutdown".*?\n\t\}\);', src, re.DOTALL)
         self.assertIsNotNone(shutdown, "the session_shutdown handler moved; re-point this test")
-        self.assertRegex(shutdown.group(0).split("state.towers.size === 0")[0], r'state\.shuttingDown = true;',
-                         "session_shutdown must raise the flag the line handler reads, and raise it "
-                         "before any early return, or a reload with no towers leaves it down")
+        self.assertRegex(shutdown.group(0).split("event.reason")[0], r'stash\.sink = null;',
+                         "session_shutdown must drop the sink BEFORE any branch or early return, or a "
+                         "line arriving mid-reload reaches a `pi` that is already invalid")
+        start = re.search(r'pi\.on\("session_start".*?\n\t\}\);', src, re.DOTALL)
+        sink = start.group(0).split("stash.sink =")[1].split("const held")[0]
+        self.assertTrue(re.search(r'try\s*\{.*?pi\.sendMessage.*?\}\s*catch', sink, re.DOTALL),
+                        "the sink's sendMessage must sit in a try/catch: a throw here is an "
+                        "uncaughtException in an async callback, which exits pi outright (#33)")
 
 
-class DeafAfterReload(unittest.TestCase):
-    """Surviving a reload is half the job; knowing you went deaf is the other half.
+class SurviveReload(unittest.TestCase):
+    """A `/reload` must cost a CCCP comrade nothing at all (#38).
 
-    A reload kills the watchtowers and then builds a fresh extension instance, so the comrade
-    comes back joined to nothing. Left there it is the exact failure the watchtower `exit`
-    handler already refuses to allow: events stop, dispatch still works, nobody notices. The
-    hand-off runs through `pi.appendEntry` - Pi has no extension-scoped store or state directory,
-    and module scope does not survive a reload - and the model is told, never auto-rejoined.
+    The watchtower was never killed BY the reload - this extension killed it, in session_shutdown, and
+    then #33 told the model it had gone deaf. Neither was necessary. The pi process owns the watchtower
+    and survives a reload intact; only the extension instance is replaced. So on `reason === "reload"`
+    nothing is signalled, nothing restarts, and the model is told nothing, because nothing happened to
+    tell it about.
+
+    Measured in a live pi 0.84.2 TUI before any of this was written: an event stream ran unbroken across
+    a reload, the line before and the line after delivered by different extension instances, and the
+    child process kept the same pid throughout.
+
+    Two things carry state across, for two different jobs. The `globalThis` stash carries the LIVE
+    objects (ChildProcess handles, open streams) that no session entry could hold. The sanctioned
+    `pi.appendEntry` record carries the serializable facts, and exists so that an instance which comes up
+    WITHOUT the stash can tell "never joined" from "joined and now deaf". Pi does not document the stash
+    surviving - `docs/extensions.md` warns the opposite - so the record is not redundancy, it is the
+    thing that stops a future Pi from turning this into silence.
     """
 
     def setUp(self):
         self.src = EXTENSION.read_text()
 
-    def test_joined_cells_are_recorded_for_the_next_instance(self):
-        shutdown = re.search(r'pi\.on\("session_shutdown".*?\n\t\}\);', self.src, re.DOTALL)
-        self.assertIsNotNone(shutdown, "the session_shutdown handler moved; re-point this test")
-        self.assertIn("pi.appendEntry", shutdown.group(0),
-                      "session_shutdown must hand the joined cells to the post-reload instance, and "
-                      "pi.appendEntry is the sanctioned carrier - module scope does not survive a reload")
+    def _shutdown(self):
+        m = re.search(r'pi\.on\("session_shutdown".*?\n\t\}\);', self.src, re.DOTALL)
+        self.assertIsNotNone(m, "the session_shutdown handler moved; re-point this test")
+        return m.group(0)
+
+    def _start(self):
+        m = re.search(r'pi\.on\("session_start".*?\n\t\}\);', self.src, re.DOTALL)
+        self.assertIsNotNone(m, "the session_start handler moved; re-point this test")
+        return m.group(0)
+
+    def _recover(self):
+        m = re.search(r'function recoverAfterReload.*?\n\t\}', self.src, re.DOTALL)
+        self.assertIsNotNone(m, "recoverAfterReload moved or was renamed; re-point this test")
+        return m.group(0)
+
+    # ---- the fast path: a reload changes nothing ----
+
+    def test_a_reload_kills_nothing(self):
+        reload_branch = self._shutdown().split('event.reason === "reload"')[1].split("return;")[0]
+        self.assertNotIn(".kill()", reload_branch,
+                         "a reload must not kill a watchtower - that kill IS the bug in #38, and it was "
+                         "never something pi did to us")
+
+    def test_only_a_reload_is_treated_as_a_continuation(self):
+        """`new`, `resume` and `fork` switch sessions IN PROCESS. Carrying live watchtowers into one of
+        those would feed a session another session's cell events - so the test is that the gate names
+        reload positively, never that it merely excludes `quit`."""
+        shutdown = self._shutdown()
+        self.assertIn('event.reason === "reload"', shutdown,
+                      "the keep-alive gate must name reload positively")
+        self.assertNotIn('!== "quit"', shutdown,
+                         "excluding only `quit` would carry live watchtowers into a resumed or forked "
+                         "session, which never joined those cells")
+
+    def test_every_other_reason_kills_and_clears(self):
+        shutdown = self._shutdown()
+        after = shutdown[shutdown.index("stash.closed = true"):]
+        self.assertIn(".kill()", after, "a real exit or a session switch must still kill every watchtower")
+        self.assertIn("stash.pending.length = 0", after,
+                      "buffered events belong to the session that is ending; a resumed session must not "
+                      "be handed them")
+        self.assertIn("stash.closed = true", after,
+                      "with no successor coming, later emissions must be dropped rather than buffered "
+                      "forever")
+
+    def test_the_fast_path_tells_the_model_nothing(self):
+        """The whole point. A reload is routine; a comrade that announces one has merely traded a
+        failure for a notification."""
+        recover = self._recover()
+        survived = recover.split("stash.towers.size > 0")[1].split("recorded.unreadable")[0]
+        self.assertNotIn("emit(", survived,
+                         "when the watchtowers survived there is nothing to report - saying so would "
+                         "make /reload visible to the agent again, which is exactly what #38 removes")
+        self.assertIn("return", survived, "the fast path returns without touching the fallback")
+
+    def test_handover_events_are_buffered_not_dropped(self):
+        """The reload window is ~20ms of real time in which no instance owns the sink. Dropping those
+        lines would make the reload lossy in a way no one could see; buffering makes it merely late."""
+        emit = re.search(r'function emit\(.*?\n\}', self.src, re.DOTALL)
+        self.assertIsNotNone(emit, "emit() moved; re-point this test")
+        self.assertIn("stash.pending.push", emit.group(0),
+                      "an event arriving while no instance owns the sink must be held, not dropped")
+        start = self._start()
+        self.assertIn("stash.pending.splice(0)", start,
+                      "the new instance must drain what the handover buffered, or the buffer is a "
+                      "slower way of losing the same events")
+        self.assertLess(start.index("stash.sink ="), start.index("takeOrphanedCells"),
+                        "claim the sink before anything else can produce a line")
+
+    # ---- the record: how a lost stash is noticed ----
+
+    def test_the_record_is_written_even_when_the_stash_survived(self):
+        """It is tombstoned unread on the fast path, and that is fine - it costs one entry and it is the
+        only thing standing between a future Pi teardown and silent deafness."""
+        reload_branch = self._shutdown().split('event.reason === "reload"')[1].split("return;")[0]
+        self.assertIn("pi.appendEntry", reload_branch,
+                      "every reload must record the joined cells, because this instance cannot know "
+                      "whether the NEXT one will still have the stash")
 
     def test_nothing_is_recorded_when_nothing_was_joined(self):
         """The dormancy contract: a session that never joined leaves no trace, entries included."""
-        shutdown = re.search(r'pi\.on\("session_shutdown".*?\n\t\}\);', self.src, re.DOTALL)
-        before_append = shutdown.group(0).split("pi.appendEntry")[0]
-        self.assertIn("state.towers.size === 0", before_append,
-                      "the early return for an empty tower map must come BEFORE the entry is written, "
-                      "or a never-joined session starts leaving session entries behind")
+        reload_branch = self._shutdown().split('event.reason === "reload"')[1].split("return;")[0]
+        self.assertLess(reload_branch.index("stash.towers.size > 0"), reload_branch.index("pi.appendEntry"),
+                        "the emptiness check must come BEFORE the entry is written, or a never-joined "
+                        "session starts leaving session entries behind")
 
-    def test_a_reload_tells_the_model_it_went_deaf_without_rejoining_for_it(self):
-        start = re.search(r'pi\.on\("session_start".*?\n\t\}\);', self.src, re.DOTALL)
-        self.assertIsNotNone(start, "the session_start handler moved; re-point this test")
-        body = start.group(0)
-        self.assertIn('event.reason === "reload"', body,
-                      "only a reload orphans watchtowers this way; a resume or fork must not be told about them")
-        self.assertIn("cccp_join", body, "the notice must name the tool the model rejoins with")
-        self.assertNotRegex(body, r'spawn\(|watchtowerArgs\(',
-                            "the extension must never rejoin a cell for the model: membership stays an "
-                            "agent-driven tool call, exactly as it is on a first join")
+    def test_the_record_carries_the_join_config_not_just_the_slug(self):
+        reload_branch = self._shutdown().split('event.reason === "reload"')[1].split("return;")[0]
+        self.assertIn("idleMinutes", reload_branch,
+                      "the record must carry each cell's idle setting, or a fallback re-arm silently "
+                      "restores heartbeats the comrade had disabled (#38)")
 
-    def test_the_notice_costs_a_turn_like_every_other_deaf_alarm(self):
-        """`nextTurn` would sit unread until the user happened to type again - that is the silence."""
-        start = re.search(r'pi\.on\("session_start".*?\n\t\}\);', self.src, re.DOTALL)
-        notice = start.group(0).split('event.reason === "reload"')[1]
-        self.assertIn('triggerTurn: true', notice.split("resolveEnvironment")[0],
-                      "going deaf is worth a turn of its own, the same way a watchtower exit is")
+    def test_the_record_is_taken_on_every_start_whatever_the_reason(self):
+        start = self._start()
+        take = re.search(r'const recorded = takeOrphanedCells\(.*?\);', start, re.DOTALL)
+        self.assertIsNotNone(take, "takeOrphanedCells moved; re-point this test")
+        self.assertNotIn("event.reason", take.group(0),
+                         "the TAKE must stay unconditional - gating it parks the record and lets a "
+                         "later reload re-arm cells this comrade left behind long ago")
 
+    # ---- the fallback: what happens the day the stash is gone ----
+
+    def test_a_lost_stash_falls_back_to_rearming(self):
+        recover = self._recover()
+        self.assertIn("armWatchtower", recover,
+                      "with the stash gone, the recorded cells are all that is left and must be re-armed")
+        self.assertIn("recorded.cells", recover, "the fallback re-arms from the sanctioned record")
+
+    def test_an_unreadable_record_alarms_rather_than_guessing(self):
+        """A session that reloads across an upgrade carries the PREVIOUS version's record shape. We will
+        not guess what it meant - but a comrade that was joined to SOMETHING and cannot tell what is
+        #33's deaf comrade, and silence is the one answer that is certainly wrong."""
+        recover = self._recover()
+        unreadable = recover.split("recorded.unreadable.length > 0")[1].split("return;")[0]
+        self.assertIn("triggerTurn: true", unreadable,
+                      "an unreadable record means deaf-and-cannot-say-which-cells, which is worth a turn")
+        self.assertIn("cccp_join", unreadable, "the alarm must name the tool the model rejoins with")
+        self.assertNotIn("armWatchtower", unreadable,
+                         "we do not guess what an older version's record meant; we report it")
+
+    def test_a_failed_rearm_still_costs_a_turn_like_every_other_deaf_alarm(self):
+        """`nextTurn` would sit unread until the user happened to type again - that is the silence #33
+        exists to break, and a failed re-arm is exactly #33's deaf comrade."""
+        failure = self._recover().split("failed.length > 0")[1]
+        self.assertIn("triggerTurn: true", failure, "a failed re-arm IS the deaf comrade")
+        self.assertIn("cccp_join", failure, "the failure notice must name the tool the model rejoins with")
+
+    def test_a_successful_fallback_rearm_does_not_cost_a_turn(self):
+        success = self._recover().split("armed.length > 0")[1].split("failed.length > 0")[0]
+        self.assertIn('deliverAs: "nextTurn"', success,
+                      "a recovered comrade is not deaf; only going deaf earns a turn of its own")
+        self.assertNotIn("triggerTurn: true", success,
+                         "recovering from a reload must not trigger a turn just to say it worked")
+
+    def test_the_fallback_notice_admits_the_gap_the_fast_path_does_not_have(self):
+        """A RESTARTED watchtower starts at the live edge and never replays backlog (bin/cccp's
+        initial_scan fast-forwards past everything already written), so the fallback really did miss the
+        reload window. The fast path never stopped polling and has no such gap - which is why only this
+        notice mentions one."""
+        success = self._recover().split("armed.length > 0")[1].split("failed.length > 0")[0]
+        self.assertIn("cccp read", success,
+                      "the fallback must point at the one command that shows what the window swallowed")
+
+    def test_rearm_waits_for_the_resolved_environment(self):
+        """Spawning needs PATH pointing at the cccp binary and CCCP_COMRADE_ID naming the identity the
+        new watchtower claims; both are resolveEnvironment's output."""
+        start = self._start()
+        self.assertLess(start.index("resolveEnvironment"), start.index("recoverAfterReload"),
+                        "recovery must be sequenced AFTER resolveEnvironment")
+        self.assertLess(start.index("recoverAfterReload"), start.index("telemetry.initialize"),
+                        "and BEFORE telemetry, which can wait while a deaf comrade cannot")
+
+    # ---- structure ----
+
+    def test_the_stash_is_namespaced_and_lives_on_globalThis(self):
+        """Module scope does not survive a reload; globalThis does. It is shared with the whole Pi
+        runtime and every other extension, so the key must not be a common word."""
+        self.assertIn("globalThis", self.src, "the live handles have nowhere else to survive a reload")
+        key = re.search(r'const STASH_KEY = "([^"]+)"', self.src)
+        self.assertIsNotNone(key, "STASH_KEY moved; re-point this test")
+        self.assertIn("cccp", key.group(1).lower(),
+                      "a globalThis key shared with the whole runtime must be namespaced to cccp")
+
+    def test_the_undocumented_mechanism_is_never_the_only_mechanism(self):
+        """Pi does not document globalThis surviving a reload and warns against assuming in-memory state
+        does. Relying on it alone would mean a future Pi silently reintroduces the deaf comrade."""
+        recover = self._recover()
+        self.assertIn("recorded.cells", recover,
+                      "there must be a sanctioned fallback behind the globalThis fast path")
+        self.assertIn("globalThis", self.src)
+
+    def test_join_and_rearm_cannot_drift_apart(self):
+        """One spawn site. A re-arm that built its own would be free to diverge from a join - different
+        idle handling, no stderr tail, no death alarm - and nothing here would notice.
+
+        This test also exists because its predecessor did not catch a change of exactly this kind: the
+        old doctrine was pinned by asserting `spawn(` did not appear in the session_start body, and
+        extracting the spawn into a helper satisfied that assertion while reversing the rule it
+        protected. Structure, not proximity."""
+        self.assertEqual(self.src.count("spawn(CCCP"), 1,
+                         "exactly one place may spawn a watchtower, so join and re-arm cannot disagree")
+        arm = re.search(r'function armWatchtower.*?\n\t\}', self.src, re.DOTALL).group(0)
+        self.assertIn("watchtowerArgs(cell, idleMinutes)", arm,
+                      "the shared spawn must pass the recorded idle setting through")
+
+    def test_a_watchtower_that_cannot_spawn_is_never_an_uncaught_error(self):
+        """An unhandled `error` event on a ChildProcess is thrown, and a throw in an async callback is
+        the uncaughtException that exits pi outright - #33's failure mode by a different road, reachable
+        now that a fallback re-arm can spawn with no model in the loop."""
+        arm = re.search(r'function armWatchtower.*?\n\t\}', self.src, re.DOTALL).group(0)
+        self.assertIn('proc.on("error"', arm,
+                      "a spawn failure must be reported as one dead cell, not kill the whole comrade")
 
 class TypeCheck(unittest.TestCase):
     def test_extension_typechecks(self):
