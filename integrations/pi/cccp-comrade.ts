@@ -68,6 +68,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline";
 import { fileURLToPath } from "node:url";
+import { Container, Markdown, Text, type Component } from "@earendil-works/pi-tui";
+import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerTokenWatch } from "./token-watch.ts";
@@ -290,6 +292,31 @@ function takeOrphanedCells(pi: ExtensionAPI, entries: readonly { type: string; c
 		return taken;
 	}
 	return { cells: [], unreadable: [] };
+}
+
+class HeadTailMarkdown implements Component {
+	private readonly markdown: Markdown;
+	private readonly omission: (text: string) => string;
+
+	constructor(text: string, color: (text: string) => string, omission: (text: string) => string) {
+		this.markdown = new Markdown(text, 0, 0, getMarkdownTheme(), { color });
+		this.omission = omission;
+	}
+
+	render(width: number): string[] {
+		const lines = this.markdown.render(width);
+		if (lines.length <= 7) return lines;
+		const omitted = lines.length - 6;
+		return [
+			...lines.slice(0, 3),
+			this.omission(`… (${omitted} lines omitted)`),
+			...lines.slice(-3),
+		];
+	}
+
+	invalidate(): void {
+		this.markdown.invalidate();
+	}
 }
 
 export default function (pi: ExtensionAPI) {
@@ -592,6 +619,31 @@ export default function (pi: ExtensionAPI) {
 				child.stdin?.end();
 			});
 			return { content: [{ type: "text" as const, text: output || "Dispatch sent" }], details: { cell: params.cell, to: params.to ?? ["*"] } };
+		},
+		renderCall(args, theme) {
+			const recipients = args.to?.join(" ") || "*";
+			const row = new Container();
+			row.addChild(new Text(
+				theme.fg("toolTitle", theme.bold("cccp_dispatch")) +
+					" | " + theme.bold(theme.fg("accent", args.cell)) +
+					" | " + theme.fg("muted", recipients),
+				0,
+				0,
+			));
+			row.addChild(new HeadTailMarkdown(
+				args.message,
+				(value) => theme.fg("toolOutput", value),
+				(value) => theme.fg("dim", value),
+			));
+			return row;
+		},
+		renderResult(result, _options, theme, context) {
+			if (!context.isError) return new Container();
+			const text = result.content
+				.filter((item) => item.type === "text")
+				.map((item) => item.text ?? "")
+				.join("\n");
+			return new Text(theme.fg("error", text), 0, 0);
 		},
 	});
 }
