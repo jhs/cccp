@@ -86,6 +86,7 @@ Each send is a `Bash` call. Use the **slug** as the first argument. `--to <comra
 | Message with quotes/code/multi-line | `cccp dispatch <slug> - <<'EOF' … EOF` (stdin, verbatim — see mechanics) |
 | Share a file | `cccp publish <slug> /path/to/file` |
 | Withdraw a shared file | `cccp unpublish <slug> /path/to/file` (same path as published) |
+| Withdraw my big files, keep the small | `cccp unpublish <slug> --larger-than 1m` |
 | Fetch published file(s) on demand | `cccp pull <slug> <path> [<path> ...]` |
 | Read message history | `cccp read <slug> [--from <id>] [--to <id>] [--last N | --ts <ts>]` |
 | Wake the watchtower (event waiting!) | `cccp wake <slug>` |

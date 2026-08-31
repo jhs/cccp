@@ -1907,7 +1907,8 @@ class RecipientResolution(unittest.TestCase):
     def test_unpublish_to_alias_announces_the_resolved_id(self):
         with self._cell():
             self._quiet(cccp.cmd_publish, path=str(self.src), to=["Captain"])
-            self._quiet(cccp.cmd_unpublish, path=str(self.src), to=["Captain"])
+            self._quiet(cccp.cmd_unpublish, path=str(self.src), to=["Captain"],
+                        larger_than=None)
         ann = [d for d in self._gazette(self.ME) if d.get("op") == "unpublish"]
         self.assertEqual(len(ann), 1)
         self.assertEqual(ann[0]["to"], [self.PEER])
@@ -2039,6 +2040,132 @@ class PublishedCatalogue(unittest.TestCase):
 
     def test_empty_cell_is_an_empty_catalogue(self):
         self.assertEqual(self._cat(), {})
+
+
+class UnpublishLargerThan(unittest.TestCase):
+    """`unpublish --larger-than` selects on the size the PUBLISH ANNOUNCEMENT claims,
+    not the file on disk (#40). By wind-down time the local original may be edited or
+    already deleted, and what matters is what peers can still pull."""
+
+    ME = "me@hostA:cc-aaaaaa"
+    PEER = "peer@hostB:cc-bbbbbb"
+
+    def setUp(self):
+        self.data = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.data, True))
+        self.slug = "demo"
+
+    @contextlib.contextmanager
+    def _cell(self):
+        with _isolated_env(self.data, CCCP_COMRADE_ID=self.ME):
+            yield
+
+    def _args(self, **kw):
+        return type("Args", (), dict({"cell": self.slug, "to": [], "path": None,
+                                      "larger_than": None}, **kw))()
+
+    def _run(self, fn, **kw):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            fn(self._args(**kw))
+        return out.getvalue()
+
+    def _publish(self, name, nbytes):
+        src = Path(self.data, name)
+        src.write_bytes(b"x" * nbytes)
+        self._run(cccp.cmd_publish, path=str(src))
+        return src
+
+    def _live(self, sender=None):
+        """The wire paths `sender` still has published, straight from the gazettes."""
+        cfg = cccp.resolve_config()
+        client = cccp.make_backend(cfg)
+        cat = cccp.published_catalogue(client, cfg["PREFIX"], self.slug)
+        return sorted(wp for (s, wp), _ in cat.items()
+                      if sender is None or s == sender)
+
+    def test_retracts_the_big_and_leaves_the_small(self):
+        with self._cell():
+            self._publish("big.bin", 4096)
+            self._publish("small.txt", 10)
+            out = self._run(cccp.cmd_unpublish, larger_than="1k")
+            live = self._live()
+        self.assertIn("big.bin", out)
+        self.assertNotIn("small.txt", out)
+        self.assertEqual(live, [f"files{self.data}/small.txt".replace("//", "/")])
+
+    def test_the_boundary_is_strictly_greater(self):
+        """The exact complement of CCCP_AUTODOWNLOAD_MAX, which auto-downloads at or
+        BELOW its value. So --larger-than <that> retracts exactly what a peer's
+        watchtower declined to fetch, and a file of exactly that size stays."""
+        with self._cell():
+            self._publish("exact.bin", 1024)
+            out = self._run(cccp.cmd_unpublish, larger_than="1k")
+            self.assertEqual(len(self._live()), 1)
+        self.assertIn("nothing of mine", out)
+
+    def test_size_comes_from_the_announcement_not_the_disk(self):
+        """Deleting the local file after publishing must not hide it from the
+        selector - that is precisely the wind-down case."""
+        with self._cell():
+            src = self._publish("gone.bin", 4096)
+            src.unlink()
+            self._run(cccp.cmd_unpublish, larger_than="1k")
+            self.assertEqual(self._live(), [])
+
+    def test_it_only_touches_my_own_files(self):
+        """A peer's big file is in the same catalogue and must survive: I can only
+        withdraw what I announced."""
+        with _isolated_env(self.data, CCCP_COMRADE_ID=self.PEER):
+            src = Path(self.data, "theirs.bin")
+            src.write_bytes(b"y" * 4096)
+            self._run(cccp.cmd_publish, path=str(src))
+        with self._cell():
+            self._publish("mine.bin", 4096)
+            self._run(cccp.cmd_unpublish, larger_than="1k")
+            self.assertEqual(self._live(self.ME), [])
+            self.assertEqual(len(self._live(self.PEER)), 1)
+
+    def test_one_scalar_path_dispatch_per_file(self):
+        """The wire is unchanged: N ordinary unpublish events, each with a scalar
+        `path`, so a 3.10 watchtower drops N mirror copies knowing nothing of the
+        flag. Batching into a list-valued path would have been a format change."""
+        with self._cell():
+            self._publish("a.bin", 4096)
+            self._publish("b.bin", 8192)
+            self._run(cccp.cmd_unpublish, larger_than="1k")
+            cfg = cccp.resolve_config()
+            client = cccp.make_backend(cfg)
+            st, body = client.get(cccp.gazette_path(cfg["PREFIX"], self.slug, self.ME))
+        anns = [json.loads(x) for x in body.splitlines()]
+        unpubs = [d for d in anns if d.get("op") == "unpublish"]
+        self.assertEqual(len(unpubs), 2)
+        for d in unpubs:
+            self.assertIsInstance(d["path"], str)
+            self.assertEqual(set(d) - {"lines"},
+                             {"type", "op", "ts", "from", "to", "path"})
+
+    def test_a_malformed_size_is_refused_before_anything_is_deleted(self):
+        with self._cell():
+            self._publish("big.bin", 4096)
+            with self.assertRaises(SystemExit) as cm:
+                self._run(cccp.cmd_unpublish, larger_than="1 gigabyte")
+            self.assertEqual(len(self._live()), 1)
+        self.assertIn("not a size", str(cm.exception))
+
+    def test_path_and_larger_than_are_exclusive_and_one_is_required(self):
+        for kw in ({"path": "/tmp/x", "larger_than": "1m"}, {}):
+            with self.assertRaises(SystemExit) as cm:
+                self._run(cccp.cmd_unpublish, **kw)
+            self.assertIn("exactly one", str(cm.exception))
+
+    def test_naming_a_path_still_withdraws_just_that_file(self):
+        with self._cell():
+            src = self._publish("a.bin", 4096)
+            self._publish("b.bin", 8192)
+            self._run(cccp.cmd_unpublish, path=str(src))
+            self.assertEqual([wp.rsplit("/", 1)[-1] for wp in self._live()],
+                             ["b.bin"])
 
 
 if __name__ == "__main__":

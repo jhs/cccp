@@ -34,7 +34,7 @@ Subcommands:
     read        Print cell message history.
     rm          Delete a cell and all its blobs (user-directed).
     publish     Share a file with a cell.
-    unpublish   Withdraw a previously-published file.
+    unpublish   Withdraw a published file, or all of mine over a size.
     pull        Download published files into the local mirror.
 """
 
@@ -2869,8 +2869,11 @@ def cmd_publish(args):
 
 
 def cmd_unpublish(args):
-    """Delete a previously-published file blob and announce the withdrawal.
-    Uses the same path that was given to publish."""
+    """Withdraw published files: one named path, or every file of mine bigger than
+    --larger-than. The size selector is for a departing comrade's wind-down - retract
+    the big binaries, leave the small text artifacts shared."""
+    if (args.path is None) == (args.larger_than is None):
+        sys.exit("error: unpublish takes exactly one of PATH or --larger-than")
     cfg = resolve_config()
     client = make_backend(cfg)
     slug = slugify(args.cell)
@@ -2879,14 +2882,35 @@ def cmd_unpublish(args):
     client.log = log
     with subcommand_footer(log):
         to = resolve_targets(slug, args.to)
-        src = Path(os.path.abspath(os.path.expanduser(args.path)))
-        rel = str(src).lstrip("/")
-        client.delete(published_blob(cfg["PREFIX"], slug, me, f"files/{rel}"))  # 404 ok
-        d = {"type": "filesystem", "op": "unpublish", "ts": now_iso(), "from": me,
-             "to": to, "path": f"files/{rel}"}
-        append_dispatch(client, cfg["PREFIX"], slug, me, d)
+        if args.larger_than is None:
+            src = Path(os.path.abspath(os.path.expanduser(args.path)))
+            wire_paths = ["files/" + str(src).lstrip("/")]
+        else:
+            limit = parse_size(args.larger_than)
+            if limit is None:
+                sys.exit(f"error: --larger-than: {args.larger_than!r} is not a size. "
+                         f"Try 4096, 512k, 1m, 1g - the grammar CCCP_AUTODOWNLOAD_MAX "
+                         f"uses.")
+            # The announced size, not the file on disk: the wire is what peers can
+            # pull, and by wind-down time the local original may be edited or gone.
+            # Strictly greater, so --larger-than <autodownload max> retracts exactly
+            # what a peer's watchtower declined to auto-download.
+            catalogue = published_catalogue(client, cfg["PREFIX"], slug)
+            wire_paths = sorted(wp for (sender, wp), d in catalogue.items()
+                                if sender == me and d.get("size", 0) > limit)
+            if not wire_paths:
+                print(f"nothing of mine is published over {args.larger_than}")
+                return
+        # One dispatch per file, deliberately: `path` is scalar on the wire, so a
+        # 3.10 watchtower sees N ordinary unpublishes and drops N mirror copies
+        # without knowing this flag exists.
+        for wire_path in wire_paths:
+            client.delete(published_blob(cfg["PREFIX"], slug, me, wire_path))  # 404 ok
+            d = {"type": "filesystem", "op": "unpublish", "ts": now_iso(), "from": me,
+                 "to": to, "path": wire_path}
+            append_dispatch(client, cfg["PREFIX"], slug, me, d)
+            print(f"unpublished {display_path(wire_path)}")
         wake_recipients(slug, to, log)
-        print(f"unpublished {rel}")
 
 
 def cmd_pull(args):
@@ -3491,7 +3515,11 @@ def build_parser():
     unp.add_argument("cell", help="Cell slug.")
     unp.add_argument("--to", action="append", default=[], metavar="COMRADE",
                      help="Repeatable. Comrade id or alias; omit for broadcast.")
-    unp.add_argument("path", help="Path of the file to withdraw (as published).")
+    unp.add_argument("path", nargs="?",
+                     help="Path of the file to withdraw (as published).")
+    unp.add_argument("--larger-than", metavar="SIZE",
+                     help="Instead of a path, withdraw every file of mine whose "
+                          "announced size is over SIZE (4096, 512k, 1m, 1g).")
     unp.set_defaults(func=cmd_unpublish)
 
     pl = sub.add_parser("pull",
