@@ -538,8 +538,16 @@ export default function (pi: ExtensionAPI) {
 				triggerTurn: true,
 			});
 		});
-		proc.on("exit", (code) => {
-			log(code === 0 ? "INFO" : "ERROR", `Cell ${cell} watchtower exited: ${code}`);
+		// (code, signal), not (code): a process killed by a signal reports code === null and carries the
+		// signal in the second argument. Dropping it rendered `code=null` — true, and useless. A Claude Code
+		// comrade watching the same watchtower under the Monitor tool is told what killed it, and this is a
+		// thin shim over the same `cccp` program, so a Pi comrade should learn no less. SIGKILL in particular
+		// is a different conversation with the user than a non-zero exit: it usually means the OOM killer,
+		// not a bug in cccp. A clean `cccp stop` runs the watchtower's own handler and exits 0, so a signal
+		// arriving here means it died without one.
+		proc.on("exit", (code, signal) => {
+			const how = signal ? `signal=${signal}` : `code=${code}`;
+			log(code === 0 ? "INFO" : "ERROR", `Cell ${cell} watchtower exited: ${how}`);
 			if (stash.towers.get(cell)?.proc === proc) stash.towers.delete(cell);
 			// Clean exits need no alarm: a deliberate stop (session end, `cccp stop`) already announced itself
 			// via the shutdown event. Anything else means a DEAF comrade — cell events stop arriving while
@@ -549,7 +557,7 @@ export default function (pi: ExtensionAPI) {
 			if (code === 0) return;
 			const detail = tower.stderrTail.length ? `\nRecent watchtower stderr:\n${tower.stderrTail.join("\n")}` : "";
 			emit(stash, cell, {
-				content: `Your CCCP watchtower for cell '${cell}' exited (code=${code}). You are NO LONGER receiving that cell's events, though outgoing cccp_dispatch may still work. Tell the user now, and rejoin with cccp_join if appropriate.${detail}`,
+				content: `Your CCCP watchtower for cell '${cell}' exited (${how}). You are NO LONGER receiving that cell's events, though outgoing cccp_dispatch may still work. Tell the user now, and rejoin with cccp_join if appropriate.${detail}`,
 				deliverAs: "followUp",
 				triggerTurn: true,
 			});

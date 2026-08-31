@@ -616,6 +616,66 @@ class SurviveReload(unittest.TestCase):
         self.assertIn('proc.on("error"', arm,
                       "a spawn failure must be reported as one dead cell, not kill the whole comrade")
 
+class WatchtowerDeath(unittest.TestCase):
+    """How a watchtower died must reach the comrade, not just that it died.
+
+    A Claude Code comrade watches the same `cccp watchtower` under the Monitor tool and is told what
+    killed it. This extension is a thin shim over the same program, so a Pi comrade should learn no
+    less - and a signal death is the case that used to arrive as `code=null`, which is true and
+    useless. SIGKILL is a different conversation with the user than a non-zero exit: it usually means
+    the OOM killer rather than a bug in cccp."""
+
+    def setUp(self):
+        self.src = EXTENSION.read_text()
+
+    def _arm(self):
+        m = re.search(r"function armWatchtower.*?\n\t\}", self.src, re.DOTALL)
+        self.assertIsNotNone(m, "armWatchtower moved or was renamed; re-point this test")
+        return m.group(0)
+
+    def test_the_exit_handler_takes_the_signal_node_hands_it(self):
+        """Node's `exit` is (code, signal). Taking only the first argument silently discards the one
+        fact that matters when a process is killed rather than exiting."""
+        self.assertRegex(self._arm(), r'\.on\("exit",\s*\(code,\s*signal\)',
+                         "the exit handler must accept the signal argument, not just the code")
+
+    def test_a_signal_death_is_reported_as_a_signal_not_as_code_null(self):
+        arm = self._arm()
+        self.assertIn("signal ?", arm,
+                      "a signal death must render the signal; code is null in that case")
+        self.assertNotIn("(code=${code})", arm,
+                         "the alarm must not hardcode code=, which prints `code=null` on a signal death")
+
+    def test_both_the_log_and_the_alarm_say_how_it_died(self):
+        """The log serves whoever reads pi-comrade.log afterwards; the alarm serves the agent in the
+        moment. Fixing one and not the other leaves the two disagreeing about the same death."""
+        arm = self._arm()
+        self.assertEqual(arm.count("${how}"), 2,
+                         "both the log line and the emitted alarm must carry how the watchtower died")
+
+    def test_node_really_does_hand_over_the_signal(self):
+        """Guards the assumption the fix rests on, rather than trusting the docs: a killed child
+        reports code=None and names the signal."""
+        # `exec` so the signal reaches the sleep itself: without it, killing the sh leaves an orphaned
+        # sleep holding the inherited stdio pipes open, and node waits out the full sleep before
+        # exiting - which cost this one test 30 seconds. Explicit exit for the same reason.
+        script = (
+            'const { spawn } = require("node:child_process");'
+            'const p = spawn("sh", ["-c", "exec sleep 30"], { stdio: ["ignore", "pipe", "pipe"] });'
+            'p.on("exit", (code, signal) => {'
+            '  console.log(JSON.stringify({ code, signal }));'
+            '  process.exit(0);'
+            '});'
+            'setTimeout(() => p.kill("SIGKILL"), 100);'
+        )
+        r = subprocess.run(["node", "--no-warnings", "-e", script],
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, f"node failed:\n{r.stderr}")
+        out = json.loads(r.stdout.strip().splitlines()[-1])
+        self.assertIsNone(out["code"], "a signal death carries no exit code")
+        self.assertEqual(out["signal"], "SIGKILL", "the signal is what there is to report")
+
+
 class TypeCheck(unittest.TestCase):
     def test_extension_typechecks(self):
         if not (REPO / "node_modules" / ".bin" / "tsc").exists():
