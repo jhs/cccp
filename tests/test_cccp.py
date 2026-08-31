@@ -1950,5 +1950,96 @@ class RecipientResolution(unittest.TestCase):
                           f"{name} takes an alias for {dest} but does not say so")
 
 
+class PublishedCatalogue(unittest.TestCase):
+    """published_catalogue() replays gazettes into "what is published right now".
+
+    The announcements ARE the catalogue - there is no index blob - so every rule
+    here is really a rule about replay order. `unpublish --larger-than` selects on
+    the `size` this returns, so a stale or dropped entry would retract the wrong
+    file, or silently retract nothing."""
+
+    ME = "me@hostA:cc-aaaaaa"
+    PEER = "peer@hostB:cc-bbbbbb"
+    PREFIX = ""
+    SLUG = "demo"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.client = cccp.LocalFilesBackend(self._tmp.name)
+
+    def _append(self, sender, d):
+        path = cccp.gazette_path(self.PREFIX, self.SLUG, sender)
+        self.client.ensure_append_blob(path)
+        self.client.append_block(path, (json.dumps(d) + "\n").encode())
+
+    def _pub(self, sender, path, size=10, **kw):
+        self._append(sender, dict({"type": "filesystem", "op": "publish",
+                                   "path": f"files/{path.lstrip('/')}",
+                                   "from": sender, "size": size}, **kw))
+
+    def _unpub(self, sender, path):
+        self._append(sender, {"type": "filesystem", "op": "unpublish",
+                              "path": f"files/{path.lstrip('/')}", "from": sender})
+
+    def _cat(self):
+        return cccp.published_catalogue(self.client, self.PREFIX, self.SLUG)
+
+    def test_unpublish_cancels_an_earlier_publish(self):
+        self._pub(self.ME, "/tmp/a.txt")
+        self._pub(self.ME, "/tmp/b.bin")
+        self._unpub(self.ME, "/tmp/a.txt")
+        self.assertEqual(sorted(wp for _, wp in self._cat()), ["files/tmp/b.bin"])
+
+    def test_republish_after_unpublish_is_live_again(self):
+        """Order decides, not presence: the last op for a path wins. A catalogue
+        that merely diffed the two sets would leave this file retracted."""
+        self._pub(self.ME, "/tmp/a.txt", size=10)
+        self._unpub(self.ME, "/tmp/a.txt")
+        self._pub(self.ME, "/tmp/a.txt", size=999)
+        cat = self._cat()
+        self.assertEqual(len(cat), 1)
+        self.assertEqual(cat[(self.ME, "files/tmp/a.txt")]["size"], 999)
+
+    def test_an_unpublish_only_cancels_the_same_sender_s_publish(self):
+        """The key is (sender, path). Two comrades publishing the same absolute
+        path are two entries, and one retracting must not retract the other's."""
+        self._pub(self.ME, "/tmp/same.txt")
+        self._pub(self.PEER, "/tmp/same.txt")
+        self._unpub(self.PEER, "/tmp/same.txt")
+        self.assertEqual(list(self._cat()), [(self.ME, "files/tmp/same.txt")])
+
+    def test_every_comrade_s_gazette_is_read(self):
+        """The roster comes from the gazettes themselves, so a cell's catalogue is
+        every comrade's publishes, keyed by who announced them."""
+        self._pub(self.ME, "/tmp/mine.txt")
+        self._pub(self.PEER, "/tmp/theirs.txt")
+        self.assertEqual({s for s, _ in self._cat()}, {self.ME, self.PEER})
+
+    def test_the_whole_publish_dispatch_is_kept(self):
+        """Callers select on `size` and verify on `lines`, so the value must be the
+        announcement itself, not a reduced tuple."""
+        self._pub(self.ME, "/tmp/a.txt", size=8421, lines=142)
+        d = self._cat()[(self.ME, "files/tmp/a.txt")]
+        self.assertEqual((d["size"], d["lines"], d["op"]), (8421, 142, "publish"))
+
+    def test_messages_and_junk_lines_do_not_derail_the_replay(self):
+        """A gazette carries messages too, and a torn write leaves an unparseable
+        line. Neither may abort the scan - the publishes after it still count."""
+        self._pub(self.ME, "/tmp/a.txt")
+        self._append(self.ME, {"type": "message", "from": self.ME, "body": "hi"})
+        path = cccp.gazette_path(self.PREFIX, self.SLUG, self.ME)
+        self.client.append_block(path, b"{not json at all\n")
+        self._pub(self.ME, "/tmp/b.txt")
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            cat = self._cat()
+        self.assertEqual(sorted(wp for _, wp in cat),
+                         ["files/tmp/a.txt", "files/tmp/b.txt"])
+        self.assertIn("unparseable", err.getvalue())
+
+    def test_empty_cell_is_an_empty_catalogue(self):
+        self.assertEqual(self._cat(), {})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
