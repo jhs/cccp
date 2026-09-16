@@ -2367,6 +2367,17 @@ class ServeMembership(unittest.TestCase):
         self.assertEqual(self.serve.cells["a"].idle_initial, 0)
         self.assertEqual(self.serve.cells["a"].quiet, {"filesystem"})
 
+    def test_rejoin_reclaims_the_pid_record(self):
+        """A hand-armed single-cell watchtower on a held cell overwrites the
+        (cell, comrade) record at start and removes it on exit; the serve
+        process still holds the cell, but wake and status read the record.
+        A re-join puts it back."""
+        self._join("a")
+        cccp.pid_path("a", self.ME).unlink()
+        self.assertEqual(cccp.held_cells(self.ME, os.getpid()), [])
+        self._join("a")
+        self.assertEqual(cccp.held_cells(self.ME, os.getpid()), ["a"])
+
     def test_leave_ends_only_that_cell(self):
         self._join("a")
         self._join("b")

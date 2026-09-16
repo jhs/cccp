@@ -2651,6 +2651,11 @@ class Serve:
         if cell is not None:
             cell.set_idle(idle_s)
             cell.quiet = set(quiet)
+            # Re-claim the cell's pid record too. A hand-armed single-cell
+            # watchtower on a cell we hold takes the record over at start and
+            # removes it on exit, after which wake and `cccp status` no longer
+            # see us in the cell; a re-join is the operator's repair.
+            cell._write_pidfile()
             self.log.debug(f"ev=cell_rejoin slug={_kv(slug)} idle_s={idle_s} "
                            f"quiet={_kv(','.join(quiet))}")
             # The record must describe the cell as held, and the trigger is

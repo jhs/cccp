@@ -36,6 +36,7 @@ Event lines are byte-identical to a single-cell watchtower's, because each held 
 - **Ready.** `ready <me> serve=true v=<version> store=<store>` for the process; `ready <me> slug=<slug> v=<version> store=<store> gazettes=<n>` per join. `store=` and `gazettes=` are #19: an attach to an empty or a wrong store must not announce itself like a healthy one.
 - **Leave.** `shutdown <me> slug=<slug> reason=leave`; that cell's deadlines and alias map go with it. `cccp stop <slug>` writes the same cell-inbox record it always did and means the same thing under a serve process.
 - **Death.** Every held cell says goodbye with the process's reason, then the process does (`shutdown <me> serve=true reason=<why>`). `cells.json` survives every death except a deliberate bare `cccp stop`, so a successor serve process for the same session — same `CLAUDE_CODE_SESSION_ID`, hence the same comrade id — rejoins the cells at startup. That is what makes the fallback a one-step re-arm.
+- **One record per (cell, comrade).** A hand-armed `cccp watchtower <slug>` on a cell the serve process already holds - which the skill forbids - takes over that record at start and removes it on exit; the serve process keeps polling the cell, but wake and `cccp status` no longer see it there until `cccp join <slug>` is run again, which re-claims the record.
 - **Orphans.** As before, the process exits when its parent changes (`parent_exited`) or its stdout closes (`stdout_closed`). A serve process holding no cell sleeps and checks its parent once a minute.
 
 ## Fallback
