@@ -91,6 +91,9 @@ WATCH_IDLE_DEFAULT_MIN = 30   # minutes of silence before a cell's first `idle` 
 QUIET_EVENTS = ("filesystem",)   # event types `--quiet` / CCCP_QUIET may suppress
 SERVE_ORPHAN_CHECK_SECONDS = 60   # how often a serve-mode watchtower holding no cell
                                   # wakes to check that its parent is still alive
+SERVE_ARM_GRACE_SECONDS = 10      # how long `cccp join`/`leave` wait for the serve-mode
+                                  # watchtower's pid record before failing loud: the
+                                  # plugin monitor arms 1-6 s after the skill invoke
 IDLE_MAX_SECONDS = 24 * 3600   # cap for the idle backoff - past this, idles fire
                                # at most once a day so a long-silent watchtower
                                # stops forcing Claude to wake and respond
@@ -1429,13 +1432,23 @@ def held_cells(me, pid):
                   if read_pid(p)[0] == pid)
 
 
-def require_serve(me):
+def require_serve(me, wait_s=SERVE_ARM_GRACE_SECONDS):
     """The pid of this session's live serve-mode watchtower, or a loud exit that
     says how to get one. This message is where the chat skill's fallback becomes
     discoverable at the moment it is needed (#47): the plugin monitor that
     should have armed it is gated by the harness (an older Claude Code, a
-    policy, an unaccepted workspace trust), and the model learns that here."""
-    pid = live_watchtower(None, me)
+    policy, an unaccepted workspace trust), and the model learns that here.
+
+    Waits up to `wait_s` for the record to appear: the plugin monitor arms a
+    few seconds after the skill is invoked, and the model's first `cccp join`
+    can land inside that window. The wait costs nothing when the process is
+    there and turns a spurious failure into a few seconds of patience."""
+    deadline = time.monotonic() + wait_s
+    while True:
+        pid = live_watchtower(None, me)
+        if pid is not None or time.monotonic() >= deadline:
+            break
+        time.sleep(0.25)
     if pid is None:
         _, detail = watchtower_status(None, me)
         sys.exit(f"error: no serve-mode watchtower is running for this session "
