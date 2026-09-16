@@ -3140,9 +3140,10 @@ def cmd_watchtower(args):
     # watchtower'` tells apart many watchtowers - the id is session-suffixed,
     # so even siblings on the same cell and host are distinguishable. A re-exec
     # rather than argv memory tricks: fully portable, and exec keeps pid/ppid/
-    # environ, so Monitor parenting, the ppid watchdog, and the wake pkill
-    # match (a space still follows the slug) are all unaffected. comrade_id()
-    # is pure and local, so the tag is identical to the `me` computed below.
+    # environ, so Monitor parenting and the ppid watchdog are unaffected. The
+    # tag is also the ownership proof the wake and status paths check a pid
+    # record against (is_watchtower_argv). comrade_id() is pure and local, so
+    # the tag is identical to the `me` computed below.
     # The tag is always the trailing `("--", id)` pair; main() strips it before
     # argparse (argparse's own `--` handling leaks through subparsers), and its
     # presence is the already-re-exec'd marker that stops a loop.
