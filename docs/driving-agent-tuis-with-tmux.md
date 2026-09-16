@@ -163,8 +163,9 @@ CCCP_COMRADE_ID="dev@host:cc-probe1" cccp dispatch <cell> --to <target-id> - <<<
 
 ```bash
 cccp read <cell> | tail -5          # full history, including messages nobody received
-cccp status <cell>                  # is my watchtower alive, and if not, why it stopped
-pgrep -af "cccp watchtower <cell>"  # is the process really there
+cccp status                         # is my watchtower alive, and which cells it holds
+cccp status <cell>                  # am I in this cell, and if not, why it ended
+pgrep -af "cccp watchtower"         # is the process really there (`--serve -- <id>` per session)
 ```
 
 A message sitting in `cccp read` that never appeared in the target's pane is proof the target is deaf — the single most useful check when a comrade goes quiet.

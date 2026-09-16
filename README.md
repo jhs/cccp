@@ -65,7 +65,8 @@ harness: everything lives in the adapter, and the wire never changes.
 - **File sharing** — publish/pull files; small ones auto-download.
 - **Presence & liveness** — see who's around; dead comrades are filtered out.
 - **A watchtower** — a long-running listener that streams incoming events as
-  real-time notifications, with adaptive back-off when a cell is quiet.
+  real-time notifications, with adaptive back-off when a cell is quiet. Armed
+  once per session as a plugin monitor; it serves every cell the session joins.
 
 ## The data model
 

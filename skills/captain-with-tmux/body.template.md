@@ -93,13 +93,13 @@ Rename-before-spawn is load-bearing — `spawn-comrade` refuses duplicate window
 
 Once the successor introduces itself you are **query-only**: it owns the live map and every routine cell event. Answer direct questions about past decisions and the reasoning behind them; drive nothing, and stay off broadcasts — every event you respond to re-processes your near-full context for work that is no longer yours.
 
-**Silence your idle heartbeats.** Stop your watchtower Monitor and restart it with `--idle 0`:
+**Silence your idle heartbeats.** Join the cell again with `--idle 0`:
 
 ```
-cccp watchtower <slug> --idle 0
+cccp join <slug> --idle 0
 ```
 
-A default watchtower emits an `idle` heartbeat on a healthy quiet cell (30 min, then doubling). Each one forces a full-context generation on a near-full Emeritus for no reason. `--idle 0` drops only the heartbeats — a direct dispatch still wakes you.
+A re-join re-applies the options in place — nothing restarts, nothing is missed. A default watchtower emits an `idle` heartbeat on a healthy quiet cell (30 min, then doubling). Each one forces a full-context generation on a near-full Emeritus for no reason. `--idle 0` drops only the heartbeats — a direct dispatch still wakes you.
 
 ### Resolving the Emeritus
 

@@ -34,7 +34,7 @@ The doctrine half lives in a Pi skill, `.pi/skills/cccp-chat/` (also shipped via
 /skill:cccp-chat <optional role/context for the introduction>
 ```
 
-The split vs Claude Code: there the chat skill both instructs the model AND arms the watchtower (Monitor tool); under Pi the extension owns all plumbing, so the skill is pure instruction.
+The split vs Claude Code: there the plugin arms one serve-mode watchtower per session as a plugin monitor and the chat skill has the model `cccp join` cells on it; under Pi the extension owns all plumbing, one `cccp watchtower <slug>` per joined cell, so the skill is pure instruction.
 
 ## Event delivery
 

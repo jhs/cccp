@@ -269,7 +269,7 @@ class SkillTemplateFile(unittest.TestCase):
         self.assertNotIn("$ARGUMENTS", rendered)             # args come from SKILL.md
         self.assertIn("bob@hostB:1a2b3c", rendered)
         self.assertIn("backend info", rendered)              # @@BACKEND@@ substituted
-        self.assertIn("cccp watchtower <slug>", rendered)    # bare command, no path
+        self.assertIn("cccp join <slug>", rendered)          # bare command, no path
         self.assertIn("<slug>", rendered)                    # slug stays a placeholder
 
     def test_template_declares_backend_token(self):
@@ -2513,7 +2513,7 @@ class ServeLifecycle(unittest.TestCase):
 
     def test_require_serve_fails_loud_with_the_way_out(self):
         with self.assertRaises(SystemExit) as cm:
-            cccp.require_serve(self.ME)
+            cccp.require_serve(self.ME, wait_s=0)
         self.assertIn("cccp:chat", str(cm.exception))
         self.assertIn("cccp watchtower --serve", str(cm.exception))
 
