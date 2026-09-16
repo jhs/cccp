@@ -1327,6 +1327,8 @@ class ConfigSet(unittest.TestCase):
         self.assertEqual(dest["CCCP_AZURE_BLOB_SAS"],
                          "backend/azure-blob/secrets")
         self.assertEqual(dest["CCCP_LOCAL_FS_ROOT"], "backend/local-fs/config")
+        self.assertEqual(dest["CCCP_IDLE"], "config")
+        self.assertEqual(dest["CCCP_QUIET"], "config")
         self.assertNotIn("CCCP_ACTIVE_BACKEND", dest)   # refused, not routed
         self.assertNotIn("CCCP_PLUGIN_DATA", dest)
 
@@ -1619,7 +1621,7 @@ class InboxShutdown(unittest.TestCase):
         cccp.inbox_path("demo", "me@h:mmm").parent.mkdir(parents=True,
                                                          exist_ok=True)
         self.wt._reset_inbox()
-        with mock.patch.object(cccp, "wake_watchtowers", lambda slug: 0):
+        with mock.patch.object(cccp, "wake_watchtowers", lambda slug, comrade=None: 0):
             cccp.inbox_send("demo", "me@h:mmm", [{"ev": "shutdown"}])
         self.wt._poll_once()   # drains, stops, and must not touch the client
         self.assertTrue(self.wt.stop)
@@ -1693,6 +1695,9 @@ class WakeByPidRecord(unittest.TestCase):
         self.assertEqual(cccp.wake_watchtowers(self.SLUG), 2)
         self.assertEqual(sorted(self.killed),
                          [(101, cccp.signal.SIGUSR1), (102, cccp.signal.SIGUSR1)])
+        # The signal names no cell; the record written just before it does.
+        for owner in ("u@h:aaaaaa", "u@h:bbbbbb"):
+            self.assertIn(b'{"ev":"wake"}', cccp.inbox_path(self.SLUG, owner).read_bytes())
 
     def test_named_comrade_narrows_to_one(self):
         self._record("u@h:aaaaaa", 101, "/p /x/bin/cccp watchtower demo -- u@h:aaaaaa")
@@ -2412,6 +2417,43 @@ class ServeMembership(unittest.TestCase):
         self.assertFalse(cccp.pid_path("a", self.ME).exists())
         self.assertIn(f"shutdown {self.ME} slug=a reason=crash_RuntimeError", self.lines)
 
+    def test_wake_resets_only_the_cells_it_was_for(self):
+        self._join("a")
+        self._join("b")
+        for slug in ("a", "b"):
+            self.serve.cells[slug].ladder_step = 5
+            self.serve.due[slug] = 1e12
+        cccp._note_wake("a", self.ME)
+        self.serve._wake_cells()
+        self.assertEqual((self.serve.cells["a"].ladder_step, self.serve.due["a"]), (-1, 0.0))
+        self.assertEqual((self.serve.cells["b"].ladder_step, self.serve.due["b"]), (5, 1e12),
+                         "a wake for a must not drag b into fast polling")
+
+    def test_membership_wake_polls_nothing(self):
+        self._join("a")
+        self.serve.cells["a"].ladder_step = 5
+        self.serve.due["a"] = 1e12
+        cccp.inbox_send(None, self.ME, [{"ev": "ping"}])   # the session inbox grew
+        self.serve._wake_cells()
+        self.assertEqual(self.serve.due["a"], 1e12)
+
+    def test_wake_naming_no_cell_resets_every_cell(self):
+        self._join("a")
+        self._join("b")
+        for slug in ("a", "b"):
+            self.serve.due[slug] = 1e12
+        self.serve._wake_cells()
+        self.assertEqual(set(self.serve.due.values()), {0.0})
+
+    def test_rejoin_keeps_the_trigger_it_was_joined_with(self):
+        self._join("a", trigger="Intro:")
+        self._join("a", idle=0)   # a plain shell's re-join carries no trigger
+        self.assertEqual(self.serve.cells["a"].trigger, "Intro:")
+        recorded = json.loads(cccp.cells_path(self.ME).read_text())
+        self.assertEqual(recorded["a"]["trigger"], "Intro:",
+                         "a successor must rejoin with aliases still on")
+        self.assertEqual(recorded["a"]["idle"], 0)
+
     def test_options_default_and_are_bounded(self):
         self._join("a", idle=7, quiet=["filesystem", "bogus"])
         self.assertEqual(self.serve.cells["a"].idle_initial, 7 * 60)
@@ -2510,6 +2552,17 @@ class ServeLifecycle(unittest.TestCase):
         with mock.patch.object(cccp, "process_argv", lambda pid: argv):
             self.assertEqual(cccp.watchtower_status(None, self.ME)[0], "alive")
             self.assertEqual(cccp.live_watchtower("a", self.ME), os.getpid())
+
+    def test_join_fails_loud_when_the_wake_finds_nobody(self):
+        """The serve process can exit between require_serve's check and the
+        signal; a discarded join must never print success."""
+        args = mock.Mock(cell="demo", idle=None, quiet=[])
+        with mock.patch.object(cccp, "comrade_id", return_value=self.ME), \
+             mock.patch.object(cccp, "require_serve", return_value=4242), \
+             mock.patch.object(cccp, "inbox_send", return_value=0), \
+             self.assertRaises(SystemExit) as cm:
+            cccp.cmd_join(args)
+        self.assertIn("discarded", str(cm.exception))
 
     def test_require_serve_fails_loud_with_the_way_out(self):
         with self.assertRaises(SystemExit) as cm:

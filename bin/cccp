@@ -1476,13 +1476,13 @@ def inbox_send(slug, me, records):
                     for r in records)
     with open(path, "ab") as f:
         f.write(blob)
-    return wake_serve(me) if slug is None else wake_watchtowers(slug)
+    return wake_serve(me) if slug is None else wake_watchtowers(slug, me)
 
 
-def _signal_pid_record(path, owner, signum=signal.SIGUSR1):
-    """Signal the process a pid record names, if it really is `owner`'s
-    watchtower: the record is a hint, the process table is the proof, so a
-    stale record or a recycled pid is skipped, never signalled. True when sent.
+def _verified_pid(path, owner):
+    """The pid a record names, if that process really is `owner`'s watchtower,
+    else None: the record is a hint, the process table is the proof, so a
+    stale record or a recycled pid is never signalled.
 
     This replaced `pkill -f` on the argv. A serve-mode watchtower carries no
     slug in its argv, so a cell can only be found through its record - and the
@@ -1490,13 +1490,28 @@ def _signal_pid_record(path, owner, signum=signal.SIGUSR1):
     match once could (fatal, not cosmetic: SIGUSR1's default disposition is
     Term, and a signalled wrapper DIES with its watchtower following)."""
     pid, _ = read_pid(path)
-    if not is_watchtower_argv(process_argv(pid), owner):
-        return False
+    return pid if is_watchtower_argv(process_argv(pid), owner) else None
+
+
+def _signal(pid, signum=signal.SIGUSR1):
     try:
         os.kill(pid, signum)
         return True
     except OSError:
         return False
+
+
+def _note_wake(slug, owner):
+    """A `wake` record in the target's cell inbox, written just before the
+    signal, so a serve-mode watchtower can tell WHICH of its cells the signal
+    was for (Serve._wake_cells resets only the cells whose inbox grew). A
+    single-cell watchtower ignores it like any inbox record it has no use
+    for. Best-effort: the signal still goes if this fails."""
+    try:
+        with open(inbox_path(slug, owner), "ab") as f:
+            f.write(b'{"ev":"wake"}\n')
+    except OSError:
+        pass
 
 
 def wake_watchtowers(slug, comrade=None):
@@ -1509,13 +1524,30 @@ def wake_watchtowers(slug, comrade=None):
     See cmd_wake for the sibling-session caveat."""
     base = run_dir() / "watchtower" / slug
     paths = [base / comrade / "pid.json"] if comrade else base.glob("*/pid.json")
-    return sum(1 for p in paths if _signal_pid_record(p, p.parent.name))
+    woke = 0
+    for p in paths:
+        owner = p.parent.name
+        pid = _verified_pid(p, owner)
+        if pid is None:
+            continue
+        _note_wake(slug, owner)
+        woke += _signal(pid)
+    return woke
 
 
 def wake_serve(me):
     """SIGUSR1 my serve-mode watchtower so it drains the session inbox now.
     Returns 1 when signalled, 0 when none is live."""
-    return int(_signal_pid_record(pid_path(None, me), me))
+    pid = _verified_pid(pid_path(None, me), me)
+    return int(pid is not None and _signal(pid))
+
+
+def inbox_size(slug, me):
+    """Bytes in an inbox right now, 0 when there is none."""
+    try:
+        return inbox_path(slug, me).stat().st_size
+    except OSError:
+        return 0
 
 
 def wake_recipients(slug, to, log=None):
@@ -1958,6 +1990,9 @@ class Watchtower:
         self.log.debug(f"ev=aliases_seeded count={len(amap)} stale_skipped={stale}")
 
     def run(self):
+        # SIGUSR1 before the pid record: a peer's dispatch signals whatever the
+        # record names the moment it lands (#21, by way of the record now).
+        signal.signal(signal.SIGUSR1, self._on_wake)
         self._reset_inbox()
         self._write_pidfile()
         try:
@@ -2113,6 +2148,8 @@ class Watchtower:
         if ev == "ping":
             self._log(f"inbox ping: {rec!r}")
             return
+        if ev == "wake":
+            return   # the signal that came with it already did the work
         if ev == "deadline":
             self._arm_deadline(rec)
             return
@@ -2467,6 +2504,13 @@ class Serve:
             self._emit(f"shutdown {self.me} serve=true reason=already_serving pid={pid}")
             self._log(f"already serving, exit: pid={pid}")
             return
+        # Handlers before the pid record, not merely before anything slow: `cccp
+        # join` polls for that record and signals the instant it appears, and
+        # SIGUSR1's default disposition is Term (the #21 lesson, now provoked on
+        # purpose by our own client). Cells joined later inherit these handlers.
+        signal.signal(signal.SIGUSR1, self._on_wake)
+        signal.signal(signal.SIGTERM, self._on_signal)
+        signal.signal(signal.SIGINT, self._on_signal)
         reset_inbox(None, self.me, self._log)
         write_pidfile(None, self.me, self._log)
         try:
@@ -2475,12 +2519,6 @@ class Serve:
             self._record_stop()
 
     def _run(self):
-        # Handlers first, before anything slow - the #21 lesson: a SIGUSR1 wake
-        # broadcast before the handler is armed kills the process (default
-        # disposition Term). Cells joined later inherit these process handlers.
-        signal.signal(signal.SIGUSR1, self._on_wake)
-        signal.signal(signal.SIGTERM, self._on_signal)
-        signal.signal(signal.SIGINT, self._on_signal)
         self._emit(f"ready {self.me} serve=true v={cccp_version()} store={store_label(self.cfg)}")
         self.log.debug(f"ev=serve_ready comrade={_kv(self.me)}")
         # Put back what a predecessor held (cells_path): a Monitor expiry, a
@@ -2503,18 +2541,29 @@ class Serve:
                     self._interrupt.clear()
                     if self.wake_requested:
                         self.wake_requested = False
-                        # A signal carries no cell, so a wake is every cell's:
-                        # the spurious ones spend a few fast polls before their
-                        # ladders reassert, the same accepted cost as a sibling
-                        # session's wake (cmd_wake).
-                        for slug, cell in self.cells.items():
-                            cell.last_activity = time.monotonic()
-                            cell.ladder_step = -1
-                            self.due[slug] = 0.0
-                        self.log.debug("ev=wake_received")
+                        self._wake_cells()
             except Exception:
                 self._log("sleep/wake exception (survived):\n" + traceback.format_exc())
                 time.sleep(POLL_LADDER[-1])
+
+    def _wake_cells(self):
+        """Poll now, and back at the fast cadence, the cells a wake was for -
+        those whose inbox grew since their last drain (wake_watchtowers writes
+        a `wake` record before signalling), so a busy cell never drags a quiet
+        one into fast polling. A signal with only the session inbox grown is a
+        join or leave: nothing to poll. One that grew nothing came from
+        something that names no cell (an old `cccp wake`): every cell, then."""
+        woken = [s for s, c in self.cells.items()
+                 if inbox_size(s, self.me) > c.inbox_offset]
+        if not woken and inbox_size(None, self.me) > self.inbox_offset:
+            self.log.debug("ev=wake_received cells=none")
+            return
+        for slug in woken or list(self.cells):
+            cell = self.cells[slug]
+            cell.last_activity = time.monotonic()
+            cell.ladder_step = -1
+            self.due[slug] = 0.0
+        self.log.debug(f"ev=wake_received cells={_kv(','.join(woken) or '*')}")
 
     def _sleep_for(self):
         """Seconds until the earliest cell is due, or the orphan-check interval
@@ -2604,7 +2653,9 @@ class Serve:
             cell.quiet = set(quiet)
             self.log.debug(f"ev=cell_rejoin slug={_kv(slug)} idle_s={idle_s} "
                            f"quiet={_kv(','.join(quiet))}")
-            self._remember(slug, rec)
+            # The record must describe the cell as held, and the trigger is
+            # the one it was joined with - not whatever this re-join carried.
+            self._remember(slug, {**rec, "trigger": cell.trigger})
             return
         cell = Watchtower(self.client, self.cfg["PREFIX"], slug, self.me, idle_s,
                           log=self.log, quiet=quiet, trigger=rec.get("trigger"),
@@ -3126,7 +3177,7 @@ def cmd_dispatch(args):
                 sys.exit(f"error: no live watchtower for cell {slug!r} to own "
                          f"this deadline - the record was discarded"
                          + ("; the message itself was sent" if sent else "")
-                         + ". Arm a watchtower, then re-run.")
+                         + f". Join the cell (`cccp join {slug}`), then re-run.")
             if limit:
                 print(f"deadline {limit} armed for {', '.join(to)}")
             else:
@@ -3196,6 +3247,10 @@ def cmd_join(args):
                "trigger": cfg["ALIAS_TRIGGER"], "ts": now_iso()}
         woke = inbox_send(None, me, [rec])
         log.debug(f"ev=join_sent slug={_kv(slug)} held={held} woke={woke}")
+        if not woke:
+            sys.exit("error: the serve-mode watchtower exited before the join "
+                     "could be delivered - the request was discarded. Run "
+                     "`cccp status`, then retry")
         opts = f"idle={idle}m quiet={','.join(quiet) or 'none'}"
         if held:
             print(f"already joined cell {slug!r}; options re-applied ({opts})")
@@ -3218,6 +3273,10 @@ def cmd_leave(args):
             sys.exit(f"cell {slug!r} is not joined - nothing to leave")
         woke = inbox_send(None, me, [{"ev": "leave", "slug": slug, "ts": now_iso()}])
         log.debug(f"ev=leave_sent slug={_kv(slug)} woke={woke}")
+        if not woke:
+            sys.exit("error: the serve-mode watchtower exited before the leave "
+                     "could be delivered - the request was discarded. Run "
+                     "`cccp status`, then retry")
         print(f"leave requested for cell {slug!r}; the watchtower confirms with "
               f"`shutdown {me} slug={slug} reason=leave`")
 
@@ -3254,7 +3313,9 @@ def cmd_wake(args):
 
 
 def cmd_stop(args):
-    """Ask my own watchtower(s) for this cell to exit, via the inbox.
+    """Ask my own watchtower for this cell to end its watch, via the inbox - an
+    exit for a single-cell watchtower, a leave for the serve-mode one. With no
+    cell, stop the serve-mode watchtower itself.
 
     Kill-free termination (#16): the inbox is keyed (cell, comrade), so this can
     only ever stop THIS comrade's watchtowers - never a peer's - with no pgrep
@@ -3280,19 +3341,18 @@ def cmd_stop(args):
                   "and exits on its next inbox drain (woken now). It will not "
                   "come back this session: a plugin monitor is armed only once")
         return
+    # With a cell: the same cell-inbox record as ever. A single-cell watchtower
+    # exits on it; a serve-mode one leaves the cell (#47) - one record, one
+    # reader per cell, and nothing here needs to know which mode is live.
     slug = slugify(args.cell)
-    serve = live_watchtower(None, me)
-    if serve is not None and live_watchtower(slug, me) == serve:
-        cmd_leave(args)   # `cccp stop <slug>` is a leave in serve mode (#47)
-        return
     cfg = resolve_config()
     log = setup_logging(cfg, slug, me, sys.argv)
     with subcommand_footer(log):
         woke = inbox_send(slug, me, [{"ev": "shutdown", "ts": now_iso()}])
         log.debug(f"ev=stop_sent slug={_kv(slug)} woke={woke}")
         if woke:
-            print(f"stop requested; my watchtower for cell {slug!r} exits on "
-                  f"its next inbox drain (woken now)")
+            print(f"stop requested; my watchtower ends its watch on cell "
+                  f"{slug!r} on its next inbox drain (woken now)")
         else:
             sys.exit(f"no local watchtower found for cell {slug!r} - nothing "
                      f"to stop (request discarded by the next one's inbox reset)")
@@ -3731,7 +3791,8 @@ def _config_destinations():
     with nothing extra to register. Exact-match only: prefix routing would
     happily write a typo'd key and leave a <missing> to debug later."""
     dest = {"CCCP_DEBUG": "config", "CCCP_AUTODOWNLOAD_MAX": "config",
-            "CCCP_ALIAS_TRIGGER": "config"}
+            "CCCP_ALIAS_TRIGGER": "config", "CCCP_IDLE": "config",
+            "CCCP_QUIET": "config"}
     for name, spec in BACKENDS.items():
         for key in _config_keys(name):
             file = "secrets" if key in spec["secrets"] else "config"
