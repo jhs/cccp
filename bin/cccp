@@ -86,6 +86,11 @@ POLL_LADDER = (            # seconds; the adaptive inter-poll gap. First entry i
                            # LIST against the backend and a comrade takes
                            # multiple seconds just to emit a message anyway.
 TRUNCATE_THRESHOLD = 500   # max chars per watchtower stdout line (Monitor cuts at 500)
+WATCH_IDLE_DEFAULT_MIN = 30   # minutes of silence before a cell's first `idle` heartbeat;
+                              # `--idle`, CCCP_IDLE and config override it (watch_options)
+QUIET_EVENTS = ("filesystem",)   # event types `--quiet` / CCCP_QUIET may suppress
+SERVE_ORPHAN_CHECK_SECONDS = 60   # how often a serve-mode watchtower holding no cell
+                                  # wakes to check that its parent is still alive
 IDLE_MAX_SECONDS = 24 * 3600   # cap for the idle backoff - past this, idles fire
                                # at most once a day so a long-silent watchtower
                                # stops forcing Claude to wake and respond
@@ -226,7 +231,9 @@ def current_session_id():
 #                         sharing one data root never collide; contract in
 #                         docs/telemetry-snapshots.md
 #   run/                  ephemeral inter-process runtime state (the /var/run of
-#                         the tree): watchtower inboxes today, pidfiles later
+#                         the tree): watchtower inboxes and pid records, per
+#                         (cell, comrade) under watchtower/ and per session
+#                         under serve/ (the serve-mode watchtower, #44)
 #
 # backend/local-fs/ is the ONLY authoritative data in the tree: it IS the local
 # cell's message log, and deleting it loses messages permanently. That is the
@@ -376,7 +383,7 @@ def _env_layer():
 # than carrying to the use site. Backend params are absent on purpose: they are
 # opaque strings (an account name, a SAS) that only the store can judge, which
 # `cccp backend check` does over the network.
-TYPED_KEYS = ("CCCP_AUTODOWNLOAD_MAX", "CCCP_ALIAS_TRIGGER")
+TYPED_KEYS = ("CCCP_AUTODOWNLOAD_MAX", "CCCP_ALIAS_TRIGGER", "CCCP_IDLE", "CCCP_QUIET")
 
 
 def _typed_key_error(key, value):
@@ -397,7 +404,19 @@ def _typed_key_error(key, value):
         return (f"{key} {value!r} is too short to be a declaration prefix - it "
                 f"would match ordinary prose and harvest garbage names. Use "
                 f"something deliberate, like 'Intro:'")
+    if key == "CCCP_IDLE" and not (value.isdigit()):
+        return f"{key} {value!r} is not a whole number of minutes (0 disables heartbeats)"
+    if key == "CCCP_QUIET":
+        bad = [e for e in _split_quiet(value) if e not in QUIET_EVENTS]
+        if bad:
+            return (f"{key} {value!r} names no suppressible event type: "
+                    f"{', '.join(bad)} (known: {', '.join(QUIET_EVENTS)})")
     return None
+
+
+def _split_quiet(value):
+    """CCCP_QUIET is a comma-separated list of event types; empty means none."""
+    return [e.strip() for e in (value or "").split(",") if e.strip()]
 
 
 def resolve_config():
@@ -483,8 +502,38 @@ def resolve_config():
                                 else AUTODOWNLOAD_MAX_DEFAULT,
         # None when unset, which is exactly "aliases off" (see parse_alias).
         "ALIAS_TRIGGER": merged.get("CCCP_ALIAS_TRIGGER"),
+        # Per-cell watch options with no CLI flag on the serve-mode watchtower
+        # (#49): a role default set where no flag can be passed - a project's
+        # SessionStart hook, a spawn script - reaches `cccp join` through here.
+        # None / [] when unset; watch_options applies the defaults.
+        "IDLE": int(merged["CCCP_IDLE"]) if merged.get("CCCP_IDLE") else None,
+        "QUIET": _split_quiet(merged.get("CCCP_QUIET")),
         "SOURCES": sources,
     }
+
+
+def watch_options(cfg, idle=None, quiet=None):
+    """One cell's (idle minutes, quiet list): flag -> CCCP_IDLE/CCCP_QUIET (env
+    or config, already merged by resolve_config) -> default. The flag is the
+    explicit per-cell ask, so it always wins; config is the standing default
+    for every cell this session joins."""
+    if idle is None:
+        idle = cfg["IDLE"] if cfg["IDLE"] is not None else WATCH_IDLE_DEFAULT_MIN
+    if not quiet:
+        quiet = cfg["QUIET"]
+    return idle, list(quiet)
+
+
+def store_label(cfg):
+    """Where events are read from and written to, for the `ready` line (#19): an
+    empty-container attach must not announce itself like a healthy one, and a
+    session silently redirected by an inherited CCCP_AZURE_BLOB_* must say where
+    it actually went. Never a secret - the SAS is not part of the label."""
+    params = cfg["PARAMS"]
+    if cfg["BACKEND"] == "azure-blob":
+        return f"azure-blob:{params.get('account')}/{params.get('container')}"
+    root = params.get("root") or backend_dir("local-fs")
+    return f"local-fs:{Path(root).expanduser()}"
 
 
 # ---------- debug logging ----------
@@ -1246,32 +1295,64 @@ def download_to_mirror(client, prefix, slug, sender, wire_path,
 
 # ---------- watchtower ----------
 
-def inbox_path(slug, me):
-    """This comrade's watchtower inbox for one cell: a local, private, append-only
-    journal of commands for the live watchtower (`{"ev": ...}` per line).
+def serve_dir(me):
+    """The session-scoped run directory of my serve-mode watchtower (#44): the
+    one process that holds every cell this session joins. Keyed by comrade id
+    alone, because it belongs to the session, not to any cell."""
+    return run_dir() / "serve" / me
 
-    One watchtower = one cell = one comrade, so the path IS the scope of what it
-    carries - a broadcast signal needs no addressing because each watchtower only
-    ever opens its own. Deliberately local and never routed through the backend:
-    a command to a local process must not cost a network round-trip, must not be
-    unsendable when the backend is down, and is nobody else's business.
+
+def _run_scope(slug, me):
+    """Where one watchtower's runtime records live. A single-cell watchtower is
+    scoped (cell, comrade); the serve-mode one - `slug` None - is scoped to the
+    session. Every record below takes the same `slug=None` to mean the latter."""
+    return serve_dir(me) if slug is None else run_dir() / "watchtower" / slug / me
+
+
+def inbox_path(slug, me):
+    """This comrade's watchtower inbox: a local, private, append-only journal of
+    commands for the live watchtower (`{"ev": ...}` per line).
+
+    A cell's inbox (`slug` given) carries the commands about that cell -
+    deadlines, a stop - and is read by whichever of my watchtowers holds the
+    cell, single-cell or serve-mode. The session inbox (`slug` None) carries
+    the commands about membership - join, leave, a full stop - and only the
+    serve-mode watchtower reads it. Either way the path IS the scope of what it
+    carries - a broadcast signal needs no addressing because each watchtower
+    only ever opens its own. Deliberately local and never routed through the
+    backend: a command to a local process must not cost a network round-trip,
+    must not be unsendable when the backend is down, and is nobody else's
+    business.
     """
-    return run_dir() / "watchtower" / slug / me / "inbox.jsonl"
+    return _run_scope(slug, me) / "inbox.jsonl"
 
 
 def pid_path(slug, me):
     """The live watchtower's pid record (JSON: pid, started), written at startup
     and removed on any clean exit - so a pidfile with no matching process means
-    exactly "died without running its exit path" (#18). Scoped like the inbox:
-    one watchtower = one cell = one comrade."""
-    return run_dir() / "watchtower" / slug / me / "pid.json"
+    exactly "died without running its exit path" (#18). A cell's record names
+    whichever of my processes holds the cell: a serve-mode watchtower writes it
+    on join and removes it on leave, so `cccp status <slug>` and the wake path
+    never need to know which mode is live. The session record (`slug` None)
+    is the serve process's own."""
+    return _run_scope(slug, me) / "pid.json"
 
 
 def last_stop_path(slug, me):
     """The most recent clean stop (JSON: ts, reason, pid), written by the exit
     path pid_path's removal happens in. Survives until read; `cccp status` is
     the reader. Never cleaned up - each stop overwrites the last."""
-    return run_dir() / "watchtower" / slug / me / "last-stop.json"
+    return _run_scope(slug, me) / "last-stop.json"
+
+
+def cells_path(me):
+    """The cells my serve-mode watchtower holds, with their join options (JSON:
+    slug -> join record), kept current on every join and leave. A successor
+    serve process for the same session rejoins them at startup, so a process
+    lost to a Monitor expiry, a `claude --resume` or a crash is put back by
+    re-arming one Monitor - not by re-joining every cell by hand. Cleared only
+    by a deliberate full stop; a leave removes just its cell."""
+    return serve_dir(me) / "cells.json"
 
 
 def process_argv(pid):
@@ -1286,25 +1367,46 @@ def process_argv(pid):
     return r.stdout.strip() or None
 
 
-def watchtower_status(slug, me):
-    """(state, human line) for my watchtower in one cell.
+def is_watchtower_argv(argv, owner):
+    """True when a process command line is a cccp watchtower owned by `owner`.
+    cmd_watchtower's re-exec tags every watchtower's argv with a trailing
+    `-- <comrade-id>`, single-cell and serve-mode alike, so a recycled pid can
+    never pass as ours and a Monitor bash wrapper - which carries the same
+    words quoted inside its own cmdline, then continues past them into harness
+    plumbing - never matches."""
+    return bool(argv) and "cccp watchtower " in argv and argv.endswith(f"-- {owner}")
 
-    States: "alive" (pid record's process exists AND its argv carries both this
-    cell and my ownership tag - a recycled pid cannot fake that), "stale"
-    (pid record but no such watchtower: it died hard, nothing ran its exit
-    path), "stopped" (clean exit, reason recorded), "absent" (no record at
-    all). #18: a dead watchtower must be distinguishable from a quiet cell in
-    one command."""
+
+def read_pid(path):
+    """The (pid, started) of a pid record, or (None, None) when there is none."""
     try:
-        rec = json.loads(pid_path(slug, me).read_text())
-    except (OSError, ValueError):
-        rec = None
-    if rec:
-        pid = rec.get("pid")
-        argv = process_argv(pid)
-        if argv and f"cccp watchtower {slug} " in argv \
-                and argv.endswith(f"-- {me}"):
-            return "alive", f"alive pid={pid} started={rec.get('started', '?')}"
+        rec = json.loads(path.read_text())
+        return rec.get("pid"), rec.get("started", "?")
+    except (OSError, ValueError, AttributeError):
+        return None, None
+
+
+def live_watchtower(slug, me):
+    """The pid of my live watchtower holding `slug` - or, for `slug` None, of my
+    live serve-mode watchtower - verified against the process table; None when
+    the record is missing or stale."""
+    pid, _ = read_pid(pid_path(slug, me))
+    return pid if is_watchtower_argv(process_argv(pid), me) else None
+
+
+def watchtower_status(slug, me):
+    """(state, human line) for my watchtower in one cell, or for my serve-mode
+    watchtower when `slug` is None.
+
+    States: "alive" (pid record's process exists AND its argv carries my
+    ownership tag - a recycled pid cannot fake that), "stale" (pid record but
+    no such watchtower: it died hard, nothing ran its exit path), "stopped"
+    (clean exit, reason recorded), "absent" (no record at all). #18: a dead
+    watchtower must be distinguishable from a quiet cell in one command."""
+    pid, started = read_pid(pid_path(slug, me))
+    if pid is not None:
+        if is_watchtower_argv(process_argv(pid), me):
+            return "alive", f"alive pid={pid} started={started}"
         return "stale", (f"dead pid={pid}: pid record is stale - the "
                          f"watchtower died without a clean exit (killed or "
                          f"crashed hard), so no stop reason was recorded")
@@ -1313,7 +1415,34 @@ def watchtower_status(slug, me):
         return "stopped", (f"stopped reason={stop.get('reason', '?')} "
                            f"at={stop.get('ts', '?')}")
     except (OSError, ValueError):
+        if slug is None:
+            return "absent", "no serve-mode watchtower record for this session"
         return "absent", f"no watchtower record for cell {slug!r}"
+
+
+def held_cells(me, pid):
+    """The cells whose pid record names `pid` - what a serve-mode watchtower
+    holds right now, read back from the same per-cell records it maintains on
+    join and leave, so `cccp status` needs no second source of truth."""
+    root = run_dir() / "watchtower"
+    return sorted(p.parent.parent.name for p in root.glob(f"*/{me}/pid.json")
+                  if read_pid(p)[0] == pid)
+
+
+def require_serve(me):
+    """The pid of this session's live serve-mode watchtower, or a loud exit that
+    says how to get one. This message is where the chat skill's fallback becomes
+    discoverable at the moment it is needed (#47): the plugin monitor that
+    should have armed it is gated by the harness (an older Claude Code, a
+    policy, an unaccepted workspace trust), and the model learns that here."""
+    pid = live_watchtower(None, me)
+    if pid is None:
+        _, detail = watchtower_status(None, me)
+        sys.exit(f"error: no serve-mode watchtower is running for this session "
+                 f"({detail}). Invoke the cccp:chat skill to arm the plugin's "
+                 f"watchtower monitor, then retry; if it still fails, arm one "
+                 f"yourself under the Monitor tool: `cccp watchtower --serve`")
+    return pid
 
 
 def inbox_send(slug, me, records):
@@ -1325,52 +1454,55 @@ def inbox_send(slug, me, records):
 
     The wake is what makes this prompt: SIGUSR1 means only "poll now", and a poll
     drains the inbox first, so the record lands within ms instead of at the next
-    rung of the ladder."""
+    rung of the ladder. Returns how many watchtowers were signalled; 0 is not an
+    error here - an inbox record simply waits for a watchtower that may never
+    come - but every caller treats it as the news it is."""
     path = inbox_path(slug, me)
     path.parent.mkdir(parents=True, exist_ok=True)
     blob = b"".join((json.dumps(r, separators=(",", ":")) + "\n").encode("utf-8")
                     for r in records)
     with open(path, "ab") as f:
         f.write(blob)
-    return wake_watchtowers(slug)
+    return wake_serve(me) if slug is None else wake_watchtowers(slug)
 
 
-def wake_pattern(slug, comrade=None):
-    """The pkill -f ERE matching ONLY live watchtower processes for `slug` -
-    never the Monitor bash wrapper that carries the same words quoted inside
-    its own cmdline. Getting this wrong is fatal, not cosmetic: SIGUSR1's
-    default disposition is Term, so a matched wrapper DIES and its watchtower
-    follows via the ppid watchdog.
+def _signal_pid_record(path, owner, signum=signal.SIGUSR1):
+    """Signal the process a pid record names, if it really is `owner`'s
+    watchtower: the record is a hint, the process table is the proof, so a
+    stale record or a recycled pid is skipped, never signalled. True when sent.
 
-    The anchor is the ps ownership tag (cmd_watchtower's re-exec): a real
-    watchtower's cmdline always ENDS with `-- <comrade-id>`, while the
-    wrapper's continues past the quoted command into harness plumbing. The
-    previous anchor - "a quote follows the slug in the wrapper" - held only
-    for flag-less arming: with flags (e.g. --alias-trigger) a SPACE follows
-    the slug in the wrapper too, so every wake/deadline-arm broadcast beheaded
-    any same-cell watchtower armed with flags, wrapper first (the #5 churn).
-
-    The trailing space after the slug also keeps `foo` from matching
-    `foo-bar`. POSIX ERE only (BSD pkill on macOS, procps on Linux): [^ ]
-    instead of \\S, literal alternations, no PCRE.
-
-    `comrade` narrows the same anchor from "any watchtower on this cell" to one
-    named comrade's, which is what lets an automatic wake signal only the
-    session a message was actually addressed to."""
-    tail = re.escape(comrade) if comrade else "[^ ]+"
-    return rf"cccp watchtower {re.escape(slug)} (.* )?-- {tail}$"
+    This replaced `pkill -f` on the argv. A serve-mode watchtower carries no
+    slug in its argv, so a cell can only be found through its record - and the
+    record-then-verify walk cannot hit the Monitor bash wrapper that a pattern
+    match once could (fatal, not cosmetic: SIGUSR1's default disposition is
+    Term, and a signalled wrapper DIES with its watchtower following)."""
+    pid, _ = read_pid(path)
+    if not is_watchtower_argv(process_argv(pid), owner):
+        return False
+    try:
+        os.kill(pid, signum)
+        return True
+    except OSError:
+        return False
 
 
 def wake_watchtowers(slug, comrade=None):
-    """SIGUSR1 every local watchtower for `slug` - "poll now" - or just `comrade`'s
-    when one is named. Returns the completed pkill process: rc 0 = at least one
-    signalled, 1 = none running (which is NOT an error - an inbox record simply
-    waits for a watchtower that may never come).
+    """SIGUSR1 every local watchtower holding `slug` - "poll now" - or just
+    `comrade`'s when one is named, which is what lets an automatic wake signal
+    only the session a message was actually addressed to. Returns how many
+    were signalled.
 
-    Shared by `cccp wake` and by anything that drops a record in an inbox. See
-    cmd_wake for the sibling-session caveat."""
-    return subprocess.run(["pkill", "-USR1", "-f", wake_pattern(slug, comrade)],
-                          capture_output=True)
+    Shared by `cccp wake` and by anything that drops a record in a cell inbox.
+    See cmd_wake for the sibling-session caveat."""
+    base = run_dir() / "watchtower" / slug
+    paths = [base / comrade / "pid.json"] if comrade else base.glob("*/pid.json")
+    return sum(1 for p in paths if _signal_pid_record(p, p.parent.name))
+
+
+def wake_serve(me):
+    """SIGUSR1 my serve-mode watchtower so it drains the session inbox now.
+    Returns 1 when signalled, 0 when none is live."""
+    return int(_signal_pid_record(pid_path(None, me), me))
 
 
 def wake_recipients(slug, to, log=None):
@@ -1378,8 +1510,8 @@ def wake_recipients(slug, to, log=None):
     send lands now instead of waiting out the recipient's poll ladder (#20).
 
     Reach is what makes this safe to do automatically rather than on request:
-    pkill signals only this user's processes on this host, so the only comrades
-    this can reach are the ones already sharing our user@host. A recipient on
+    the pid records live in this user's data tree on this host, so the only
+    comrades this can reach are the ones already sharing our user@host. A recipient on
     another box is unreachable by any host-local signal, and their latency stays
     bounded by the POLL_LADDER cap - the half of #20 that needs a store-side
     hint, not a signal.
@@ -1389,13 +1521,13 @@ def wake_recipients(slug, to, log=None):
     unaddressed same-host sibling keeps its ladder, which on a metered backend is
     one LIST per sibling per message not spent."""
     if "*" in to:
-        r = wake_watchtowers(slug)
+        woke = wake_watchtowers(slug)
         if log:
-            log.debug(f"ev=wake_broadcast slug={_kv(slug)} pkill_rc={r.returncode}")
+            log.debug(f"ev=wake_broadcast slug={_kv(slug)} woke={woke}")
         return
     mine = base_comrade_id()
     local = [cid for cid in to if cid.rsplit(":", 1)[0] == mine]
-    woke = sum(1 for cid in local if wake_watchtowers(slug, cid).returncode == 0)
+    woke = sum(wake_watchtowers(slug, cid) for cid in local)
     if log:
         log.debug(f"ev=wake_targeted slug={_kv(slug)} to_count={len(to)} "
                   f"local={len(local)} woke={woke}")
@@ -1533,18 +1665,126 @@ def resolve_targets(slug, tokens):
     return out
 
 
+def emit_event(line, log_fn):
+    """Print one event line for the Monitor reader. Returns False when stdout is
+    gone: our reader is dead - no Monitor, no Claude - and nothing will ever see
+    another event, which is proof the process has no purpose, not a fault to
+    survive. (Python ignores SIGPIPE, so a dead pipe raises here instead of
+    killing us.) `log_fn` is the caller's always-on _log - the record of WHY we
+    stopped, which is what the #503 catch wanted."""
+    if len(line) > TRUNCATE_THRESHOLD:
+        line = line[:TRUNCATE_THRESHOLD - 14] + " overflow=true"
+    try:
+        print(line, flush=True)
+    except BrokenPipeError as e:
+        log_fn(f"_emit stdout closed ({type(e).__name__}: {e}); stopping; "
+               f"line skipped: {line[:120]!r}")
+        # Python flushes stdout once more at interpreter exit; on a dead pipe
+        # that re-raises and prints "Exception ignored ... BrokenPipeError" to
+        # stderr. Point stdout at devnull so the final flush is a no-op and
+        # this stays a clean, deliberate exit.
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except OSError:
+            pass
+        return False
+    except OSError as e:
+        log_fn(f"_emit failed ({type(e).__name__}: {e}); line skipped: {line[:120]!r}")
+    return True
+
+
+def write_pidfile(slug, me, log_fn):
+    """Liveness record for `cccp status` and the wake path (#18). Best-effort: a
+    watchtower that cannot write it still serves events."""
+    try:
+        p = pid_path(slug, me)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"pid": os.getpid(), "started": now_iso()}))
+    except OSError as e:
+        log_fn(f"pidfile write failed ({type(e).__name__}: {e})")
+
+
+def clear_pidfile(slug, me):
+    """Remove the pid record if it is still OURS. The record is shared ground
+    between a watchtower and whatever replaces it, and an unconditional unlink
+    deletes a LIVE successor's claim whenever our exit path runs late - mid-poll
+    on a slow backend when the SIGTERM arrived. `cccp status` would then report
+    stopped for a watchtower that is alive and serving, which inverts the one
+    question the pidfile exists to answer (#18).
+
+    A residual race is left open ON PURPOSE, and this is the paragraph that
+    says so rather than leaving the next reader to find it. Between the read
+    and the unlink below, a successor can write its own pid; we would then
+    delete a claim that had stopped being ours in between. Closing that needs
+    an atomic claim - a lock file, a rename protocol, a pid-keyed path - and
+    this is a stdlib-only reference implementation meant to be read in one
+    sitting and rebuilt in an afternoon (README, "Simplicity first"). POSIX
+    locking to win a microseconds-wide race is not a trade this codebase makes.
+
+    What it costs when it does happen is one stale `cccp status` reading, and
+    that layer is not where the stack is expected to catch it. A comrade learns
+    something is wrong from a dispatch deadline that never clears, or from a
+    peer saying so - not from a pidfile. Anything needing a hard guarantee here
+    should build the claim protocol above cccp rather than inside it."""
+    p = pid_path(slug, me)
+    if read_pid(p)[0] == os.getpid():
+        p.unlink(missing_ok=True)
+
+
+def reset_inbox(slug, me, log_fn):
+    """Start from an empty inbox. Commands address a specific live watchtower,
+    so anything a previous one left behind is meaningless. Truncate-on-start
+    is simultaneously this file's GC - nothing else ever cleans it up, and
+    nothing has to: no cleanup phase, no enumeration, no stale-state sweep."""
+    path = inbox_path(slug, me)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "wb"):
+            pass
+    except OSError as e:
+        log_fn(f"inbox reset failed ({type(e).__name__}: {e})")
+
+
+def read_inbox(slug, me, offset, log_fn):
+    """The command records appended to an inbox past `offset`, and the bytes
+    consumed. Costs a stat and an early-out in the overwhelmingly common case
+    where nothing has been written."""
+    path = inbox_path(slug, me)
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return [], 0   # no inbox yet: nobody has ever sent us a command
+    if size <= offset:
+        return [], 0   # nothing new
+    try:
+        with open(path, "rb") as f:
+            f.seek(offset)
+            data = f.read()
+    except OSError as e:
+        log_fn(f"inbox read failed ({type(e).__name__}: {e})")
+        return [], 0
+    return journal_records(
+        data, on_bad=lambda c: log_fn(f"skip unparseable inbox line: {c[:120]!r}"))
+
+
 class Watchtower:
     """Polls the cell prefix and emits one event line per new dispatch. A live-
     event stream: it skips backlog at startup (no replay). The only local state is
     an optional, opt-in alias map (--alias-trigger); identity and history otherwise
-    live in the container."""
+    live in the container.
+
+    One instance is one cell. Under `cccp watchtower <slug>` it also owns the
+    process (run); under `cccp watchtower --serve` a Serve loop holds one per
+    joined cell and drives them (start, _poll_once, _next_sleep, _record_stop),
+    so the two modes share every byte of per-cell behaviour."""
 
     def __init__(self, client, prefix, slug, me, idle_initial,
                  idle_max=IDLE_MAX_SECONDS, log=None, quiet=(), trigger=None,
-                 autodownload_max=None):
+                 autodownload_max=None, store=None):
         self.client = client
         self.prefix = prefix
         self.slug = slug
+        self.store = store   # for the ready line (#19); None omits it
         self.autodownload_max = (autodownload_max if autodownload_max is not None
                                  else parse_size(AUTODOWNLOAD_MAX_DEFAULT))
         self.me = me
@@ -1605,30 +1845,9 @@ class Watchtower:
             pass
 
     def _emit(self, line):
-        if len(line) > TRUNCATE_THRESHOLD:
-            line = line[:TRUNCATE_THRESHOLD - 14] + " overflow=true"
-        try:
-            print(line, flush=True)
-        except BrokenPipeError as e:
-            # Our stdout reader is gone - no Monitor, no Claude, and nothing will
-            # ever see another event. That is proof we have no purpose, not a
-            # fault to survive: stop. (Python ignores SIGPIPE, so a dead pipe
-            # raises here instead of killing us.) The _log call stays - it is the
-            # record of WHY we stopped, which is what the #503 catch wanted.
-            self._log(f"_emit stdout closed ({type(e).__name__}: {e}); stopping; "
-                      f"line skipped: {line[:120]!r}")
+        if not emit_event(line, self._log):
             self.stop = True
             self.stop_reason = "stdout_closed"
-            # Python flushes stdout once more at interpreter exit; on a dead pipe
-            # that re-raises and prints "Exception ignored ... BrokenPipeError" to
-            # stderr. Point stdout at devnull so the final flush is a no-op and
-            # this stays a clean, deliberate exit.
-            try:
-                os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
-            except OSError:
-                pass
-        except OSError as e:
-            self._log(f"_emit failed ({type(e).__name__}: {e}); line skipped: {line[:120]!r}")
 
     @staticmethod
     def _format_quiet(seconds):
@@ -1734,14 +1953,14 @@ class Watchtower:
             self._record_stop()
 
     def _write_pidfile(self):
-        """Liveness record for `cccp status` (#18). Best-effort: a watchtower
-        that cannot write it still serves events."""
-        try:
-            p = pid_path(self.slug, self.me)
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(json.dumps({"pid": os.getpid(), "started": now_iso()}))
-        except OSError as e:
-            self._log(f"pidfile write failed ({type(e).__name__}: {e})")
+        write_pidfile(self.slug, self.me, self._log)
+
+    def set_idle(self, idle_initial):
+        """Re-apply the idle heartbeat schedule, as a re-join with new options does
+        (#47): the clock restarts from now at the new initial silence."""
+        self.idle_initial = idle_initial
+        self.idle_current = idle_initial
+        self.idle_due = time.monotonic() + idle_initial
 
     def _record_stop(self):
         """Make the death visible (#18): a final `shutdown` event while stdout
@@ -1755,47 +1974,41 @@ class Watchtower:
         if reason != "stdout_closed":
             self._emit(f"shutdown {self.me} slug={self.slug} reason={reason}")
         self._log(f"stopped reason={reason}")
-        self.log.debug(f"ev=watchtower_stop reason={_kv(reason)}")
+        self.log.debug(f"ev=watchtower_stop slug={_kv(self.slug)} reason={_kv(reason)}")
         try:
             last_stop_path(self.slug, self.me).write_text(json.dumps(
                 {"ts": now_iso(), "reason": reason, "pid": os.getpid()}))
-            # Clear only OUR OWN record. One watchtower = one cell = one comrade, so the
-            # pid record is shared ground between a watchtower and whatever replaces it,
-            # and an unconditional unlink deletes a LIVE successor's claim whenever our
-            # exit path runs late - mid-poll on a slow backend when the SIGTERM arrived.
-            # `cccp status` would then report stopped for a watchtower that is alive and
-            # serving, which inverts the one question the pidfile exists to answer (#18).
-            #
-            # A residual race is left open ON PURPOSE, and this is the paragraph
-            # that says so rather than leaving the next reader to find it. Between
-            # the read and the unlink below, a successor can write its own pid; we
-            # would then delete a claim that had stopped being ours in between.
-            # Closing that needs an atomic claim - a lock file, a rename protocol,
-            # a pid-keyed path - and this is a stdlib-only reference implementation
-            # meant to be read in one sitting and rebuilt in an afternoon (README,
-            # "Simplicity first"). POSIX locking to win a microseconds-wide race is
-            # not a trade this codebase makes.
-            #
-            # What it costs when it does happen is one stale `cccp status` reading,
-            # and that layer is not where the stack is expected to catch it. A
-            # comrade learns something is wrong from a dispatch deadline that never
-            # clears, or from a peer saying so - not from a pidfile. Anything
-            # needing a hard guarantee here should build the claim protocol above
-            # cccp rather than inside it.
-            p = pid_path(self.slug, self.me)
-            try:
-                owner = json.loads(p.read_text()).get("pid")
-            except (OSError, ValueError):
-                owner = None
-            if owner == os.getpid():
-                p.unlink(missing_ok=True)
+            clear_pidfile(self.slug, self.me)
         except OSError as e:
             self._log(f"stop record write failed ({type(e).__name__}: {e})")
+
+    def start(self):
+        """Bring the cell up: fast-forward past its backlog, seed aliases,
+        announce `ready`, start the idle clock. The caller (our own _run, or the
+        Serve loop) has already armed SIGUSR1 - see the #21 note in _run."""
+        with TimeLogger(self.log, "initial_scan"):
+            self.initial_scan()
+        if self.trigger:
+            with TimeLogger(self.log, "seed_aliases"):
+                self.seed_aliases()
+        # `store=` and `gazettes=` are #19: an attach to an empty or a wrong
+        # store must not announce itself like a healthy one. `gazettes=` counts
+        # every comrade ever seen in the cell, mine included.
+        store = f" store={self.store}" if self.store else ""
+        self._emit(f"ready {self.me} slug={self.slug} v={cccp_version()}"
+                   f"{store} gazettes={len(self.hwm)}")
+        self.log.debug(
+            f"ev=watchtower_ready comrade={_kv(self.me)} slug={_kv(self.slug)} "
+            f"idle_initial_s={self.idle_initial} idle_max_s={self.idle_max} "
+            f"gazettes={len(self.hwm)}")
+        # Start the idle clock from "fully up", after the network-bound startup.
+        self.set_idle(self.idle_initial)
+        self.ladder_step = -1
 
     def _run(self):
         # #21: arm the wake handler BEFORE the network-bound startup, not after
         # `ready`. `initial_scan`/`seed_aliases` take seconds, and any peer's
-        # `cccp wake`/`dispatch` pkill-broadcasts SIGUSR1 across the cell during
+        # `cccp wake`/`dispatch` broadcasts SIGUSR1 across the cell during
         # that window. SIGUSR1's default disposition is Term, so a joining
         # watchtower was killed (exit 138) before it could emit `ready`. With the
         # handler installed first, an early wake merely sets `wake_requested`; the
@@ -1803,21 +2016,7 @@ class Watchtower:
         # below - they aren't broadcast by wake, and a joining watchtower should
         # remain promptly killable during its own startup.)
         signal.signal(signal.SIGUSR1, self._on_wake)
-        with TimeLogger(self.log, "initial_scan"):
-            self.initial_scan()
-        if self.trigger:
-            with TimeLogger(self.log, "seed_aliases"):
-                self.seed_aliases()
-        self._emit(f"ready {self.me} slug={self.slug} v={cccp_version()}")
-        self.log.debug(
-            f"ev=watchtower_ready comrade={_kv(self.me)} slug={_kv(self.slug)} "
-            f"idle_initial_s={self.idle_initial} idle_max_s={self.idle_max} "
-            f"gazettes={len(self.hwm)}")
-        # Start the idle clock from "fully up", after the network-bound startup.
-        self.last_activity = time.monotonic()
-        self.idle_current = self.idle_initial
-        self.idle_due = self.last_activity + self.idle_initial
-        self.ladder_step = -1
+        self.start()
         signal.signal(signal.SIGTERM, self._on_signal)
         signal.signal(signal.SIGINT, self._on_signal)
         # SIGUSR1 was already armed at the top of _run (#21).
@@ -1874,17 +2073,7 @@ class Watchtower:
         self._interrupt.set()
 
     def _reset_inbox(self):
-        """Start from an empty inbox. Commands address a specific live watchtower,
-        so anything a previous one left behind is meaningless. Truncate-on-start
-        is simultaneously this file's GC - nothing else ever cleans it up, and
-        nothing has to: no cleanup phase, no enumeration, no stale-state sweep."""
-        path = inbox_path(self.slug, self.me)
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with open(path, "wb"):
-                pass
-        except OSError as e:
-            self._log(f"inbox reset failed ({type(e).__name__}: {e})")
+        reset_inbox(self.slug, self.me, self._log)
         self.inbox_offset = 0
 
     def _drain_inbox(self):
@@ -1892,28 +2081,14 @@ class Watchtower:
 
         Runs first in every poll, and SIGUSR1 already means "poll now" - so a
         writer appends, signals, and lands within ms, with no signal machinery of
-        its own. Costs a stat and an early-out in the overwhelmingly common case
-        where nothing has been written."""
-        path = inbox_path(self.slug, self.me)
-        try:
-            size = path.stat().st_size
-        except OSError:
-            return   # no inbox yet: nobody has ever sent us a command
-        if size <= self.inbox_offset:
-            return   # nothing new
-        try:
-            with open(path, "rb") as f:
-                f.seek(self.inbox_offset)
-                data = f.read()
-        except OSError as e:
-            self._log(f"inbox read failed ({type(e).__name__}: {e})")
+        its own."""
+        records, consumed = read_inbox(self.slug, self.me, self.inbox_offset, self._log)
+        if not consumed:
             return
-        records, consumed = journal_records(
-            data, on_bad=lambda c: self._log(f"skip unparseable inbox line: {c[:120]!r}"))
         self.inbox_offset += consumed
         self.log.debug(
-            f"ev=inbox_drained records={len(records)} bytes={consumed} "
-            f"offset={self.inbox_offset}")
+            f"ev=inbox_drained slug={_kv(self.slug)} records={len(records)} "
+            f"bytes={consumed} offset={self.inbox_offset}")
         for rec in records:
             self._apply_inbox(rec)
 
@@ -1933,7 +2108,8 @@ class Watchtower:
             # (cell, comrade), so only this comrade's own tooling can reach us -
             # a shutdown can never arrive from a peer's recovery routine. The
             # final `shutdown` event is emitted by _record_stop with this
-            # reason, exactly like every other stop path.
+            # reason, exactly like every other stop path. Under a Serve loop the
+            # same record ends only this cell: `cccp stop <slug>` is a leave (#47).
             self._log(f"inbox shutdown: {rec!r}")
             self.stop = True
             self.stop_reason = "inbox_shutdown"
@@ -2216,6 +2392,284 @@ class Watchtower:
             except OSError:
                 pass
         return render_filesystem_event(self._aliased(d))
+
+
+class Serve:
+    """One cell-agnostic watchtower per session (#44): `cccp watchtower --serve`
+    starts holding no cell and serves whichever cells are joined and left at
+    runtime through its session inbox (`cccp join`, `cccp leave`). That is the
+    shape a plugin monitor needs - a command fixed in monitors.json, one process
+    per session, armed once - and it is also what lets one process outlive
+    Claude Code's 30-minute Monitor cap and every change of cell membership.
+
+    Each held cell is an ordinary Watchtower driven by this loop instead of its
+    own: its event lines, per-cell inbox (deadlines, stop-as-leave), pid record
+    and stop record are exactly a single-cell watchtower's, so nothing
+    downstream can tell the two modes apart. Only the poll schedule is kept
+    here, per cell, so a busy cell never drags a quiet one into fast polling -
+    on a metered backend every poll is a LIST.
+
+    Holding no cell, the process sleeps; it polls nothing until a join arrives.
+    It never exits on its own: a leave ends a cell, and only a bare `cccp stop`,
+    a signal, a dead reader or a vanished parent ends the process."""
+
+    def __init__(self, client, cfg, me, log=None):
+        self.client = client
+        self.cfg = cfg
+        self.me = me
+        self.log = log or _NULL_LOG
+        self.cells = {}    # slug -> Watchtower
+        self.due = {}      # slug -> monotonic time of that cell's next poll
+        self.inbox_offset = 0
+        self.stop = False
+        self.stop_reason = None
+        self.ppid = os.getppid()   # see Watchtower: never outlive our creator
+        self._interrupt = threading.Event()
+        self.wake_requested = False
+
+    def _log(self, msg):
+        """Always-on diagnostics, like Watchtower._log; must never raise. Under
+        mirror/_serve/ - a name no cell slug can take - beside the debug log."""
+        try:
+            path = mirror_dir() / "_serve" / self.me / "watchtower.log"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a") as f:
+                f.write(f"{now_iso()} {msg}\n")
+        except Exception:
+            pass
+
+    def _emit(self, line):
+        if not emit_event(line, self._log):
+            self.stop = True
+            self.stop_reason = "stdout_closed"
+
+    def run(self):
+        """Serve until told to stop. Refuses to run beside a live serve-mode
+        watchtower of this session: the plugin manifest arms one monitor per
+        skill and the skill's fallback arms one by hand, so a second arrival is
+        expected, not an error - it says so and exits, leaving every record to
+        the incumbent."""
+        pid = live_watchtower(None, self.me)
+        if pid is not None:
+            self._emit(f"shutdown {self.me} serve=true reason=already_serving pid={pid}")
+            self._log(f"already serving, exit: pid={pid}")
+            return
+        reset_inbox(None, self.me, self._log)
+        write_pidfile(None, self.me, self._log)
+        try:
+            self._run()
+        finally:
+            self._record_stop()
+
+    def _run(self):
+        # Handlers first, before anything slow - the #21 lesson: a SIGUSR1 wake
+        # broadcast before the handler is armed kills the process (default
+        # disposition Term). Cells joined later inherit these process handlers.
+        signal.signal(signal.SIGUSR1, self._on_wake)
+        signal.signal(signal.SIGTERM, self._on_signal)
+        signal.signal(signal.SIGINT, self._on_signal)
+        self._emit(f"ready {self.me} serve=true v={cccp_version()} store={store_label(self.cfg)}")
+        self.log.debug(f"ev=serve_ready comrade={_kv(self.me)}")
+        # Put back what a predecessor held (cells_path): a Monitor expiry, a
+        # `claude --resume`, a crash - the session is the same, so its cells are.
+        for rec in self._recorded_cells().values():
+            self._join(rec)
+        while not self.stop:
+            if os.getppid() != self.ppid:
+                self._log(f"parent exited (ppid {self.ppid} -> {os.getppid()}); stopping")
+                self.stop_reason = "parent_exited"
+                break
+            try:
+                self._tick()
+            except Exception:
+                self._log("tick exception (survived):\n" + traceback.format_exc())
+            if self.stop:
+                break
+            try:
+                if self._interrupt.wait(timeout=self._sleep_for()):
+                    self._interrupt.clear()
+                    if self.wake_requested:
+                        self.wake_requested = False
+                        # A signal carries no cell, so a wake is every cell's:
+                        # the spurious ones spend a few fast polls before their
+                        # ladders reassert, the same accepted cost as a sibling
+                        # session's wake (cmd_wake).
+                        for slug, cell in self.cells.items():
+                            cell.last_activity = time.monotonic()
+                            cell.ladder_step = -1
+                            self.due[slug] = 0.0
+                        self.log.debug("ev=wake_received")
+            except Exception:
+                self._log("sleep/wake exception (survived):\n" + traceback.format_exc())
+                time.sleep(POLL_LADDER[-1])
+
+    def _sleep_for(self):
+        """Seconds until the earliest cell is due, or the orphan-check interval
+        when no cell is held - the one reason an empty serve process wakes."""
+        if not self.due:
+            return SERVE_ORPHAN_CHECK_SECONDS
+        return max(0.0, min(self.due.values()) - time.monotonic())
+
+    def _tick(self):
+        """One pass: membership commands first, then every cell that is due."""
+        self._drain_inbox()
+        if self.stop:
+            return
+        now = time.monotonic()
+        for slug, cell in list(self.cells.items()):
+            if self.due[slug] > now:
+                continue
+            try:
+                with TimeLogger(self.log, "poll", slug=slug):
+                    cell._poll_once()
+            except Exception as e:
+                print(f"watchtower error: {e}", file=sys.stderr)
+                self.log.debug(f"ev=watchtower_error slug={_kv(slug)} "
+                               f"exc={type(e).__name__} msg={_kv(str(e))}")
+                cell._log("poll_once exception (survived):\n" + traceback.format_exc())
+            if cell.stop_reason == "stdout_closed":
+                # The reader died: that ends the process, not the cell.
+                self.stop = True
+                self.stop_reason = "stdout_closed"
+                return
+            if cell.stop:
+                self._leave(slug, "leave")   # `cccp stop <slug>` arrived in its inbox
+                continue
+            self.due[slug] = time.monotonic() + cell._next_sleep()
+
+    def _on_signal(self, signum, _frame):
+        self.stop = True
+        self.stop_reason = f"signal_{signum}"
+        self._interrupt.set()
+
+    def _on_wake(self, *_):
+        self.wake_requested = True
+        self._interrupt.set()
+
+    def _drain_inbox(self):
+        records, consumed = read_inbox(None, self.me, self.inbox_offset, self._log)
+        if not consumed:
+            return
+        self.inbox_offset += consumed
+        self.log.debug(f"ev=serve_inbox_drained records={len(records)} "
+                       f"bytes={consumed} offset={self.inbox_offset}")
+        for rec in records:
+            self._apply_inbox(rec)
+
+    def _apply_inbox(self, rec):
+        """The session inbox protocol, whole: join, leave, shutdown. Anything
+        else is ignored, as a gazette ignores an unknown `type`, so a newer
+        writer can never break an older watchtower."""
+        ev = rec.get("ev")
+        if ev == "join":
+            self._join(rec)
+        elif ev == "leave":
+            self._leave(rec.get("slug"), "leave")
+        elif ev == "shutdown":
+            # A deliberate full stop (bare `cccp stop`): the session is done
+            # with cells, so a successor must not put them back.
+            self._log(f"inbox shutdown: {rec!r}")
+            self.stop = True
+            self.stop_reason = "inbox_shutdown"
+        elif ev == "ping":
+            self._log(f"inbox ping: {rec!r}")
+        else:
+            self.log.debug(f"ev=inbox_unknown rec={_kv(json.dumps(rec))}")
+
+    def _join(self, rec):
+        """Hold one more cell, or re-apply a held cell's options. A re-join
+        never starts a second poller and never repeats `ready`; the alias
+        trigger is fixed at the first join (leave and re-join to change it)."""
+        slug = rec.get("slug")
+        if not slug:
+            return
+        idle_s = int(rec.get("idle", WATCH_IDLE_DEFAULT_MIN)) * 60
+        quiet = [q for q in (rec.get("quiet") or []) if q in QUIET_EVENTS]
+        cell = self.cells.get(slug)
+        if cell is not None:
+            cell.set_idle(idle_s)
+            cell.quiet = set(quiet)
+            self.log.debug(f"ev=cell_rejoin slug={_kv(slug)} idle_s={idle_s} "
+                           f"quiet={_kv(','.join(quiet))}")
+            self._remember(slug, rec)
+            return
+        cell = Watchtower(self.client, self.cfg["PREFIX"], slug, self.me, idle_s,
+                          log=self.log, quiet=quiet, trigger=rec.get("trigger"),
+                          autodownload_max=self.cfg["AUTODOWNLOAD_MAX"],
+                          store=store_label(self.cfg))
+        cell._reset_inbox()
+        cell._write_pidfile()
+        try:
+            cell.start()
+        except Exception as e:
+            # The cell never came up (backend unreachable, bad store): say so on
+            # the stream the model is reading, record it, hold nothing.
+            print(f"watchtower error: join {slug!r} failed: {e}", file=sys.stderr)
+            cell.stop_reason = f"crash_{type(e).__name__}"
+            cell._record_stop()
+            return
+        self.cells[slug] = cell
+        self.due[slug] = time.monotonic() + cell._next_sleep()
+        self._remember(slug, rec)
+
+    def _leave(self, slug, reason):
+        """Let go of one cell: its `shutdown … slug=<slug> reason=<reason>`
+        line, its stop record, its pid record cleared - a single-cell
+        watchtower's exit, in-process. Its deadlines go with it, silently: the
+        shutdown line is the notice. Only a deliberate leave forgets the cell;
+        a process-wide stop keeps its record for the successor."""
+        cell = self.cells.pop(slug, None)
+        self.due.pop(slug, None)
+        if cell is None:
+            return
+        cell.stop_reason = reason
+        cell._record_stop()
+        if reason == "leave":
+            self._forget(slug)
+
+    def _record_stop(self):
+        exc = sys.exc_info()[1]
+        reason = self.stop_reason or (
+            f"crash_{type(exc).__name__}" if exc else "unknown")
+        for slug in list(self.cells):
+            self._leave(slug, reason)
+        if reason != "stdout_closed":
+            self._emit(f"shutdown {self.me} serve=true reason={reason}")
+        self._log(f"stopped reason={reason}")
+        self.log.debug(f"ev=serve_stop reason={_kv(reason)}")
+        try:
+            last_stop_path(None, self.me).write_text(json.dumps(
+                {"ts": now_iso(), "reason": reason, "pid": os.getpid()}))
+            clear_pidfile(None, self.me)
+            if reason == "inbox_shutdown":
+                cells_path(self.me).unlink(missing_ok=True)
+        except OSError as e:
+            self._log(f"stop record write failed ({type(e).__name__}: {e})")
+
+    def _recorded_cells(self):
+        try:
+            cells = json.loads(cells_path(self.me).read_text())
+            return cells if isinstance(cells, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _write_cells(self, cells):
+        try:
+            p = cells_path(self.me)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(cells))
+        except OSError as e:
+            self._log(f"cells record write failed ({type(e).__name__}: {e})")
+
+    def _remember(self, slug, rec):
+        cells = self._recorded_cells()
+        cells[slug] = {k: rec[k] for k in ("slug", "idle", "quiet", "trigger") if k in rec}
+        self._write_cells(cells)
+
+    def _forget(self, slug):
+        cells = self._recorded_cells()
+        if cells.pop(slug, None) is not None:
+            self._write_cells(cells)
 
 
 # ---------- subcommands ----------
@@ -2649,8 +3103,8 @@ def cmd_dispatch(args):
                 rec["standing"] = True
             with TimeLogger(log, "deadline_send", to_count=len(to),
                             limit=limit or "none", standing=bool(args.standing)):
-                r = inbox_send(slug, me, [{**rec, "to": t} for t in to])
-            if r.returncode == 1:
+                woke = inbox_send(slug, me, [{**rec, "to": t} for t in to])
+            if not woke:
                 # Timers are watchtower-owned, and a fresh watchtower resets
                 # its inbox - so an arm with no live watchtower is not
                 # deferred, it is DISCARDED. Fail loudly (#13) instead of the
@@ -2660,9 +3114,6 @@ def cmd_dispatch(args):
                          f"this deadline - the record was discarded"
                          + ("; the message itself was sent" if sent else "")
                          + ". Arm a watchtower, then re-run.")
-            if r.returncode > 1:
-                sys.exit(f"pkill failed: "
-                         f"{r.stderr.decode().strip() or r.returncode}")
             if limit:
                 print(f"deadline {limit} armed for {', '.join(to)}")
             else:
@@ -2685,18 +3136,76 @@ def cmd_watchtower(args):
     if sys.argv[-2:-1] != ["--"]:
         os.execv(sys.executable,
                  [sys.executable, sys.argv[0], *sys.argv[1:], "--", comrade_id()])
+    if bool(args.serve) == bool(args.cell):
+        sys.exit("error: give a cell slug, or --serve to hold cells joined later "
+                 "with `cccp join` - not both, not neither")
     cfg = resolve_config()
     client = make_backend(cfg)
-    slug = slugify(args.cell)
     me = comrade_id()
-    log = setup_logging(cfg, slug, me, sys.argv)
-    client.log = log
     # No subcommand_footer here - the Watchtower emits its own ev=watchtower_stop
     # with a reason, which is the richer lifecycle record for a long-lived
     # process.
-    Watchtower(client, cfg["PREFIX"], slug, me, args.idle * 60, log=log,
-               quiet=args.quiet, trigger=cfg["ALIAS_TRIGGER"],
-               autodownload_max=cfg["AUTODOWNLOAD_MAX"]).run()
+    if args.serve:
+        if args.idle is not None or args.quiet:
+            sys.exit("error: --idle and --quiet are per-cell: pass them to `cccp join`")
+        log = setup_logging(cfg, "_serve", me, sys.argv)
+        client.log = log
+        Serve(client, cfg, me, log=log).run()
+        return
+    slug = slugify(args.cell)
+    log = setup_logging(cfg, slug, me, sys.argv)
+    client.log = log
+    idle, quiet = watch_options(cfg, args.idle, args.quiet)
+    Watchtower(client, cfg["PREFIX"], slug, me, idle * 60, log=log,
+               quiet=quiet, trigger=cfg["ALIAS_TRIGGER"],
+               autodownload_max=cfg["AUTODOWNLOAD_MAX"],
+               store=store_label(cfg)).run()
+
+
+def cmd_join(args):
+    """Join a cell on this session's serve-mode watchtower (#47): one record in
+    the session inbox carrying the per-cell options that were `cccp watchtower`
+    flags, resolved HERE (flag -> env -> config -> default) so the serve
+    process's own environment - frozen when the plugin monitor armed it - is
+    irrelevant. `CCCP_ALIAS_TRIGGER='Intro:' cccp join <slug>` therefore works
+    exactly as the same prefix on `cccp watchtower <slug>` did. Idempotent: a
+    held cell gets its options re-applied, never a second poller."""
+    slug = slugify(args.cell)
+    me = comrade_id()
+    cfg = resolve_config()
+    log = setup_logging(cfg, slug, me, sys.argv)
+    with subcommand_footer(log):
+        pid = require_serve(me)
+        idle, quiet = watch_options(cfg, args.idle, args.quiet)
+        held = live_watchtower(slug, me) == pid
+        rec = {"ev": "join", "slug": slug, "idle": idle, "quiet": quiet,
+               "trigger": cfg["ALIAS_TRIGGER"], "ts": now_iso()}
+        woke = inbox_send(None, me, [rec])
+        log.debug(f"ev=join_sent slug={_kv(slug)} held={held} woke={woke}")
+        opts = f"idle={idle}m quiet={','.join(quiet) or 'none'}"
+        if held:
+            print(f"already joined cell {slug!r}; options re-applied ({opts})")
+        else:
+            print(f"join requested for cell {slug!r} ({opts}); the watchtower "
+                  f"confirms with `ready {me} slug={slug} ...`")
+
+
+def cmd_leave(args):
+    """Leave a cell held by this session's serve-mode watchtower (#47). Its
+    deadlines and alias map go with it; the `shutdown … reason=leave` line is
+    the confirmation. A cell not held is a one-line non-zero exit."""
+    slug = slugify(args.cell)
+    me = comrade_id()
+    cfg = resolve_config()
+    log = setup_logging(cfg, slug, me, sys.argv)
+    with subcommand_footer(log):
+        pid = require_serve(me)
+        if live_watchtower(slug, me) != pid:
+            sys.exit(f"cell {slug!r} is not joined - nothing to leave")
+        woke = inbox_send(None, me, [{"ev": "leave", "slug": slug, "ts": now_iso()}])
+        log.debug(f"ev=leave_sent slug={_kv(slug)} woke={woke}")
+        print(f"leave requested for cell {slug!r}; the watchtower confirms with "
+              f"`shutdown {me} slug={slug} reason=leave`")
 
 
 def cmd_wake(args):
@@ -2704,14 +3213,15 @@ def cmd_wake(args):
     poll immediately. Use when you know an event is waiting and don't want to
     wait out the current idle gap.
 
-    Sibling-session caveat: this pkill-USR1s every watchtower whose cmdline
-    matches wake_pattern(slug), and sibling Claude sessions on the same
-    host+user watching the same cell all match. All such siblings will be
-    woken. The collateral cost is trivial - the spurious sibling spends a few
-    extra seconds in fast-poll before its ladder reasserts - so this is the
-    documented, accepted side-effect. Surgical per-session signalling is now
-    possible (pid_path carries each watchtower's pid, keyed by comrade) but
-    not worth the divergence while the broadcast stays this cheap.
+    Sibling-session caveat: this signals every watchtower with a pid record for
+    the cell, and sibling Claude sessions on the same host+user watching the
+    same cell all have one. All such siblings will be woken - and a serve-mode
+    watchtower wakes every cell it holds, since a signal names none. The
+    collateral cost is trivial - the spurious watchtower spends a few extra
+    seconds in fast-poll before its ladder reasserts - so this is the
+    documented, accepted side-effect. Surgical per-session signalling is
+    possible (the records are keyed by comrade) but not worth the divergence
+    while the broadcast stays this cheap.
     """
     slug = slugify(args.cell)
     # Use the bare user@host for the log path - the exact session-suffixed id
@@ -2721,14 +3231,12 @@ def cmd_wake(args):
     me = base_comrade_id()
     log = setup_logging(cfg, slug, me, sys.argv)
     with subcommand_footer(log):
-        r = wake_watchtowers(slug)
-        log.debug(f"ev=wake_sent slug={_kv(slug)} pkill_rc={r.returncode}")
-        if r.returncode == 0:
-            print(f"woke watchtower(s) for cell {slug!r}")
-        elif r.returncode == 1:
-            sys.exit(f"no local watchtower found for cell {slug!r}")
+        woke = wake_watchtowers(slug)
+        log.debug(f"ev=wake_sent slug={_kv(slug)} woke={woke}")
+        if woke:
+            print(f"woke {woke} watchtower(s) for cell {slug!r}")
         else:
-            sys.exit(f"pkill failed: {r.stderr.decode().strip() or r.returncode}")
+            sys.exit(f"no local watchtower found for cell {slug!r}")
 
 
 def cmd_stop(args):
@@ -2741,34 +3249,56 @@ def cmd_stop(args):
     within ms when a watchtower is alive (inbox_send wakes it); a leftover
     record is truncated unread by the next watchtower's inbox reset, so a stale
     stop can never kill a future one."""
-    slug = slugify(args.cell)
     me = comrade_id()
+    if args.cell is None:
+        # Bare: tear down the serve-mode watchtower itself (#45). Deliberate and
+        # final for the session - a plugin monitor is armed once and never
+        # re-armed, so the skill says: leave cells, never stop the process.
+        cfg = resolve_config()
+        log = setup_logging(cfg, "_serve", me, sys.argv)
+        with subcommand_footer(log):
+            if live_watchtower(None, me) is None:
+                sys.exit("no serve-mode watchtower is running for this session - "
+                         "nothing to stop")
+            woke = inbox_send(None, me, [{"ev": "shutdown", "ts": now_iso()}])
+            log.debug(f"ev=serve_stop_sent woke={woke}")
+            print("stop requested; the serve-mode watchtower leaves every cell "
+                  "and exits on its next inbox drain (woken now). It will not "
+                  "come back this session: a plugin monitor is armed only once")
+        return
+    slug = slugify(args.cell)
+    serve = live_watchtower(None, me)
+    if serve is not None and live_watchtower(slug, me) == serve:
+        cmd_leave(args)   # `cccp stop <slug>` is a leave in serve mode (#47)
+        return
     cfg = resolve_config()
     log = setup_logging(cfg, slug, me, sys.argv)
     with subcommand_footer(log):
-        r = inbox_send(slug, me, [{"ev": "shutdown", "ts": now_iso()}])
-        log.debug(f"ev=stop_sent slug={_kv(slug)} pkill_rc={r.returncode}")
-        if r.returncode == 0:
+        woke = inbox_send(slug, me, [{"ev": "shutdown", "ts": now_iso()}])
+        log.debug(f"ev=stop_sent slug={_kv(slug)} woke={woke}")
+        if woke:
             print(f"stop requested; my watchtower for cell {slug!r} exits on "
                   f"its next inbox drain (woken now)")
-        elif r.returncode == 1:
+        else:
             sys.exit(f"no local watchtower found for cell {slug!r} - nothing "
                      f"to stop (request discarded by the next one's inbox reset)")
-        else:
-            sys.exit(f"pkill failed: {r.stderr.decode().strip() or r.returncode}")
 
 
 def cmd_status(args):
-    """Report my watchtower's state for a cell: alive (verified against the
-    process table via the argv ownership tag), stopped-with-reason, or
-    died-hard (stale pid record). Exit 0 only when alive."""
-    slug = slugify(args.cell)
+    """Report my watchtower's state for a cell - or, with no cell, my serve-mode
+    watchtower's and the cells it holds: alive (verified against the process
+    table via the argv ownership tag), stopped-with-reason, or died-hard (stale
+    pid record). Exit 0 only when alive."""
     me = comrade_id()
+    slug = slugify(args.cell) if args.cell else None
     cfg = resolve_config()
-    log = setup_logging(cfg, slug, me, sys.argv)
+    log = setup_logging(cfg, slug or "_serve", me, sys.argv)
     with subcommand_footer(log):
         state, detail = watchtower_status(slug, me)
-        log.debug(f"ev=status state={state}")
+        log.debug(f"ev=status slug={_kv(slug or '')} state={state}")
+        if slug is None and state == "alive":
+            cells = held_cells(me, read_pid(pid_path(None, me))[0])
+            detail += f" serve=true cells={','.join(cells) or 'none'}"
         print(detail)
         if state != "alive":
             sys.exit(1)
@@ -3212,6 +3742,11 @@ def _global_rows(cfg):
          src.get("CCCP_AUTODOWNLOAD_MAX", []), cfg["AUTODOWNLOAD_MAX_RAW"]),
         ("CCCP_ALIAS_TRIGGER", cfg["ALIAS_TRIGGER"] or "off",
          src.get("CCCP_ALIAS_TRIGGER", []), cfg["ALIAS_TRIGGER"]),
+        ("CCCP_IDLE", str(cfg["IDLE"]) if cfg["IDLE"] is not None
+         else f"{WATCH_IDLE_DEFAULT_MIN} (default)",
+         src.get("CCCP_IDLE", []), cfg["IDLE"]),
+        ("CCCP_QUIET", ",".join(cfg["QUIET"]) or "none",
+         src.get("CCCP_QUIET", []), ",".join(cfg["QUIET"]) or None),
         ("CCCP_ACTIVE_BACKEND", cfg["BACKEND"],
          src.get("CCCP_ACTIVE_BACKEND", []), cfg["BACKEND"]),
     ]
@@ -3388,8 +3923,8 @@ def build_parser():
     # shows in top-level `cccp --help`.
     sub = p.add_subparsers(
         dest="cmd", required=True,
-        metavar="{config,backend,dispatch,watchtower,wake,stop,status,read,rm,"
-                "publish,unpublish,pull,aliases,alias,unalias}")
+        metavar="{config,backend,dispatch,watchtower,join,leave,wake,stop,status,"
+                "read,rm,publish,unpublish,pull,aliases,alias,unalias}")
 
     # No `help=` kwarg: argparse only emits a subcommand's detail line when a
     # truthy help is passed, so omitting it (NOT help=SUPPRESS, which is itself a
@@ -3464,22 +3999,41 @@ def build_parser():
                                    "stdin verbatim (heredoc-friendly).")
     disp.set_defaults(func=cmd_dispatch)
 
+    idle_help = ("Initial silence (minutes) before the first `idle` heartbeat "
+                 f"(default {WATCH_IDLE_DEFAULT_MIN}, or CCCP_IDLE; 0 disables). "
+                 "Each subsequent silent interval doubles, capped at 24h, and "
+                 "resets to this initial value on any activity.")
+    quiet_help = ("Repeatable. Handle but don't emit this event type (the file "
+                  "still auto-downloads; only the notification is suppressed). A "
+                  "coordination hub passes `--quiet filesystem` to drop redundant "
+                  "publish pings when a pointer dispatch already announced the "
+                  "file. Default: CCCP_QUIET, else none.")
     wt = sub.add_parser("watchtower",
-                        help="Stream live cell events (run under the Monitor tool).")
-    wt.add_argument("cell", help="Cell slug.")
-    wt.add_argument("--idle", type=int, default=30, metavar="MIN",
-                    help="Initial silence (minutes) before the first `idle` "
-                         "heartbeat (default 30; 0 disables). Each subsequent "
-                         "silent interval doubles, capped at 24h, and resets to "
-                         "this initial value on any activity.")
-    wt.add_argument("--quiet", action="append", default=[], choices=["filesystem"],
-                    metavar="EVENT",
-                    help="Repeatable. Handle but don't emit this event type (the "
-                         "file still auto-downloads; only the notification is "
-                         "suppressed). A coordination hub passes `--quiet filesystem` "
-                         "to drop redundant publish pings when a pointer dispatch "
-                         "already announced the file.")
+                        help="Stream live cell events: one cell, or --serve for the "
+                             "session-wide watchtower that holds cells joined with "
+                             "`cccp join` (what the plugin monitor runs).")
+    wt.add_argument("cell", nargs="?", help="Cell slug (omit with --serve).")
+    wt.add_argument("--serve", action="store_true",
+                    help="Hold no cell at start; join and leave cells at runtime "
+                         "(`cccp join`, `cccp leave`). One per session.")
+    wt.add_argument("--idle", type=int, default=None, metavar="MIN", help=idle_help)
+    wt.add_argument("--quiet", action="append", default=[], choices=list(QUIET_EVENTS),
+                    metavar="EVENT", help=quiet_help)
     wt.set_defaults(func=cmd_watchtower)
+
+    jn = sub.add_parser("join",
+                        help="Join a cell on this session's serve-mode watchtower.")
+    jn.add_argument("cell", help="Cell slug.")
+    jn.add_argument("--idle", type=int, default=None, metavar="MIN", help=idle_help)
+    jn.add_argument("--quiet", action="append", default=[], choices=list(QUIET_EVENTS),
+                    metavar="EVENT", help=quiet_help)
+    jn.set_defaults(func=cmd_join)
+
+    lv = sub.add_parser("leave",
+                        help="Leave a cell held by this session's serve-mode "
+                             "watchtower (its deadlines go with it).")
+    lv.add_argument("cell", help="Cell slug.")
+    lv.set_defaults(func=cmd_leave)
 
     al = sub.add_parser("aliases", help="List this cell's local alias map.")
     al.add_argument("cell", help="Cell slug.")
@@ -3506,14 +4060,17 @@ def build_parser():
 
     stp = sub.add_parser("stop",
                          help="Ask my own watchtower for this cell to exit "
-                              "cleanly, via its inbox. Never touches a peer's.")
-    stp.add_argument("cell", help="Cell slug.")
+                              "cleanly, via its inbox (a leave, in serve mode); "
+                              "with no cell, stop the serve-mode watchtower "
+                              "itself. Never touches a peer's.")
+    stp.add_argument("cell", nargs="?", help="Cell slug.")
     stp.set_defaults(func=cmd_stop)
 
     sts = sub.add_parser("status",
                          help="Report whether my watchtower for this cell is "
-                              "alive - and when it is not, why it stopped.")
-    sts.add_argument("cell", help="Cell slug.")
+                              "alive - and when it is not, why it stopped. With "
+                              "no cell: the serve-mode watchtower and its cells.")
+    sts.add_argument("cell", nargs="?", help="Cell slug.")
     sts.set_defaults(func=cmd_status)
 
     rd = sub.add_parser("read", help="Print cell message history.")

@@ -1283,12 +1283,17 @@ class AliasTrigger(unittest.TestCase):
         # The DRY contract: one function decides legality for every typed key,
         # so the write path and the resolve path can never drift apart.
         self.assertEqual(cccp.TYPED_KEYS,
-                         ("CCCP_AUTODOWNLOAD_MAX", "CCCP_ALIAS_TRIGGER"))
+                         ("CCCP_AUTODOWNLOAD_MAX", "CCCP_ALIAS_TRIGGER",
+                          "CCCP_IDLE", "CCCP_QUIET"))
         for key in cccp.TYPED_KEYS:
             self.assertIsNone(cccp._typed_key_error(key, ""))     # unset is fine
             self.assertIsNone(cccp._typed_key_error(key, None))
         self.assertIsNotNone(cccp._typed_key_error("CCCP_AUTODOWNLOAD_MAX", "lots"))
         self.assertIsNotNone(cccp._typed_key_error("CCCP_ALIAS_TRIGGER", "I"))
+        self.assertIsNotNone(cccp._typed_key_error("CCCP_IDLE", "soon"))
+        self.assertIsNone(cccp._typed_key_error("CCCP_IDLE", "0"))
+        self.assertIsNotNone(cccp._typed_key_error("CCCP_QUIET", "message"))
+        self.assertIsNone(cccp._typed_key_error("CCCP_QUIET", "filesystem"))
 
     def test_the_triggers_it_rejects_are_the_ones_that_mis_parse(self):
         # Why ALIAS_TRIGGER_MIN exists: parse_alias cannot catch these, because
@@ -1614,8 +1619,7 @@ class InboxShutdown(unittest.TestCase):
         cccp.inbox_path("demo", "me@h:mmm").parent.mkdir(parents=True,
                                                          exist_ok=True)
         self.wt._reset_inbox()
-        with mock.patch.object(cccp, "wake_watchtowers",
-                               lambda slug: mock.Mock(returncode=1)):
+        with mock.patch.object(cccp, "wake_watchtowers", lambda slug: 0):
             cccp.inbox_send("demo", "me@h:mmm", [{"ev": "shutdown"}])
         self.wt._poll_once()   # drains, stops, and must not touch the client
         self.assertTrue(self.wt.stop)
@@ -1625,64 +1629,108 @@ class InboxShutdown(unittest.TestCase):
         self.assertFalse(self.wt.stop)
 
 
-class WakePattern(unittest.TestCase):
-    """The wake pkill pattern must hit watchtowers and NEVER the Monitor bash
-    wrapper - SIGUSR1 terminates an unsuspecting bash, and the watchtower then
-    follows via the ppid watchdog. The flags-after-slug wrapper (a space, not
-    a quote, after the slug) is the exact cmdline that beheaded #5's cells on
-    every wake/deadline-arm broadcast."""
+class WatchtowerArgv(unittest.TestCase):
+    """The ownership predicate behind status and wake: a watchtower's argv ends
+    with its re-exec tag `-- <comrade-id>`, single-cell or serve-mode. The
+    Monitor bash wrapper carries the same words quoted inside its own cmdline
+    and must NEVER match - SIGUSR1 terminates an unsuspecting bash, and the
+    watchtower then follows via the ppid watchdog (the #5 churn)."""
 
-    WT_BARE = "/usr/bin/python3 /x/bin/cccp watchtower demo -- u@h:aaaaaa"
-    WT_FLAGS = ("/usr/bin/python3 /x/bin/cccp watchtower demo "
-                "--quiet filesystem -- u@h:aaaaaa")
-    WRAP_BARE = ("bash -c cd /x && eval 'bin/cccp watchtower demo' "
-                 "< /dev/null && echo done")
-    WRAP_FLAGS = ("bash -c cd /x && eval 'bin/cccp watchtower demo "
-                  "--quiet filesystem' < /dev/null && echo done")
+    ME = "u@h:aaaaaa"
+    WT_BARE = f"/usr/bin/python3 /x/bin/cccp watchtower demo -- {ME}"
+    WT_FLAGS = f"/usr/bin/python3 /x/bin/cccp watchtower demo --quiet filesystem -- {ME}"
+    WT_SERVE = f"/usr/bin/python3 /x/bin/cccp watchtower --serve -- {ME}"
+    WRAP = (f"bash -c cd /x && eval 'bin/cccp watchtower demo -- {ME}' "
+            "< /dev/null && echo done")
 
-    def _hits(self, cmdline, slug="demo", comrade=None):
-        import re as _re
-        return bool(_re.search(cccp.wake_pattern(slug, comrade), cmdline))
+    def test_matches_every_watchtower_shape(self):
+        for argv in (self.WT_BARE, self.WT_FLAGS, self.WT_SERVE):
+            self.assertTrue(cccp.is_watchtower_argv(argv, self.ME), argv)
 
-    def test_matches_bare_watchtower(self):
-        self.assertTrue(self._hits(self.WT_BARE))
+    def test_spares_the_wrapper(self):
+        self.assertFalse(cccp.is_watchtower_argv(self.WRAP, self.ME))
 
-    def test_matches_flagged_watchtower(self):
-        self.assertTrue(self._hits(self.WT_FLAGS))
+    def test_owner_must_match_whole(self):
+        self.assertFalse(cccp.is_watchtower_argv(self.WT_BARE, "u@h:bbbbbb"))
+        self.assertFalse(cccp.is_watchtower_argv(self.WT_BARE, "h:aaaaaa"))
 
-    def test_spares_bare_wrapper(self):
-        self.assertFalse(self._hits(self.WRAP_BARE))
+    def test_recycled_pid_never_matches(self):
+        self.assertFalse(cccp.is_watchtower_argv("/usr/bin/vim notes.txt", self.ME))
+        self.assertFalse(cccp.is_watchtower_argv(None, self.ME))
 
-    def test_spares_flagged_wrapper(self):
-        self.assertFalse(self._hits(self.WRAP_FLAGS))
 
-    def test_slug_is_word_bounded(self):
-        other = self.WT_BARE.replace("watchtower demo", "watchtower demo-x")
-        self.assertFalse(self._hits(other))
+class WakeByPidRecord(unittest.TestCase):
+    """A wake finds watchtowers through their pid records, not a pkill pattern:
+    a serve-mode watchtower carries no slug in its argv, so the record under
+    run/watchtower/<slug>/<comrade>/ is the only thing that says it holds the
+    cell. The record is a hint, the process table is the proof."""
 
-    def test_comrade_anchor_selects_one_watchtower(self):
-        """The narrowed pattern is what makes an automatic wake targeted."""
-        sibling = self.WT_BARE.replace("u@h:aaaaaa", "u@h:bbbbbb")
-        self.assertTrue(self._hits(self.WT_BARE, comrade="u@h:aaaaaa"))
-        self.assertFalse(self._hits(sibling, comrade="u@h:aaaaaa"))
+    SLUG = "demo"
 
-    def test_comrade_anchor_still_spares_the_wrapper(self):
-        wrap = self.WRAP_BARE.replace("watchtower demo", "watchtower demo -- u@h:aaaaaa")
-        self.assertFalse(self._hits(wrap, comrade="u@h:aaaaaa"))
+    def setUp(self):
+        self.data = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.data, True))
+        self.env = _isolated_env(self.data)
+        self.env.__enter__()
+        self.addCleanup(lambda: self.env.__exit__(None, None, None))
+        self.argv = {}      # pid -> argv the fake process table answers
+        self.killed = []    # (pid, signum)
+        mock.patch.object(cccp, "process_argv", self.argv.get).start()
+        mock.patch.object(cccp.os, "kill",
+                          lambda pid, sig: self.killed.append((pid, sig))).start()
+        self.addCleanup(mock.patch.stopall)
+
+    def _record(self, comrade, pid, argv):
+        p = cccp.pid_path(self.SLUG, comrade)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"pid": pid, "started": "t"}))
+        if argv is not None:
+            self.argv[pid] = argv
+
+    def test_wakes_every_verified_holder_of_the_cell(self):
+        self._record("u@h:aaaaaa", 101, "/p /x/bin/cccp watchtower demo -- u@h:aaaaaa")
+        self._record("u@h:bbbbbb", 102, "/p /x/bin/cccp watchtower --serve -- u@h:bbbbbb")
+        self.assertEqual(cccp.wake_watchtowers(self.SLUG), 2)
+        self.assertEqual(sorted(self.killed),
+                         [(101, cccp.signal.SIGUSR1), (102, cccp.signal.SIGUSR1)])
+
+    def test_named_comrade_narrows_to_one(self):
+        self._record("u@h:aaaaaa", 101, "/p /x/bin/cccp watchtower demo -- u@h:aaaaaa")
+        self._record("u@h:bbbbbb", 102, "/p /x/bin/cccp watchtower demo -- u@h:bbbbbb")
+        self.assertEqual(cccp.wake_watchtowers(self.SLUG, "u@h:bbbbbb"), 1)
+        self.assertEqual(self.killed, [(102, cccp.signal.SIGUSR1)])
+
+    def test_stale_and_recycled_records_are_never_signalled(self):
+        self._record("u@h:aaaaaa", 101, None)                    # no such process
+        self._record("u@h:bbbbbb", 102, "/usr/bin/vim notes.txt")  # pid reused
+        self._record("u@h:cccccc", 103, "bash -c eval 'cccp watchtower demo -- u@h:cccccc' x")
+        self.assertEqual(cccp.wake_watchtowers(self.SLUG), 0)
+        self.assertEqual(self.killed, [])
+
+    def test_no_records_is_zero_not_an_error(self):
+        self.assertEqual(cccp.wake_watchtowers(self.SLUG), 0)
+
+    def test_serve_wake_uses_the_session_record(self):
+        p = cccp.pid_path(None, "u@h:aaaaaa")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"pid": 200, "started": "t"}))
+        self.argv[200] = "/p /x/bin/cccp watchtower --serve -- u@h:aaaaaa"
+        self.assertEqual(cccp.wake_serve("u@h:aaaaaa"), 1)
+        self.assertEqual(cccp.wake_serve("u@h:bbbbbb"), 0)
 
 
 class WakeRecipients(unittest.TestCase):
     """#20: a send wakes the watchtowers it is addressed to, so a targeted
-    message lands now instead of waiting out the recipient's poll ladder. pkill
-    reaches only this user on this host, so that is exactly the set this may
-    signal - a remote recipient must produce no signal at all."""
+    message lands now instead of waiting out the recipient's poll ladder. The
+    pid records reach only this user on this host, so that is exactly the set
+    this may signal - a remote recipient must produce no signal at all."""
 
     def _signalled(self, to, mine="u@h"):
         seen = []
 
         def fake_wake(slug, comrade=None):
             seen.append((slug, comrade))
-            return mock.Mock(returncode=0)
+            return 1
 
         with mock.patch.object(cccp, "base_comrade_id", return_value=mine), \
              mock.patch.object(cccp, "wake_watchtowers", fake_wake):
@@ -2235,6 +2283,283 @@ class UnpublishLargerThan(unittest.TestCase):
             self._run(cccp.cmd_unpublish, path=str(src))
             self.assertEqual([wp.rsplit("/", 1)[-1] for wp in self._live()],
                              ["b.bin"])
+
+
+def _serve_cfg():
+    return {"BACKEND": "local-fs", "PARAMS": {}, "PREFIX": "", "DEBUG": None,
+            "AUTODOWNLOAD_MAX": cccp.parse_size("1m"), "ALIAS_TRIGGER": None,
+            "IDLE": None, "QUIET": [], "SOURCES": {}}
+
+
+class ServeMembership(unittest.TestCase):
+    """#45/#49: one serve-mode process holds many cells for the whole session,
+    so what a join and a leave do to per-cell state is defined here, not
+    assumed. Driven on the fake backend through the same inbox records the
+    `cccp join`/`leave`/`stop`/`dispatch --deadline` commands write."""
+
+    ME = "me@h:mmmmmm"
+    BOB = "bob@h:bbbbbb"
+
+    def setUp(self):
+        self.data = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.data, True))
+        self.env = _isolated_env(self.data)
+        self.env.__enter__()
+        self.addCleanup(lambda: self.env.__exit__(None, None, None))
+        self.client = _FakeBlobClient()
+        self.lines = []
+        mock.patch.object(cccp, "emit_event",
+                          lambda line, log_fn: self.lines.append(line) or True).start()
+        # No live process anywhere: every wake is a no-op, every liveness check
+        # says dead, so records are exercised without a process table.
+        mock.patch.object(cccp, "process_argv", lambda pid: None).start()
+        self.addCleanup(mock.patch.stopall)
+        self.serve = cccp.Serve(self.client, _serve_cfg(), self.ME)
+
+    def _join(self, slug, **opts):
+        self.serve._apply_inbox({"ev": "join", "slug": slug, **opts})
+
+    def _tick_all(self):
+        for slug in self.serve.due:
+            self.serve.due[slug] = 0.0
+        self.serve._tick()
+
+    def _say(self, slug, frm, body, ts="2026-09-16T00:00:00.000000Z"):
+        self.client.append(cccp.gazette_path("", slug, frm),
+                           {"type": "message", "from": frm, "ts": ts, "to": ["*"], "body": body})
+
+    def _deadline(self, slug, to, limit):
+        cccp.inbox_send(slug, self.ME,
+                        [{"ev": "deadline", "to": to, "limit": limit, "ts": cccp.now_iso()}])
+
+    def test_join_emits_one_ready_per_cell_and_records_the_pid(self):
+        self._join("a")
+        self._join("b")
+        readies = [l for l in self.lines if l.startswith("ready ")]
+        self.assertEqual(len(readies), 2)
+        self.assertTrue(readies[0].startswith(f"ready {self.ME} slug=a v="))
+        self.assertIn(" store=local-fs:", readies[0])
+        self.assertTrue(readies[0].endswith(" gazettes=0"))
+        for slug in ("a", "b"):
+            self.assertEqual(cccp.read_pid(cccp.pid_path(slug, self.ME))[0], os.getpid())
+        self.assertEqual(sorted(self.serve.cells), ["a", "b"])
+
+    def test_events_route_to_their_own_cell(self):
+        self._join("a")
+        self._join("b")
+        self._say("a", self.BOB, "for a")
+        self._say("b", self.BOB, "for b")
+        self._tick_all()
+        msgs = [l for l in self.lines if l.startswith("message ")]
+        self.assertEqual(len(msgs), 2)
+        self.assertIn('body="for a"', msgs[0])
+        self.assertIn('body="for b"', msgs[1])
+
+    def test_rejoin_reapplies_options_without_a_second_poller(self):
+        self._join("a")
+        self._join("a", idle=0, quiet=["filesystem"])
+        self.assertEqual(len([l for l in self.lines if l.startswith("ready ")]), 1)
+        self.assertEqual(self.serve.cells["a"].idle_initial, 0)
+        self.assertEqual(self.serve.cells["a"].quiet, {"filesystem"})
+
+    def test_leave_ends_only_that_cell(self):
+        self._join("a")
+        self._join("b")
+        self._deadline("a", self.BOB, "10m")
+        self._deadline("b", self.BOB, "10m")
+        cccp.save_aliases("b", self.ME, {self.BOB: "Bob"})
+        self._tick_all()   # drains both deadlines
+        self.assertIn(self.BOB, self.serve.cells["a"].deadlines)
+        self.serve._apply_inbox({"ev": "leave", "slug": "a"})
+        self.assertEqual(self.lines[-1], f"shutdown {self.ME} slug=a reason=leave")
+        self.assertEqual(list(self.serve.cells), ["b"])
+        self.assertIn(self.BOB, self.serve.cells["b"].deadlines,
+                      "leaving a must not touch b's deadline")
+        self.assertEqual(cccp.load_aliases("b", self.ME), {self.BOB: "Bob"})
+        self.assertFalse(cccp.pid_path("a", self.ME).exists())
+        self.assertEqual(cccp.watchtower_status("a", self.ME)[0], "stopped")
+        self.assertIn("reason=leave", cccp.watchtower_status("a", self.ME)[1])
+
+    def test_rejoin_after_leave_starts_clean(self):
+        self._join("a")
+        self._deadline("a", self.BOB, "10m")
+        self._tick_all()
+        self.serve._apply_inbox({"ev": "leave", "slug": "a"})
+        self._join("a")
+        self.assertEqual(self.serve.cells["a"].deadlines, {})
+        self.assertEqual(len([l for l in self.lines if l.startswith("ready ")]), 2)
+
+    def test_leave_of_a_cell_not_held_is_a_noop(self):
+        self.serve._apply_inbox({"ev": "leave", "slug": "nope"})
+        self.assertEqual(self.lines, [])
+
+    def test_cell_inbox_shutdown_is_a_leave(self):
+        """`cccp stop <slug>` writes the same record it always did; under a
+        Serve loop it ends the cell, not the process (#47)."""
+        self._join("a")
+        self._join("b")
+        cccp.inbox_send("a", self.ME, [{"ev": "shutdown"}])
+        self._tick_all()
+        self.assertEqual(list(self.serve.cells), ["b"])
+        self.assertFalse(self.serve.stop)
+        self.assertIn(f"shutdown {self.ME} slug=a reason=leave", self.lines)
+
+    def test_join_failure_holds_nothing(self):
+        self.client.list = mock.Mock(side_effect=RuntimeError("store down"))
+        with contextlib.redirect_stderr(io.StringIO()):
+            self._join("a")
+        self.assertEqual(self.serve.cells, {})
+        self.assertFalse(cccp.pid_path("a", self.ME).exists())
+        self.assertIn(f"shutdown {self.ME} slug=a reason=crash_RuntimeError", self.lines)
+
+    def test_options_default_and_are_bounded(self):
+        self._join("a", idle=7, quiet=["filesystem", "bogus"])
+        self.assertEqual(self.serve.cells["a"].idle_initial, 7 * 60)
+        self.assertEqual(self.serve.cells["a"].quiet, {"filesystem"})
+        self._join("b")
+        self.assertEqual(self.serve.cells["b"].idle_initial, cccp.WATCH_IDLE_DEFAULT_MIN * 60)
+
+
+class ServeLifecycle(unittest.TestCase):
+    """The serve process's own records: what a successor for the same session
+    finds, and when it finds nothing on purpose."""
+
+    ME = "me@h:mmmmmm"
+
+    def setUp(self):
+        self.data = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.data, True))
+        self.env = _isolated_env(self.data)
+        self.env.__enter__()
+        self.addCleanup(lambda: self.env.__exit__(None, None, None))
+        self.lines = []
+        mock.patch.object(cccp, "emit_event",
+                          lambda line, log_fn: self.lines.append(line) or True).start()
+        mock.patch.object(cccp, "process_argv", lambda pid: None).start()
+        self.addCleanup(mock.patch.stopall)
+
+    def _serve(self):
+        return cccp.Serve(_FakeBlobClient(), _serve_cfg(), self.ME)
+
+    def test_signal_stop_says_goodbye_per_cell_and_keeps_them_for_a_successor(self):
+        s = self._serve()
+        s._apply_inbox({"ev": "join", "slug": "a", "idle": 0})
+        s._apply_inbox({"ev": "join", "slug": "b"})
+        s.stop_reason = "signal_15"
+        s._record_stop()
+        self.assertEqual(self.lines[-3:], [
+            f"shutdown {self.ME} slug=a reason=signal_15",
+            f"shutdown {self.ME} slug=b reason=signal_15",
+            f"shutdown {self.ME} serve=true reason=signal_15"])
+        self.assertFalse(cccp.pid_path(None, self.ME).exists())
+        self.assertEqual(cccp.watchtower_status(None, self.ME)[0], "stopped")
+        recorded = json.loads(cccp.cells_path(self.ME).read_text())
+        self.assertEqual(sorted(recorded), ["a", "b"])
+        self.assertEqual(recorded["a"]["idle"], 0)
+
+    def test_successor_rejoins_recorded_cells_with_their_options(self):
+        s = self._serve()
+        s._apply_inbox({"ev": "join", "slug": "a", "idle": 0, "quiet": ["filesystem"]})
+        s.stop_reason = "signal_15"
+        s._record_stop()
+        self.lines.clear()
+        successor = self._serve()
+        successor.stop = True          # run the startup, skip the loop
+        mock.patch.object(cccp.signal, "signal").start()
+        successor.run()
+        self.assertTrue(self.lines[0].startswith(f"ready {self.ME} serve=true v="))
+        self.assertTrue(self.lines[1].startswith(f"ready {self.ME} slug=a v="))
+        self.assertEqual(self.lines[-1], f"shutdown {self.ME} serve=true reason=unknown")
+        # The cell was held with the recorded options until the stop.
+        self.assertIn(f"shutdown {self.ME} slug=a reason=unknown", self.lines)
+
+    def test_deliberate_stop_forgets_every_cell(self):
+        s = self._serve()
+        s._apply_inbox({"ev": "join", "slug": "a"})
+        s._apply_inbox({"ev": "shutdown"})
+        self.assertTrue(s.stop)
+        s._record_stop()
+        self.assertFalse(cccp.cells_path(self.ME).exists())
+        self.assertEqual(cccp.Serve(_FakeBlobClient(), _serve_cfg(), self.ME)._recorded_cells(), {})
+
+    def test_leave_forgets_only_its_cell(self):
+        s = self._serve()
+        s._apply_inbox({"ev": "join", "slug": "a"})
+        s._apply_inbox({"ev": "join", "slug": "b"})
+        s._apply_inbox({"ev": "leave", "slug": "a"})
+        self.assertEqual(list(json.loads(cccp.cells_path(self.ME).read_text())), ["b"])
+
+    def test_second_serve_for_the_session_exits_at_once(self):
+        p = cccp.pid_path(None, self.ME)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"pid": 4242, "started": "t"}))
+        with mock.patch.object(cccp, "process_argv",
+                               lambda pid: f"/p /x/bin/cccp watchtower --serve -- {self.ME}"):
+            self._serve().run()
+        self.assertEqual(self.lines, [f"shutdown {self.ME} serve=true reason=already_serving pid=4242"])
+        self.assertEqual(json.loads(p.read_text())["pid"], 4242, "the incumbent's record is untouched")
+
+    def test_status_lists_held_cells(self):
+        s = self._serve()
+        s._apply_inbox({"ev": "join", "slug": "a"})
+        s._apply_inbox({"ev": "join", "slug": "b"})
+        cccp.write_pidfile(None, self.ME, lambda m: None)
+        self.assertEqual(cccp.held_cells(self.ME, os.getpid()), ["a", "b"])
+        self.assertEqual(cccp.held_cells("other@h:oooooo", os.getpid()), [])
+        argv = f"/p /x/bin/cccp watchtower --serve -- {self.ME}"
+        with mock.patch.object(cccp, "process_argv", lambda pid: argv):
+            self.assertEqual(cccp.watchtower_status(None, self.ME)[0], "alive")
+            self.assertEqual(cccp.live_watchtower("a", self.ME), os.getpid())
+
+    def test_require_serve_fails_loud_with_the_way_out(self):
+        with self.assertRaises(SystemExit) as cm:
+            cccp.require_serve(self.ME)
+        self.assertIn("cccp:chat", str(cm.exception))
+        self.assertIn("cccp watchtower --serve", str(cm.exception))
+
+
+class WatchOptions(unittest.TestCase):
+    """#49: flag -> CCCP_IDLE/CCCP_QUIET -> default, resolved by the caller."""
+
+    def test_precedence(self):
+        cfg = _serve_cfg()
+        self.assertEqual(cccp.watch_options(cfg), (cccp.WATCH_IDLE_DEFAULT_MIN, []))
+        cfg["IDLE"], cfg["QUIET"] = 5, ["filesystem"]
+        self.assertEqual(cccp.watch_options(cfg), (5, ["filesystem"]))
+        self.assertEqual(cccp.watch_options(cfg, idle=0), (0, ["filesystem"]))
+        self.assertEqual(cccp.watch_options(cfg, quiet=["filesystem"]), (5, ["filesystem"]))
+
+    def test_env_reaches_resolve_config(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(d, True))
+        with _isolated_env(d, CCCP_IDLE="0", CCCP_QUIET="filesystem"):
+            cfg = cccp.resolve_config()
+        self.assertEqual((cfg["IDLE"], cfg["QUIET"]), (0, ["filesystem"]))
+        with _isolated_env(d, CCCP_IDLE="soon"), self.assertRaises(SystemExit):
+            cccp.resolve_config()
+
+
+class MonitorsManifest(unittest.TestCase):
+    """#46: the plugin monitor manifest is an experimental component upstream
+    ("shape may change without a deprecation cycle"), so its shape is pinned
+    here and a change is caught in this repo first."""
+
+    def setUp(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(here, os.pardir, "monitors", "monitors.json")
+        with open(path) as f:
+            self.monitors = json.load(f)
+
+    def test_one_serve_monitor_per_watchtower_skill(self):
+        self.assertEqual(sorted(m["when"] for m in self.monitors), [
+            "on-skill-invoke:cccp:captain", "on-skill-invoke:cccp:captain-with-tmux",
+            "on-skill-invoke:cccp:chat", "on-skill-invoke:cccp:team"])
+        names = [m["name"] for m in self.monitors]
+        self.assertEqual(len(set(names)), len(names), "monitor names must be unique")
+        for m in self.monitors:
+            self.assertEqual(set(m), {"name", "description", "when", "command"})
+            self.assertEqual(m["command"], '"${CLAUDE_PLUGIN_ROOT}"/bin/cccp watchtower --serve')
+            self.assertNotIn("user_config", m["command"])
 
 
 if __name__ == "__main__":
