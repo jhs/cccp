@@ -1,0 +1,26 @@
+[
+  {
+    "name": "watchtower",
+    "description": "cccp watchtower",
+    "when": "on-skill-invoke:cccp:chat",
+    "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/cccp watchtower --serve"
+  },
+  {
+    "name": "watchtower-team",
+    "description": "cccp watchtower",
+    "when": "on-skill-invoke:cccp:team",
+    "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/cccp watchtower --serve"
+  },
+  {
+    "name": "watchtower-captain",
+    "description": "cccp watchtower",
+    "when": "on-skill-invoke:cccp:captain",
+    "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/cccp watchtower --serve"
+  },
+  {
+    "name": "watchtower-captain-with-tmux",
+    "description": "cccp watchtower",
+    "when": "on-skill-invoke:cccp:captain-with-tmux",
+    "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/cccp watchtower --serve"
+  }
+]
