@@ -50,16 +50,16 @@ When no plugin monitor is live — an older Claude Code, plugin monitors disable
 - The monitor process sees `CLAUDE_CODE_SESSION_ID` and every SessionStart export, including cccp's own `CCCP_PLUGIN_DATA`; the shell wrapper sources the session env file. `CLAUDE_PLUGIN_ROOT`/`CLAUDE_PLUGIN_DATA` are **not** in its environment — only substituted in the command string, hence the quoted `"${CLAUDE_PLUGIN_ROOT}"` in the manifest.
 - Delivery is a token bucket of 10, one token per 2 s, per monitor; excess batches are dropped with a `suppressed N events` line and the process keeps running. Lines within 200 ms are one batch, one token. The watchtower emits one batch per poll and polls no faster than every 2 s, so it never hits the bucket.
 - Plugin monitors run unsandboxed at hook trust, in interactive sessions only, and are skipped when workspace trust is not accepted or `disableAllHooks` is set. Arming is also gated by a remote flag.
-- Every plugin's `bin/` is put on the session `PATH` in plugin order. Running a checkout with `--plugin-dir` beside an installed cccp puts the installed `cccp` first — so the model's `cccp join` ran the installed 3.12.0 (no such verb) while the monitor ran the checkout. The manifest's explicit `"${CLAUDE_PLUGIN_ROOT}"/bin/cccp` keeps a released install consistent; for a dev session, put the checkout's `bin` first on `PATH` yourself.
+- Every plugin's `bin/` is put on the session `PATH` in plugin order, regardless of which plugins are enabled. Running a checkout with `--plugin-dir` beside an installed cccp put the installed `cccp` first — so the model's `cccp join` ran the installed 3.12.0 (no such verb) while the monitor ran the checkout. Since 3.13.1 the SessionStart hook prepends its own plugin's `bin/`, so the `cccp` on `PATH` is the one whose hook, data dir and monitor the session uses; the manifest's explicit `"${CLAUDE_PLUGIN_ROOT}"/bin/cccp` was already consistent on its own.
 
 ## Verifying a change
 
-Unit tests drive `Serve` on the fake backend (`tests/test_cccp.py`, `ServeMembership`, `ServeLifecycle`) and pin the manifest shape (`MonitorsManifest`). For the real thing, launch a Claude Code TUI under tmux with this checkout as the plugin — see [driving-agent-tuis-with-tmux.md](driving-agent-tuis-with-tmux.md) — invoke `/cccp:chat <cell>`, and inject traffic from a shell as a second comrade:
+Unit tests drive `Serve` on the fake backend (`tests/test_cccp.py`, `ServeMembership`, `ServeLifecycle`) and pin the manifest shape (`MonitorsManifest`). For the real thing, launch a Claude Code TUI under tmux with this checkout as the plugin through `bin/claude-dev` — see [driving-agent-tuis-with-tmux.md](driving-agent-tuis-with-tmux.md) — invoke `/cccp:chat <cell>`, and inject traffic from a shell as a second comrade:
 
 ```bash
-tmux new-window -d -n cctest -c "$PWD" "PATH=$PWD/bin:\$PATH CCCP_ACTIVE_BACKEND=local-fs claude --plugin-dir $PWD --settings '{\"enabledPlugins\":{\"cccp@CCCP\":false}}' --session-id <uuid> --model <model> --dangerously-skip-permissions; sleep 900"
-pgrep -af 'cccp watchtower --serve'          # armed? the argv ends -- dev@host:cc-<first 6 of the uuid>
+tmux new-window -d -n cctest -c "$PWD" "bin/claude-dev --model <model> --dangerously-skip-permissions; sleep 900"
+pgrep -af 'cccp watchtower --serve'          # armed? the argv ends -- <the comrade id claude-dev printed>
 CCCP_ACTIVE_BACKEND=local-fs CCCP_PLUGIN_DATA=~/.claude/plugins/data/cccp-inline CCCP_COMRADE_ID=<that id> cccp status
 ```
 
-The `cccp-inline` data dir is where a `--plugin-dir` plugin keeps its state; check its `cccp config` before trusting where a test cell's traffic goes.
+The `cccp-inline` data dir is where a `--plugin-dir` plugin keeps its state; `claude-dev` points the session at local-fs, and the `ready … store=` line says where a cell's traffic actually goes.

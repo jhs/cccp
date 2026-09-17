@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# claude-dev — launch Claude Code with THIS checkout as the cccp plugin.
+#
+# Usage:
+#   claude-dev [--hub] [claude options...]
+#
+# What it settles, so a test session never needs the incantation by hand:
+#   - the checkout is the plugin (--plugin-dir), and the installed cccp is
+#     disabled for the session, so exactly one cccp hook, skill set and
+#     monitor manifest are loaded - the checkout's
+#   - the session id is chosen here and printed with the comrade id it
+#     yields, so a shell can address the session as a peer at once
+#   - the data backend is local-fs (cells are free and local) unless --hub
+#     asks for whatever the inline data dir is configured for
+#
+# Anything else (--model, --dangerously-skip-permissions, --resume, ...) passes
+# through to claude. Prints the session id and comrade id on stderr, then execs.
+set -euo pipefail
+root="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+hub=0
+if [[ "${1:-}" == "--hub" ]]; then hub=1; shift; fi
+command -v claude >/dev/null || { echo "claude-dev: claude not found" >&2; exit 1; }
+sid="$(uuidgen 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())')"
+echo "claude-dev: session ${sid} comrade $(id -un)@$(hostname -s):cc-${sid:0:6} plugin ${root} backend $([[ $hub == 1 ]] && echo '(inline data dir config)' || echo local-fs)" >&2
+(( hub )) || export CCCP_ACTIVE_BACKEND=local-fs
+exec claude --plugin-dir "$root" --settings '{"enabledPlugins":{"cccp@CCCP":false}}' --session-id "$sid" "$@"

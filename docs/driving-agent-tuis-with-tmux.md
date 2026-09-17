@@ -126,6 +126,14 @@ pi --list-models                  # resolve a model name to an id
 
 A Claude Code process will not exit because you asked it to; `tmux kill-window` is the only exit path. Wind-down doctrine for a real comrade lives in the skill's `## Terminating a comrade`.
 
+To test **this checkout** as the plugin, launch through `bin/claude-dev` instead of `claude`: it loads the checkout with `--plugin-dir`, disables the installed cccp for the session, picks the session id (printing the comrade id it yields, so a shell can address the session as a peer at once) and defaults the backend to local-fs (`--hub` opts into the inline data dir's configured store). Everything else passes through:
+
+```bash
+tmux new-window -d -n cctest -c "$PWD" "bin/claude-dev --model claude-sonnet-5 --dangerously-skip-permissions; echo \"=== EXITED rc=\$? ===\"; sleep 900"
+```
+
+`spawn-comrade --dev` routes a comrade through the same launcher.
+
 ## Zero-cost harness probes
 
 Extension lifecycle hooks (`session_start`, `session_shutdown`) fire without any model call. A throwaway extension that writes to a file from those hooks answers questions about harness internals — what survives a reload, what an event carries, whether an API works at a given moment — for free, in the real TUI.
