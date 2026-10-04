@@ -178,6 +178,12 @@ class TeamSkill(unittest.TestCase):
                           f"team skill - re-sync the adapted copy")
         self.assertIn("../cccp-chat/SKILL.md", self.text)
 
+    def test_trigger_is_read_from_config_never_set(self):
+        # #51: config is the alias trigger's one source. The skill teaches how to
+        # read it and never pins one, so a Pi seat parses intros like the rest.
+        self.assertIn("cccp config CCCP_ALIAS_TRIGGER", self.text)
+        self.assertNotIn("CCCP_ALIAS_TRIGGER=", self.text)
+
 
 class EnvSurface(unittest.TestCase):
     """The extension invents NO env vars: cell is a tool parameter, the binary

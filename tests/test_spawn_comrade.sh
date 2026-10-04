@@ -31,11 +31,25 @@ else
   ok
 fi
 
-prompt="$(pi_prompt Builder cell-a captain@host:abc docs/brief.md)"
+prompt="$(pi_prompt Builder cell-a captain@host:abc 'Comrade Introduction:' docs/brief.md)"
 has "$prompt" "/skill:cccp-chat cell-a" "Pi prompt starts the chat skill"
 has "$prompt" "@docs/brief.md" "Pi prompt references supplied docs"
 has "$prompt" "captain@host:abc" "Pi prompt targets the captain"
-has "$prompt" "Comrade Introduction: Builder" "Pi prompt preserves Pi alias trigger"
+has "$prompt" "Comrade Introduction: Builder" "Pi prompt teaches the given trigger"
+has "$(pi_prompt Builder cell-a '' 'Intro:')" 'broadcast an introduction beginning exactly "Intro: Builder"' "Pi broadcast intro uses the given trigger"
+
+prompt="$(claude_prompt team Builder cell-a captain@host:abc 'Comrade Introduction:' docs/a.md docs/b.md)"
+eq "$prompt" "/cccp:team cell-a # See docs/a.md then docs/b.md -- then introduce yourself to your Captain at captain@host:abc,\
+ beginning with the literal prefix Comrade Introduction: followed by your alias Builder" "Claude prompt teaches the given trigger"
+eq "$(claude_prompt team Builder cell-a '' 'Intro:')" \
+  "/cccp:team cell-a -- then introduce yourself to the cell, beginning with the literal prefix Intro: followed by your alias Builder" "Claude prompt without docs or captain"
+
+# #51: the trigger comes from cccp's config, the one source every seat on the machine parses intros with.
+data="$(mktemp -d)"
+eq "$(env -u CCCP_ALIAS_TRIGGER CCCP_PLUGIN_DATA="$data" bash -c 'source "$1"; alias_trigger' _ "$SCRIPT")" "Intro:" "Trigger defaults with nothing configured"
+printf 'CCCP_ALIAS_TRIGGER=Comrade Introduction:\n' >"$data/config"
+eq "$(env -u CCCP_ALIAS_TRIGGER CCCP_PLUGIN_DATA="$data" bash -c 'source "$1"; alias_trigger' _ "$SCRIPT")" "Comrade Introduction:" "Trigger follows config"
+rm -rf "$data"
 
 echo "Test results: RAN=$RAN FAIL=$FAIL"
 [[ "$FAIL" -eq 0 ]]

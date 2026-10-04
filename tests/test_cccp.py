@@ -8,6 +8,7 @@ watchtower preview and the `read` continuation must split the body at the SAME
 byte, the truncated event must fit the Monitor envelope, and escapes must never
 be split. cccp is an executable script (no .py), so load it by path.
 """
+import argparse
 import contextlib
 import glob
 import importlib.util
@@ -1274,15 +1275,24 @@ class AliasTrigger(unittest.TestCase):
     """CCCP_ALIAS_TRIGGER: config, not a watchtower flag. A cell-wide convention
     reads as configuration, and the env layer already supplies the one-off
     override (`CCCP_ALIAS_TRIGGER=... cccp watchtower <slug>`) that a flag would
-    have duplicated. Unset means off, so bare `chat` is untouched."""
+    have duplicated. Unset means the built-in default (#51): a cell never runs
+    with aliases off just because nothing was configured."""
 
     def setUp(self):
         self.data = tempfile.mkdtemp()
         self.addCleanup(lambda: __import__("shutil").rmtree(self.data, True))
 
-    def test_defaults_to_off(self):
+    def test_defaults_to_intro(self):
         with _isolated_env(self.data):
-            self.assertIsNone(cccp.resolve_config()["ALIAS_TRIGGER"])
+            self.assertEqual(cccp.resolve_config()["ALIAS_TRIGGER"], "Intro:")
+
+    def test_dump_names_the_default(self):
+        with _isolated_env(self.data):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                cccp._print_config_dump()
+        row = next(l for l in buf.getvalue().splitlines() if "CCCP_ALIAS_TRIGGER" in l)
+        self.assertEqual(row.split(), ["CCCP_ALIAS_TRIGGER", "default", "Intro:"])
 
     def test_env_override_resolves(self):
         with _isolated_env(self.data, CCCP_ALIAS_TRIGGER="Intro:"):
@@ -1333,6 +1343,114 @@ class AliasTrigger(unittest.TestCase):
         # lengths below the floor yield a plausible-looking, wrong alias.
         self.assertEqual(cccp.parse_alias("I am ready", "I"), "am")
         self.assertEqual(cccp.parse_alias("Hi all, I'm Bob", "Hi"), "all")
+
+
+class ConfigGet(unittest.TestCase):
+    """`cccp config KEY` prints one key's resolved value - the dump's Value column,
+    redaction included - so a script (spawn-comrade) can ask cccp for the trigger
+    every seat on this machine will use instead of hardcoding one (#51)."""
+
+    def setUp(self):
+        self.data = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.data, True))
+
+    def _get(self, *keys, **env):
+        with _isolated_env(self.data, **env):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                cccp.cmd_config(argparse.Namespace(assignments=list(keys)))
+            return buf.getvalue()
+
+    def test_default_trigger(self):
+        self.assertEqual(self._get("CCCP_ALIAS_TRIGGER"), "Intro:\n")
+
+    def test_configured_trigger(self):
+        with open(os.path.join(self.data, "config"), "w") as f:
+            f.write("CCCP_ALIAS_TRIGGER=Comrade Introduction:\n")
+        self.assertEqual(self._get("CCCP_ALIAS_TRIGGER"), "Comrade Introduction:\n")
+
+    def test_env_outranks_the_file(self):
+        with open(os.path.join(self.data, "config"), "w") as f:
+            f.write("CCCP_ALIAS_TRIGGER=Comrade Introduction:\n")
+        self.assertEqual(self._get("CCCP_ALIAS_TRIGGER", CCCP_ALIAS_TRIGGER="Hello:"), "Hello:\n")
+
+    def test_value_carries_no_shadow_note(self):
+        with open(os.path.join(self.data, "config"), "w") as f:
+            f.write("CCCP_ALIAS_TRIGGER=Comrade Introduction:\n")
+        self.assertNotIn("shadows", self._get("CCCP_ALIAS_TRIGGER", CCCP_ALIAS_TRIGGER="Hello:"))
+
+    def test_secret_stays_redacted(self):
+        out = self._get("CCCP_AZURE_BLOB_SAS", CCCP_AZURE_BLOB_SAS="sv=secret")
+        self.assertNotIn("secret", out)
+        self.assertEqual(out, "<set, 9 chars>\n")
+
+    def test_unknown_key_exits(self):
+        with self.assertRaises(SystemExit) as cm:
+            self._get("CCCP_NOPE")
+        self.assertIn("CCCP_NOPE", str(cm.exception))
+
+    def test_read_and_write_do_not_mix(self):
+        with self.assertRaises(SystemExit):
+            self._get("CCCP_ALIAS_TRIGGER", "CCCP_IDLE=5")
+        self.assertFalse(os.path.exists(os.path.join(self.data, "config")))
+
+
+class SingleAliasTrigger(unittest.TestCase):
+    """#51: config is the one source of the alias trigger. The team skill used to
+    pin `CCCP_ALIAS_TRIGGER='Intro:'` on join and teach `Intro:` intros, so on a
+    machine configured with another trigger, seats that followed the skill and
+    seats that did not parsed intros differently - and a later seat seeded none
+    of the earlier ones. The skill now renders the configured trigger instead."""
+
+    ME = "me@h:cc-aaaaaa"
+    CAPTAIN = "cap@h:cc-bbbbbb"
+
+    def setUp(self):
+        self.data = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.data, True))
+
+    def _configure(self, trigger):
+        with open(os.path.join(self.data, "config"), "w") as f:
+            f.write(f"CCCP_ALIAS_TRIGGER={trigger}\n")
+
+    def _team(self):
+        with _isolated_env(self.data, CCCP_COMRADE_ID=self.ME):
+            return cccp.compose_skill("team")
+
+    def _taught_intro(self, skill):
+        m = re.search(r"cccp dispatch <slug> '(.*?)<YourName>", skill)
+        self.assertIsNotNone(m, "the team skill shows no intro example")
+        return m.group(1)
+
+    def test_skill_never_overrides_the_configured_trigger(self):
+        self._configure("Comrade Introduction:")
+        self.assertNotIn("CCCP_ALIAS_TRIGGER=", self._team())
+
+    def test_skill_teaches_the_configured_trigger(self):
+        self._configure("Comrade Introduction:")
+        self.assertEqual(self._taught_intro(self._team()), "Comrade Introduction: ")
+
+    def test_skill_teaches_the_default_trigger(self):
+        self.assertEqual(self._taught_intro(self._team()), "Intro: ")
+
+    def test_taught_intro_registers_with_the_join_trigger(self):
+        for trigger in (None, "Comrade Introduction:"):
+            with self.subTest(trigger=trigger):
+                if trigger:
+                    self._configure(trigger)
+                intro = self._taught_intro(self._team()) + "Captain — coordinating"
+                with _isolated_env(self.data):
+                    self.assertEqual(cccp.parse_alias(intro, cccp.resolve_config()["ALIAS_TRIGGER"]), "Captain")
+
+    def test_late_seat_seeds_an_earlier_intro_with_nothing_configured(self):
+        with _isolated_env(self.data, CCCP_COMRADE_ID=self.ME):
+            cfg = cccp.resolve_config()
+            client = cccp.make_backend(cfg)
+            rec = {"type": "message", "from": self.CAPTAIN, "ts": cccp.now_iso(), "to": ["*"], "body": "Intro: Captain — coordinating"}
+            client.append_block(cccp.gazette_path("", "demo", self.CAPTAIN), (json.dumps(rec) + "\n").encode())
+            wt = cccp.Watchtower(client, "", "demo", self.ME, 0, trigger=cfg["ALIAS_TRIGGER"])
+            wt.seed_aliases()
+        self.assertEqual(wt.aliases, {self.CAPTAIN: "Captain"})
 
 
 class ConfigSet(unittest.TestCase):

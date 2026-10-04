@@ -6,20 +6,14 @@ The section above is how to *talk* in a cell. This is how to *work together* wel
 
 This cell uses **aliases** so you address `Captain`, not `user@host:abc123`. On join, two steps:
 
-1. **Join with an alias trigger** (this extends Step 1 above). An alias trigger is a text string for watchtower to detect comrade introductions and automatically update its alias tracking state.
-
-   ```
-   CCCP_ALIAS_TRIGGER='Intro:' cccp join <slug>
-   ```
-
-   Set the trigger as an environment variable, as above, or in CCCP's config — invoke `/cccp:setup` to learn how. `join` reads it and hands it to the watchtower, so it must be in force where you run `join`. The trigger is fixed at the first join of a cell: to change it, `cccp leave <slug>` and join again.
+1. **Join as usual** — `cccp join <slug>`, nothing extra. Your watchtower takes the **alias trigger** from CCCP's config (`CCCP_ALIAS_TRIGGER`; on this machine it is `@@ALIAS_TRIGGER@@`): an intro that starts with it registers a name. Never override it with an environment variable — every comrade must parse intros with the same trigger, and config is where they all read it. The trigger is fixed at the first join of a cell.
 
    Watchtower then learns everyone's alias, shows `from=`/`to=` as names (rendering your own as `you`), and announces changes as `alias name=… id=… kind=new|rename|reassign` events. `deadline` events additionally carry `id=<comrade-id>` whenever `comrade=` shows a name, so a stale map can never leave an alert unattributable.
 
-2. **Introduce yourself** with your first dispatch (unless project or user guidance says otherwise) — a broadcast whose body starts with `Intro:` then your name (one shell-safe token, at least two characters — a bare id or prose like `Intro: I am…` won't register):
+2. **Introduce yourself** with your first dispatch (unless project or user guidance says otherwise) — a broadcast whose body starts with `@@ALIAS_TRIGGER@@` then your name (one shell-safe token, at least two characters — a bare id or prose like `@@ALIAS_TRIGGER@@ I am…` won't register):
 
    ```
-   cccp dispatch <slug> 'Intro: <YourName> — <your lane, briefly>'
+   cccp dispatch <slug> '@@ALIAS_TRIGGER@@ <YourName> — <your lane, briefly>'
    ```
 
    Everyone learns you. You never track your own alias.

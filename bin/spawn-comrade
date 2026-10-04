@@ -49,19 +49,42 @@ pi_model_ok() {
   fi
 }
 
+# The alias trigger every seat on this machine parses intros with. cccp's config is its one
+# source (#51): a prompt that taught any other prefix would introduce a name nobody registers.
+alias_trigger() {
+  "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/cccp" config CCCP_ALIAS_TRIGGER
+}
+
 pi_prompt() {
-  local name=$1 slug=$2 captain=$3
-  shift 3
+  local name=$1 slug=$2 captain=$3 trigger=$4
+  shift 4
   local docs="" doc
   for doc in "$@"; do docs+=" @$doc"; done
   printf 'Use /skill:cccp-chat %s to join the cell as %s.%s' "$slug" "$name" \
     "${docs:+ Read these task documents first:$docs.}"
   if [[ -n "$captain" ]]; then
-    printf ' Then send %s a targeted introduction beginning exactly "Comrade Introduction: %s".' \
-      "$captain" "$name"
+    printf ' Then send %s a targeted introduction beginning exactly "%s %s".' "$captain" "$trigger" "$name"
   else
-    printf ' Then broadcast an introduction beginning exactly "Comrade Introduction: %s".' "$name"
+    printf ' Then broadcast an introduction beginning exactly "%s %s".' "$trigger" "$name"
   fi
+}
+
+claude_prompt() {
+  local skill=$1 name=$2 slug=$3 captain=$4 trigger=$5
+  shift 5
+  local prompt="/cccp:$skill $slug"
+  if [[ $# -gt 0 ]]; then
+    local refs="$1" d
+    shift
+    for d in "$@"; do refs+=" then $d"; done
+    prompt+=" # See $refs"
+  fi
+  if [[ -n "$captain" ]]; then
+    prompt+=" -- then introduce yourself to your Captain at ${captain},"
+  else
+    prompt+=" -- then introduce yourself to the cell,"
+  fi
+  printf '%s' "$prompt beginning with the literal prefix $trigger followed by your alias ${name}"
 }
 
 # Sourcing exposes the helpers to their unit test without attempting a launch.
@@ -139,8 +162,10 @@ if tmux list-windows -t "$session" -F '#W' 2>/dev/null | grep -qxF "$name"; then
   fi
 fi
 
+trigger="$(alias_trigger)" || { echo "spawn-comrade: Cannot read alias trigger from cccp config" >&2; exit 1; }
+
 if [[ "$harness" == "pi" ]]; then
-  prompt="$(pi_prompt "$name" "$slug" "$captain" "${extra_docs[@]}")"
+  prompt="$(pi_prompt "$name" "$slug" "$captain" "$trigger" "${extra_docs[@]}")"
   # Pi loads CCCP through its installed package. Source the target project's
   # optional .env so its own tools have the same configuration as the captain.
   envload=""
@@ -148,19 +173,7 @@ if [[ "$harness" == "pi" ]]; then
   esc=${prompt//\'/\'\\\'\'}
   cmd="${envload}pi --provider openai-codex --model '${model//\'/\'\\\'\'}' --thinking '${effort//\'/\'\\\'\'}' --name '${name//\'/\'\\\'\'}' '${esc}'"
 else
-  # Build the /cccp:<skill> prompt.
-  prompt="/cccp:$skill $slug"
-  if [[ ${#extra_docs[@]} -gt 0 ]]; then
-    refs="${extra_docs[0]}"
-    for d in "${extra_docs[@]:1}"; do refs+=" then $d"; done
-    prompt+=" # See $refs"
-  fi
-  if [[ -n "$captain" ]]; then
-    prompt+=" -- then introduce yourself to your Captain at ${captain},"
-  else
-    prompt+=" -- then introduce yourself to the cell,"
-  fi
-  prompt+=" beginning with the literal prefix Intro: followed by your alias ${name}"
+  prompt="$(claude_prompt "$skill" "$name" "$slug" "$captain" "$trigger" "${extra_docs[@]}")"
 
   # Escape single-quotes for the sh -c string ( ' -> '\'' ).
   esc=${prompt//\'/\'\\\'\'}

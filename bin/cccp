@@ -119,6 +119,8 @@ ALIAS_TRIGGER_MIN = 3   # shortest usable CCCP_ALIAS_TRIGGER. Below this a
                         # is not a guarantee (no length makes a trigger
                         # distinctive), just the floor below which it is
                         # guaranteed WRONG.
+ALIAS_TRIGGER_DEFAULT = "Intro:"   # when nothing configures CCCP_ALIAS_TRIGGER (#51). A cell never runs with aliases
+                                   # off by accident, and `Intro:` is what every intro in history already used.
 DEBUG_LOG_MAX_BYTES = 10 * 1024 * 1024    # per debug.log; rotates to keep 5 backups
 DEBUG_LOG_BACKUPS = 5                     # so worst case ~60 MB per (cell, comrade)
 TEXT_EXTENSIONS = {
@@ -518,8 +520,7 @@ def resolve_config():
                                        else AUTODOWNLOAD_MAX_DEFAULT),
         "AUTODOWNLOAD_MAX_RAW": raw_adl if raw_adl is not None
                                 else AUTODOWNLOAD_MAX_DEFAULT,
-        # None when unset, which is exactly "aliases off" (see parse_alias).
-        "ALIAS_TRIGGER": merged.get("CCCP_ALIAS_TRIGGER"),
+        "ALIAS_TRIGGER": merged.get("CCCP_ALIAS_TRIGGER") or ALIAS_TRIGGER_DEFAULT,
         # Per-cell watch options with no CLI flag on the serve-mode watchtower
         # (#49): a role default set where no flag can be passed - a project's
         # SessionStart hook, a spawn script - reaches `cccp join` through here.
@@ -1636,14 +1637,14 @@ def wake_recipients(slug, to, log=None):
 # declares its alias in an intro whose body starts with the CCCP_ALIAS_TRIGGER
 # prefix; every armed comrade - including the declarer's own watchtower, which
 # reads its own gazette for exactly this - learns it and translates on the way in
-# (watchtower metadata) and out (dispatch --to). Off entirely unless a trigger is
-# set, so bare `chat` is unchanged; `team` is the layer that turns it on.
+# (watchtower metadata) and out (dispatch --to).
 #
 # The trigger is config, not a watchtower flag: a cell-wide convention every
-# comrade must agree on reads as configuration, and the config layers already
-# give a one-off override for free - `CCCP_ALIAS_TRIGGER='Intro:' cccp watchtower
-# <slug>` beats the file, and cmd_watchtower's re-exec keeps environ, so it
-# survives into the process that actually parses.
+# comrade must agree on reads as configuration, with ALIAS_TRIGGER_DEFAULT when
+# nothing sets it. Config is its ONE source (#51): the team skill renders the
+# configured trigger into its intro syntax and spawn-comrade asks `cccp config`
+# for it, so no seat pins a trigger of its own that the rest of the cell would
+# not parse.
 
 ALIAS_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")   # a shell-safe alias
 ALIAS_SEED_BYTES = 64 * 1024   # per-gazette cap when seeding the map at startup.
@@ -2805,10 +2806,11 @@ def plugin_root():
 
 def render_skill_body(template, subs):
     """Substitute the render-time @@NAME@@ tokens into a skill body template from
-    `subs` (name -> value). Two tokens exist today:
+    `subs` (name -> value). Three tokens exist today:
 
-        @@COMRADE_ID@@   this session's comrade id
-        @@BACKEND@@      the 'CCCP Data Backend' section body (backend_status_block)
+        @@COMRADE_ID@@     this session's comrade id
+        @@BACKEND@@        the 'CCCP Data Backend' section body (backend_status_block)
+        @@ALIAS_TRIGGER@@  the configured alias trigger every intro must start with
 
     The cell slug is deliberately NOT a token - it stays the literal placeholder
     `<slug>`, which the reader fills from its own invocation arguments. `cccp` is a
@@ -2863,7 +2865,7 @@ def _read_skill_template(part):
 def compose_skill(name):
     """Return a skill's whole body: its stack of body templates plus the args outro
     as an implied final part, each rendered through the same token substitution
-    (@@COMRADE_ID@@, @@BACKEND@@) and joined base-first. The backend block is
+    (@@COMRADE_ID@@, @@BACKEND@@, @@ALIAS_TRIGGER@@) and joined base-first. The backend block is
     computed once and injected as a variable, so a template places it wherever it
     reads best (chat puts it in a 'CCCP Data Backend' section)."""
     stack = SKILL_STACK.get(name)
@@ -2874,6 +2876,7 @@ def compose_skill(name):
     subs = {
         "COMRADE_ID": comrade_id(),
         "BACKEND": backend_status_block(),
+        "ALIAS_TRIGGER": skill_alias_trigger(),
     }
     parts = [_read_skill_template(part) for part in stack] + [ARGS_OUTRO]
     return "\n\n".join(render_skill_body(part, subs).strip() for part in parts) + "\n"
@@ -3089,6 +3092,17 @@ def _backend_setup_guidance(backend):
             f"to inspect it.")
 
 
+def skill_alias_trigger():
+    """The trigger a skill teaches intros with: the configured one (#51), so a comrade
+    sees the syntax its whole machine parses. A config too broken to resolve already
+    fills the backend section with the fix; the skill must still render, so the
+    trigger falls back to the default rather than failing it."""
+    try:
+        return resolve_config()["ALIAS_TRIGGER"]
+    except (SystemExit, Exception):
+        return ALIAS_TRIGGER_DEFAULT
+
+
 def backend_status_block():
     """The body of the skill's 'CCCP Data Backend' section - the @@BACKEND@@ token
     substituted by compose_skill, so the chat template places it wherever it reads
@@ -3288,9 +3302,8 @@ def cmd_join(args):
     the session inbox carrying the per-cell options that were `cccp watchtower`
     flags, resolved HERE (flag -> env -> config -> default) so the serve
     process's own environment - frozen when the plugin monitor armed it - is
-    irrelevant. `CCCP_ALIAS_TRIGGER='Intro:' cccp join <slug>` therefore works
-    exactly as the same prefix on `cccp watchtower <slug>` did. Idempotent: a
-    held cell gets its options re-applied, never a second poller."""
+    irrelevant. Idempotent: a held cell gets its options re-applied, never a
+    second poller."""
     slug = slugify(args.cell)
     also = also_ids(args.also)
     me = comrade_id()
@@ -3898,10 +3911,9 @@ def _config_destinations():
 def _global_rows(cfg):
     """The global section's (key, shown, layers, raw) rows: the tree root, the
     debug switch (rendered as its effective boolean - unset is its normal state,
-    not a configuration gap), the alias trigger (likewise: `off` is its normal
-    state, and this row is the only place aliases advertise themselves now that
-    no CLI flag does), and the backend selection that the sections below hang
-    off."""
+    not a configuration gap), the alias trigger (this row is the only place
+    aliases advertise themselves, since no CLI flag does), and the backend
+    selection that the sections below hang off."""
     root = str(plugin_data_dir())
     src = cfg["SOURCES"]
     return [
@@ -3910,7 +3922,7 @@ def _global_rows(cfg):
          src.get("CCCP_DEBUG", []), cfg["DEBUG"]),
         ("CCCP_AUTODOWNLOAD_MAX", cfg["AUTODOWNLOAD_MAX_RAW"],
          src.get("CCCP_AUTODOWNLOAD_MAX", []), cfg["AUTODOWNLOAD_MAX_RAW"]),
-        ("CCCP_ALIAS_TRIGGER", cfg["ALIAS_TRIGGER"] or "off",
+        ("CCCP_ALIAS_TRIGGER", cfg["ALIAS_TRIGGER"],
          src.get("CCCP_ALIAS_TRIGGER", []), cfg["ALIAS_TRIGGER"]),
         ("CCCP_IDLE", str(cfg["IDLE"]) if cfg["IDLE"] is not None
          else f"{WATCH_IDLE_DEFAULT_MIN} (default)",
@@ -3934,6 +3946,33 @@ def _backend_rows(name, cfg):
     return rows
 
 
+def _config_sections(cfg):
+    """The dump's sections as (title, backend name, rows): globals untitled, then
+    every backend, the active one first. Each row is (key, shown, layers, raw)."""
+    active = cfg["BACKEND"]
+    sections = [(None, None, _global_rows(cfg))]
+    for name in [active] + sorted(b for b in BACKENDS if b != active):
+        title = (f"{'Active' if name == active else 'Inactive'} "
+                 f"backend: {name}")
+        if not _config_keys(name):
+            sections.append((title, name, []))
+            continue
+        with _as_active(name) as bcfg:
+            sections.append((title, name, _backend_rows(name, bcfg)))
+    return sections
+
+
+def _config_get(key):
+    """The read-one half of `cccp config`: KEY's resolved value exactly as the
+    dump's Value column shows it, secrets redacted and no shadow note, so a script
+    can ask for the value cccp actually uses. spawn-comrade reads the alias trigger
+    this way rather than hardcoding one (#51)."""
+    shown = {k: v for _, _, rows in _config_sections(resolve_config()) for k, v, _, _ in rows}
+    if key not in shown:
+        sys.exit(f"error: unknown key {key!r} - known keys:\n  " + "\n  ".join(sorted(shown)))
+    print(shown[key])
+
+
 def _print_config_dump():
     """The read half of `cccp config`: the full resolved picture - globals, then
     every backend, the active one first, each introduced by an
@@ -3950,19 +3989,8 @@ def _print_config_dump():
     table. Value goes LAST because it is the one unbounded column - a data-dir
     path can run 90 characters and would otherwise shove `Set by` off the right
     edge. It also reads as a sentence: <key>, set by <layer>, is <value>."""
-    cfg = resolve_config()
-    active = cfg["BACKEND"]
-    sections = [(None, None, _global_rows(cfg))]
-    for name in [active] + sorted(b for b in BACKENDS if b != active):
-        title = (f"{'Active' if name == active else 'Inactive'} "
-                 f"backend: {name}")
-        if not _config_keys(name):
-            sections.append((title, name, []))
-            continue
-        with _as_active(name) as bcfg:
-            sections.append((title, name, _backend_rows(name, bcfg)))
     deco = []
-    for title, name, rows in sections:
+    for title, name, rows in _config_sections(resolve_config()):
         drows = []
         for key, shown, layers, raw in rows:
             # No layer set it: either a default filled it in (PREFIX) or nothing
@@ -4052,10 +4080,15 @@ def _config_set(assignments):
 
 def cmd_config(args):
     """`cccp config` is about understanding and managing cccp's local config
-    files: bare, the full resolved dump with provenance; with KEY=VALUE
-    assignments, writes auto-routed to the proper file. Operations on the
-    backend itself (validation, switching) live under `cccp backend`."""
-    if args.assignments:
+    files: bare, the full resolved dump with provenance; with one bare KEY, that
+    key's resolved value; with KEY=VALUE assignments, writes auto-routed to the
+    proper file. Operations on the backend itself (validation, switching) live
+    under `cccp backend`."""
+    if any("=" not in a for a in args.assignments):
+        if len(args.assignments) != 1:
+            sys.exit("error: `cccp config KEY` reads exactly one key; writes are KEY=VALUE and do not mix with a read.")
+        _config_get(args.assignments[0])
+    elif args.assignments:
         _config_set(args.assignments)
     else:
         _print_config_dump()
@@ -4135,16 +4168,18 @@ def build_parser():
 
     cf = sub.add_parser(
         "config",
-        help="Show the full resolved config, or set CCCP_* keys "
+        help="Show the full resolved config or one key's value, or set CCCP_* keys "
              "(auto-routed to the proper file).",
         description="Bare: the full resolved config - globals, then every "
                     "backend, active first - with a Set-by column naming "
                     "the winning layer by its data-dir-relative file path. With "
+                    "one bare KEY: that key's resolved value, as the dump shows it. With "
                     "KEY=VALUE assignments: write keys, auto-routed to the "
                     "proper file. Backend operations (validate, switch) live "
                     "under `cccp backend`.")
-    cf.add_argument("assignments", nargs="*", metavar="KEY=VALUE",
+    cf.add_argument("assignments", nargs="*", metavar="KEY[=VALUE]",
                     help="Canonical CCCP_* keys exactly as the dump prints them. "
+                         "A bare KEY prints its resolved value. "
                          "A VALUE of `-` reads the value from stdin (keeping a "
                          "secret out of shell history); an empty VALUE removes "
                          "the key. Omit every assignment to show the config.")
