@@ -18,6 +18,9 @@ Storage layout (a cell is a store + prefix + slug; local-fs uses no prefix):
     <prefix>/<slug>/gazettes/<comrade-id>.jsonl   append-only, their messages
     <prefix>/<slug>/files/<comrade-id>/<path>     shared files
 
+Readers also accept day-partitioned gazettes, gazettes/<YYYY-MM-DD>/<comrade-id>.jsonl
+(#55), which 4.0 writers will use; 3.x writers still write the flat file.
+
 A comrade is registered in a cell purely by having a gazette - identity is a
 local `user@host:<session>` computed offline, so there is no claim blob and no
 coordination step; comrades are discovered when their first message arrives.
@@ -1029,8 +1032,8 @@ def cell_head(prefix, slug):
 def gazettes_head(prefix, slug):
     """The blob-name prefix holding every gazette in a cell. Gazettes live under
     their own prefix - apart from published files - so the hot path (the
-    watchtower's poll LIST, the roster) enumerates one blob per all-time comrade
-    and never pays for the cell's accumulated file blobs. 'gazettes' cannot
+    watchtower's poll LIST, the roster) enumerates only gazettes and never pays
+    for the cell's accumulated file blobs. 'gazettes' cannot
     collide with a comrade id: ids always carry '@' and ':'."""
     return f"{cell_head(prefix, slug)}gazettes/"
 
@@ -1067,21 +1070,39 @@ def comrade_id():
     return f"{base_comrade_id()}:{harness}-{current_session_id()[:6]}"
 
 
+GAZETTE_DAY = re.compile(r"\d{4}-\d{2}-\d{2}")   # a day-partitioned gazette's folder: the UTC date it was written (#55)
+
+
+def gazette_entry(rest):
+    """(comrade id, day) for a blob name relative to gazettes/, or None if it names no gazette. Readers accept both layouts (#56):
+    legacy flat '<id>.jsonl' (day None) and day-partitioned '<YYYY-MM-DD>/<id>.jsonl'. Writers still write flat files in 3.x."""
+    day, _, name = rest.rpartition("/")
+    if not name.endswith(".jsonl") or (day and not GAZETTE_DAY.fullmatch(day)):
+        return None
+    return name[:-len(".jsonl")], day or None
+
+
+def gazettes_in(listing, head):
+    """The gazettes in a listing of `head`: blob path -> its listing props plus "comrade" and "day". Keyed by blob path, not comrade,
+    because one comrade can own a legacy gazette and a file per day."""
+    gazettes = {}
+    for name, props in listing.items():
+        entry = gazette_entry(name[len(head):])
+        if entry:
+            gazettes[name] = {**props, "comrade": entry[0], "day": entry[1]}
+    return gazettes
+
+
 def cell_gazettes(client, prefix, slug):
-    """Every gazette in a cell: comrade id -> its listing props {"size", "last_modified"}. Gazette ownership IS registration: every
+    """Every gazette in a cell: blob path -> {"size", "last_modified", "comrade", "day"}. Gazette ownership IS registration: every
     participation event (publish included) appends to the sender's gazette, so listing gazettes/ alone sees everyone."""
     head = gazettes_head(prefix, slug)
-    gazettes = {}
-    for name, props in client.list(head).items():
-        rest = name[len(head):]
-        if rest.endswith(".jsonl") and "/" not in rest:
-            gazettes[rest[:-len(".jsonl")]] = props
-    return gazettes
+    return gazettes_in(client.list(head), head)
 
 
 def cell_roster(client, prefix, slug):
     """Return the sorted comrade ids registered in a cell."""
-    return sorted(cell_gazettes(client, prefix, slug))
+    return sorted({g["comrade"] for g in cell_gazettes(client, prefix, slug).values()})
 
 
 def active_cutoff(hours):
@@ -1149,8 +1170,9 @@ def journal_records(data, on_bad=None):
 
 # ---------- gazette ----------
 
-def gazette_path(prefix, slug, comrade):
-    return f"{gazettes_head(prefix, slug)}{comrade}.jsonl"
+def gazette_path(prefix, slug, comrade, day=None):
+    """A comrade's gazette: legacy flat '<head><id>.jsonl', or '<head><YYYY-MM-DD>/<id>.jsonl' for one UTC day (#55)."""
+    return f"{gazettes_head(prefix, slug)}{day + '/' if day else ''}{comrade}.jsonl"
 
 
 def append_dispatch(client, prefix, slug, me, *dispatches):
@@ -1187,11 +1209,15 @@ def published_catalogue(client, prefix, slug, senders=None):
 
     `senders` reads only those gazettes instead of the whole roster. It is an exact
     narrowing, not a sample: a caller that can only act on its own announcements
-    (`unpublish`) gets the same answer from one GET that it would from hundreds.
+    (`unpublish`) gets the same answer from one LIST and its own GETs that it would
+    from hundreds.
     """
     catalogue = {}
-    for sender in (cell_roster(client, prefix, slug) if senders is None else senders):
-        st, body = client.get(gazette_path(prefix, slug, sender))
+    # Each sender's legacy gazette first, then its day files in date order: the order it wrote them.
+    gazettes = cell_gazettes(client, prefix, slug)
+    for sender, _day, path in sorted((g["comrade"], g["day"] or "", path) for path, g in gazettes.items()
+                                     if senders is None or g["comrade"] in senders):
+        st, body = client.get(path)
         if st != 200:
             continue                     # listed, then gone: a live cell can race
         for line in body.splitlines():
@@ -1959,7 +1985,7 @@ class Watchtower:
         self.quiet = set(quiet)   # event types to handle but not emit (e.g. a
                                   # coordination hub suppresses 'filesystem' - the
                                   # file still auto-downloads, just no notify turn)
-        self.hwm = {}        # comrade -> bytes consumed of their gazette
+        self.hwm = {}        # gazette blob path -> bytes consumed; a comrade has one per day file (#56)
         # Bytes consumed of my own inbox (see inbox_path). In memory only, never
         # persisted: commands are for a live watchtower, so a new one starts from
         # a truncated file with nothing to restore.
@@ -2042,25 +2068,23 @@ class Watchtower:
         return gap
 
     def _scan(self):
-        """List the cell's gazettes: comrade -> {"size", "last_modified"}. Lists
-        only the gazettes/ prefix, so the cost is one blob per all-time comrade
-        regardless of how many files the cell has accumulated."""
+        """List the cell's gazettes: blob path -> {"size", "last_modified",
+        "comrade", "day"}. Lists only the gazettes/ prefix, so the cost is one
+        blob per gazette regardless of how many files the cell has accumulated."""
         with TimeLogger(self.log, "scan") as t:
-            gazettes = {}
             head = gazettes_head(self.prefix, self.slug)
             blobs = self.client.list(head)
-            for name, props in blobs.items():
-                rest = name[len(head):]
-                if rest.endswith(".jsonl") and "/" not in rest:
-                    gazettes[rest[:-len(".jsonl")]] = props
+            gazettes = gazettes_in(blobs, head)
             t.done(blobs=len(blobs), gazettes=len(gazettes))
             return gazettes
 
     def initial_scan(self):
-        """Fast-forward HWMs to skip existing backlog (no replay)."""
+        """Fast-forward HWMs to skip existing backlog (no replay). Returns how
+        many comrades the cell has ever seen."""
         gazettes = self._scan()
-        for comrade, props in gazettes.items():
-            self.hwm[comrade] = props["size"]
+        for path, props in gazettes.items():
+            self.hwm[path] = props["size"]
+        return len({g["comrade"] for g in gazettes.values()})
 
     def seed_aliases(self):
         """Build the baseline alias map from each gazette's HEAD (capped at
@@ -2078,7 +2102,7 @@ class Watchtower:
         # while my own could never be seeded at all (issue #1).
         cutoff = active_cutoff(self.active_hours)
         gazettes = self._scan()
-        fresh = [gazette_path(self.prefix, self.slug, c) for c, props in gazettes.items() if written_since(props, cutoff)]
+        fresh = [path for path, props in gazettes.items() if written_since(props, cutoff)]
         stale = len(gazettes) - len(fresh)
         for st, data in fetch_each(lambda path: self.client.get_head(path, ALIAS_SEED_BYTES), fresh):
             if st not in (200, 206):
@@ -2149,20 +2173,21 @@ class Watchtower:
         announce `ready`, start the idle clock. The caller (our own _run, or the
         Serve loop) has already armed SIGUSR1 - see the #21 note in _run."""
         with TimeLogger(self.log, "initial_scan"):
-            self.initial_scan()
+            comrades = self.initial_scan()
         if self.trigger:
             with TimeLogger(self.log, "seed_aliases"):
                 self.seed_aliases()
         # `store=` and `gazettes=` are #19: an attach to an empty or a wrong
         # store must not announce itself like a healthy one. `gazettes=` counts
-        # every comrade ever seen in the cell, mine included.
+        # every comrade ever seen in the cell, mine included - not gazette files,
+        # which run one per comrade per day under the day layout (#56).
         store = f" store={self.store}" if self.store else ""
         self._emit(f"ready {self.me} slug={self.slug} v={cccp_version()}"
-                   f"{store} gazettes={len(self.hwm)}")
+                   f"{store} gazettes={comrades}")
         self.log.debug(
             f"ev=watchtower_ready comrade={_kv(self.me)} slug={_kv(self.slug)} "
             f"idle_initial_s={self.idle_initial} idle_max_s={self.idle_max} "
-            f"gazettes={len(self.hwm)}")
+            f"gazettes={comrades} files={len(self.hwm)}")
         # Start the idle clock from "fully up", after the network-bound startup.
         self.set_idle(self.idle_initial)
         self.ladder_step = -1
@@ -2404,7 +2429,8 @@ class Watchtower:
             self.aliases = load_aliases(self.slug, self.me)
         alias_dirty = False
 
-        for comrade, props in gazettes.items():
+        for path, props in gazettes.items():
+            comrade = props["comrade"]
             # My own gazette is read for alias learning ONLY - my intro lands
             # there and nowhere else, so an armed watchtower that skips self can
             # never register its own alias (issue #1). Unarmed, self is skipped
@@ -2412,11 +2438,13 @@ class Watchtower:
             is_me = comrade == self.me
             if is_me and not self.trigger:
                 continue
-            offset = self.hwm.get(comrade, 0)
+            # A gazette first listed mid-run - a comrade's new day file, or a new
+            # comrade - starts at 0, so each record is emitted exactly once. Entries
+            # are never pruned: a late append to an older day file resumes there.
+            offset = self.hwm.get(path, 0)
             if props["size"] <= offset:
                 continue
-            st, data = self.client.get_range(
-                gazette_path(self.prefix, self.slug, comrade), offset)
+            st, data = self.client.get_range(path, offset)
             if st not in (200, 206):
                 continue
             records, consumed = journal_records(
@@ -2462,7 +2490,7 @@ class Watchtower:
                 line = self._render(d)
                 if line:
                     messages.append((d.get("ts", now_iso()), line))
-            self.hwm[comrade] = offset + consumed
+            self.hwm[path] = offset + consumed
 
         if alias_dirty:
             save_aliases(self.slug, self.me, self.aliases)
@@ -3564,20 +3592,21 @@ def cmd_read(args):
         # Both filters name a comrade, so both take an alias.
         recipient = resolve_targets(slug, [args.to])[0] if args.to else None
         hidden, window = 0, ""
+        gazettes = cell_gazettes(client, prefix, slug)
         if args.from_:
-            senders = resolve_targets(slug, [args.from_])
+            # Every gazette of that comrade - its legacy file and its day files (#56) - merged by ts below.
+            sender = resolve_targets(slug, [args.from_])[0]
+            paths = sorted(path for path, g in gazettes.items() if g["comrade"] == sender)
         else:
-            gazettes = cell_gazettes(client, prefix, slug)
-            senders = sorted(gazettes)
+            paths = sorted(gazettes)
             if not args.all:
                 cutoff = args.since or active_cutoff(cfg["ACTIVE_HOURS"])
                 window = f"since {args.since.isoformat()}" if args.since else f"in the last {cfg['ACTIVE_HOURS']:g}h (CCCP_ACTIVE_HOURS)"
-                senders = [c for c in senders if written_since(gazettes[c], cutoff)]
-                hidden = len(gazettes) - len(senders)
-            log.debug(f"ev=read_roster gazettes={len(gazettes)} fetched={len(senders)}")
+                paths = [path for path in paths if written_since(gazettes[path], cutoff)]
+                hidden = len(gazettes) - len(paths)
+        log.debug(f"ev=read_roster gazettes={len(gazettes)} fetched={len(paths)}")
         msgs = []
-        fetched = fetch_each(client.get, [gazette_path(prefix, slug, sender) for sender in senders])
-        for sender, (st, body) in zip(senders, fetched):
+        for path, (st, body) in zip(paths, fetch_each(client.get, paths)):
             if st != 200:
                 continue
             for line in body.splitlines():
@@ -3585,7 +3614,7 @@ def cmd_read(args):
                     d = json.loads(line)
                 except ValueError:
                     print(f"cccp: warning: skipping unparseable gazette line "
-                          f"from {sender}", file=sys.stderr)
+                          f"from {gazettes[path]['comrade']}", file=sys.stderr)
                     continue
                 if d.get("type") == "message":
                     msgs.append(d)

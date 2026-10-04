@@ -83,6 +83,17 @@ watchtower's poll listing — enumerates one blob per comrade, no matter how man
 shared files the cell accumulates. Each comrade only ever writes their own
 gazette and their own `files/<comrade-id>/` area, and reads everyone's.
 
+Readers also accept day-partitioned gazettes, one per comrade per UTC day of
+writing, alongside the flat ones, and merge a comrade's files by `ts`:
+
+```
+<prefix>/<slug>/gazettes/<YYYY-MM-DD>/<comrade-id>.jsonl   append-only  (their messages that day)
+```
+
+Writers in 3.x still write only the flat file. Day files are for 4.0, which
+needs every comrade able to read them first
+([#55](https://github.com/jhs/cccp/issues/55)).
+
 A gazette is JSON lines. Readers act on two record types, `message` and
 `filesystem` (publish/unpublish announcements), and skip any other type, so new
 record types can be added without breaking older readers. One more exists: when

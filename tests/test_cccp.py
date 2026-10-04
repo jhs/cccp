@@ -3183,6 +3183,130 @@ class AliasRecords(unittest.TestCase):
         self.assertEqual(self._read(from_=self.ME).count("from="), 1)
 
 
+class DayGazettes(unittest.TestCase):
+    """#56: every reader accepts both gazette layouts at once, legacy `gazettes/<id>.jsonl` and day-partitioned
+    `gazettes/<YYYY-MM-DD>/<id>.jsonl`, so the 4.0 writers of #57 are never invisible to a 3.15 reader. No writer changes here."""
+
+    ME = "me@h:cc-aaaaaa"
+    A = "a@h:cc-111111"
+    B = "b@h:cc-222222"
+    DAY1, DAY2 = "2026-10-03", "2026-10-04"
+
+    def setUp(self):
+        self.data = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.data, True))
+        self.env = _isolated_env(self.data, CCCP_COMRADE_ID=self.ME, CCCP_ALIAS_TRIGGER="Alias:")
+        self.env.__enter__()
+        self.addCleanup(lambda: self.env.__exit__(None, None, None))
+        self.client = cccp.make_backend(cccp.resolve_config())
+
+    def _append(self, slug, comrade, records, day=None):
+        path = cccp.gazette_path("", slug, comrade, day)
+        self.client.ensure_append_blob(path)
+        self.client.append_block(path, b"".join((json.dumps(r) + "\n").encode() for r in records))
+
+    def _msg(self, frm, n, to=("*",)):
+        return {"type": "message", "from": frm, "ts": f"2026-10-04T10:00:{n:02d}.000000Z", "to": list(to), "body": f"{frm} says {n}"}
+
+    def _watchtower(self, slug="demo"):
+        wt = cccp.Watchtower(self.client, "", slug, self.ME, 0, trigger="Alias:")
+        wt.emitted = []
+        wt._emit = wt.emitted.append
+        return wt
+
+    def _read(self, slug, **kw):
+        args = type("Args", (), dict({"cell": slug, "to": None, "from_": None, "ts": None, "last": None, "full": False, "all": False,
+                                      "since": None}, **kw))()
+        out = io.StringIO()
+        with mock.patch.object(cccp, "make_backend", return_value=self.client), contextlib.redirect_stdout(out):
+            cccp.cmd_read(args)
+        return out.getvalue()
+
+    def test_gazette_entry_parses_both_layouts(self):
+        self.assertEqual(cccp.gazette_entry(f"{self.A}.jsonl"), (self.A, None))
+        self.assertEqual(cccp.gazette_entry(f"{self.DAY2}/{self.A}.jsonl"), (self.A, self.DAY2))
+        for other in (f"{self.DAY2}/x/{self.A}.jsonl", f"someday/{self.A}.jsonl", f"{self.A}.txt", f"{self.DAY2}/"):
+            self.assertIsNone(cccp.gazette_entry(other), other)
+
+    def test_day_path_round_trips_through_azure_url(self):
+        path = cccp.gazette_path("", "demo", self.A, self.DAY2)
+        self.assertEqual(path, f"demo/gazettes/{self.DAY2}/{self.A}.jsonl")
+        be = cccp.AzureBlobBackend("acct", "cont", "sig=x")
+        self.assertEqual(be._url(path), f"https://acct.blob.core.windows.net/cont/demo/gazettes/{self.DAY2}/{self.A}.jsonl?sig=x")
+
+    def test_roster_counts_comrades_not_files(self):
+        self._append("demo", self.A, [self._msg(self.A, 1)])
+        self._append("demo", self.A, [self._msg(self.A, 2)], day=self.DAY1)
+        self._append("demo", self.A, [self._msg(self.A, 3)], day=self.DAY2)
+        self._append("demo", self.B, [self._msg(self.B, 4)], day=self.DAY2)
+        self.assertEqual(cccp.cell_roster(self.client, "", "demo"), [self.A, self.B])
+        wt = self._watchtower()
+        wt.start()
+        self.assertTrue(wt.emitted[0].endswith(" gazettes=2"), wt.emitted[0])
+        out = io.StringIO()
+        with mock.patch.object(cccp, "make_backend", return_value=self.client), contextlib.redirect_stdout(out):
+            cccp.cmd_rm(type("Args", (), {"cell": "demo", "yes": False})())
+        self.assertIn("4 blobs across 2 comrades", out.getvalue())
+
+    def test_watchtower_emits_each_record_once_across_a_rollover(self):
+        self._append("demo", self.A, [self._msg(self.A, 1)])
+        self._append("demo", self.A, [self._msg(self.A, 2)], day=self.DAY1)
+        wt = self._watchtower()
+        wt.initial_scan()
+
+        def polled():
+            wt.emitted.clear()
+            wt._poll_once()
+            self.assertTrue(all(line.startswith(("message ", "alias ")) for line in wt.emitted), wt.emitted)
+            return [json.loads(re.search(r' body=(".*")$', line).group(1)) for line in wt.emitted if line.startswith("message ")]
+
+        self._append("demo", self.A, [self._msg(self.A, 3)])
+        self._append("demo", self.A, [self._msg(self.A, 4)], day=self.DAY1)
+        self.assertEqual(polled(), [f"{self.A} says 3", f"{self.A} says 4"])
+        self.assertEqual(polled(), [])
+        # Rollover: a new day file appears mid-run, led by its alias header.
+        header = {"type": "alias", "from": self.A, "ts": "2026-10-04T10:00:05.000000Z", "alias": "Anchor", "v": "4.0.0"}
+        self._append("demo", self.A, [header, self._msg(self.A, 5)], day=self.DAY2)
+        self.assertEqual(polled(), [f"{self.A} says 5"])
+        self.assertEqual(wt.aliases, {self.A: "Anchor"})
+        self.assertEqual(polled(), [])
+        self._append("demo", self.A, [self._msg(self.A, 6)], day=self.DAY2)
+        self._append("demo", self.A, [self._msg(self.A, 7)], day=self.DAY1)   # a late append to an older day file
+        self.assertEqual(polled(), [f"{self.A} says 6", f"{self.A} says 7"])
+        self.assertEqual(polled(), [])
+
+    def _history(self, frm, n, to=("*",)):
+        msgs = [self._msg(frm, n + i, to=to if i % 2 else ("*",)) for i in range(4)]
+        msgs[0]["body"] = f"Alias: Name{frm[0].upper()} - here"
+        return [{"type": "alias", "from": frm, "ts": msgs[0]["ts"], "alias": f"Name{frm[0].upper()}", "v": "3.15.0"}] + msgs
+
+    def test_reads_match_whether_history_is_flat_or_split(self):
+        a, b = self._history(self.A, 10, to=(self.B,)), self._history(self.B, 20, to=(self.A,))
+        self._append("flat", self.A, a)
+        self._append("flat", self.B, b)
+        self._append("split", self.A, a[:2])
+        self._append("split", self.A, a[2:4], day=self.DAY1)
+        self._append("split", self.A, a[4:], day=self.DAY2)
+        self._append("split", self.B, b, day=self.DAY2)
+        for kw in ({}, {"from_": self.A}, {"to": self.B}, {"last": 3}):
+            flat, split = self._read("flat", **kw), self._read("split", **kw)
+            self.assertEqual(flat, split, kw)
+            self.assertNotEqual(flat, "(no messages)\n", kw)
+        for slug in ("flat", "split"):
+            self._watchtower(slug).seed_aliases()
+        self.assertEqual(cccp.load_aliases("split", self.ME), {self.A: "NameA", self.B: "NameB"})
+        self.assertEqual(cccp.load_aliases("split", self.ME), cccp.load_aliases("flat", self.ME))
+
+    def test_published_catalogue_replays_across_layouts(self):
+        pub = lambda path, op="publish": {"type": "filesystem", "op": op, "path": path, "from": self.A, "size": 1}
+        self._append("demo", self.A, [pub("files/a.txt"), pub("files/b.txt")])
+        self._append("demo", self.A, [pub("files/a.txt", "unpublish")], day=self.DAY1)
+        self._append("demo", self.A, [pub("files/c.txt")], day=self.DAY2)
+        for senders in (None, [self.A]):
+            cat = cccp.published_catalogue(self.client, "", "demo", senders=senders)
+            self.assertEqual(sorted(wp for _, wp in cat), ["files/b.txt", "files/c.txt"])
+
+
 class MonitorsManifest(unittest.TestCase):
     """#46: the plugin monitor manifest is an experimental component upstream
     ("shape may change without a deprecation cycle"), so its shape is pinned
