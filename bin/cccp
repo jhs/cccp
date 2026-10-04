@@ -741,7 +741,8 @@ class AzureBlobBackend:
         self.log = log or _NULL_LOG
 
     def _url(self, path, query=""):
-        u = f"{self.base}/{path}" if path else self.base
+        # Percent-encode the blob path so a published file named "My File.html" is a valid URL (#43). `/`, `@` and `:` stay literal, keeping gazette paths like `u@h:aaa.jsonl` unchanged.
+        u = f"{self.base}/{urllib.parse.quote(path, safe='/@:')}" if path else self.base
         return u + "?" + "&".join(p for p in (query, self.sas) if p)
 
     def request(self, method, path, query="", data=None, headers=None, retries=3):

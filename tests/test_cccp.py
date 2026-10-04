@@ -542,6 +542,38 @@ class AzureReadFreshness(unittest.TestCase):
                                 ("PUT", None)])
 
 
+class AzureUrlEncoding(unittest.TestCase):
+    """#43: a blob path with a space must be percent-encoded, or urllib raises InvalidURL before any request is sent."""
+
+    def test_path_is_percent_encoded(self):
+        be = cccp.AzureBlobBackend("acct", "cont", "sig=x")
+        self.assertEqual(be._url("cell/files/id/My File#1.html"), "https://acct.blob.core.windows.net/cont/cell/files/id/My%20File%231.html?sig=x")
+
+    def test_gazette_path_unchanged(self):
+        be = cccp.AzureBlobBackend("acct", "cont", "sig=x")
+        self.assertEqual(be._url("cell/gazettes/u@h:aaa.jsonl", "comp=appendblock"), "https://acct.blob.core.windows.net/cont/cell/gazettes/u@h:aaa.jsonl?comp=appendblock&sig=x")
+
+    def test_put_with_space_reaches_urlopen(self):
+        be = cccp.AzureBlobBackend("acct", "cont", "sig=x")
+        seen = []
+
+        class Response:
+            status = 201
+            headers = {}
+
+            @staticmethod
+            def read():
+                return b""
+
+        def fake_urlopen(req, timeout):
+            seen.append(req.full_url)
+            return Response()
+
+        with mock.patch.object(cccp.urllib.request, "urlopen", side_effect=fake_urlopen):
+            self.assertEqual(be.put_block("cell/files/id/My File.html", b"x"), 201)
+        self.assertEqual(seen, ["https://acct.blob.core.windows.net/cont/cell/files/id/My%20File.html?sig=x"])
+
+
 class AzureListPagination(unittest.TestCase):
     """list() must follow NextMarker: Azure caps List Blobs at 5000 results per
     page, and a truncated view silently hides comrades past the marker."""
