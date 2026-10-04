@@ -18,8 +18,8 @@ source "$SCRIPT" || { echo "FAIL Could not source spawn-comrade" >&2; exit 1; }
 set +e
 
 eq "$(model_for claude cheap)" "claude-opus-4-8[1m]" "Claude cheap tier"
-eq "$(model_for claude normal)" "claude-opus-5" "Claude normal tier"
-eq "$(model_for claude premium)" "claude-fable-5" "Claude premium tier"
+eq "$(model_for claude normal)" "claude-opus-5-5" "Claude normal tier"
+eq "$(model_for claude premium)" "claude-fable-5-1" "Claude premium tier"
 eq "$(model_for pi cheap)" "gpt-5.5" "Pi cheap tier"
 eq "$(model_for pi normal)" "gpt-5.6-terra" "Pi normal tier"
 eq "$(model_for pi premium)" "gpt-5.6-sol" "Pi premium tier"

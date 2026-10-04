@@ -32,8 +32,8 @@ model_for() {
   local harness=$1 model=$2
   case "$harness:$model" in
     claude:cheap) echo 'claude-opus-4-8[1m]' ;;
-    claude:normal) echo 'claude-opus-5' ;;
-    claude:premium) echo 'claude-fable-5' ;;
+    claude:normal) echo 'claude-opus-5-5' ;;
+    claude:premium) echo 'claude-fable-5-1' ;;
     pi:cheap) echo 'gpt-5.5' ;;
     pi:normal) echo 'gpt-5.6-terra' ;;
     pi:premium) echo 'gpt-5.6-sol' ;;
