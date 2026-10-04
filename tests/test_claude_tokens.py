@@ -413,6 +413,42 @@ class WatchOutput(TreeCase):
         self.assertGreater(crossed["velocity_per_min"], 0)
 
 
+class CompactionRearm(unittest.TestCase):
+    """#39: a compaction starts a new climb, and every breakpoint must be able to fire again on it."""
+
+    PLAN = {50.0: None, 75.0: "wrap up"}
+
+    def feed(self, w, pct, now):
+        r = {"target": "t", "pct": pct, "used": pct * 2_000, "size": 200_000}
+        return list(claude_tokens.advance(w, r, now, self.PLAN))
+
+    def test_a_fall_after_compaction_rearms_and_restarts(self):
+        w = {"target": "t", "prev": None, "armed": set(), "problem": None}
+        self.feed(w, 40, 0.0)
+        self.assertEqual([e["threshold"] for e in self.feed(w, 80, 60.0)], [50.0, 75.0])
+        restart = self.feed(w, 12, 120.0)
+        self.assertEqual([e["event"] for e in restart], ["start"])
+        self.assertEqual(claude_tokens.watch_line(restart[0]), "Start watch: 12% (24k/200k)")
+        again = self.feed(w, 77, 180.0)
+        self.assertEqual([(e["threshold"], e["reminder"]) for e in again], [(50.0, None), (75.0, "wrap up")])
+
+    def test_a_fall_through_a_no_reading_gap_still_counts(self):
+        # Claude Code's snapshot carries no context_window just after a compaction; the fall is measured across it.
+        w = {"target": "t", "prev": None, "armed": set(), "problem": None}
+        self.feed(w, 40, 0.0)
+        self.feed(w, 80, 60.0)
+        self.assertEqual([e["event"] for e in claude_tokens.advance(w, {"target": "t", "error": "no reading"}, 90.0, self.PLAN)],
+                         ["waiting"])
+        self.assertEqual([e["event"] for e in self.feed(w, 12, 120.0)], ["start"])
+
+    def test_a_small_trim_does_not_refire_a_breakpoint(self):
+        w = {"target": "t", "prev": None, "armed": set(), "problem": None}
+        self.feed(w, 40, 0.0)
+        self.feed(w, 52, 60.0)
+        self.assertEqual(self.feed(w, 48, 120.0), [])
+        self.assertEqual(self.feed(w, 51, 180.0), [])
+
+
 class ThresholdSpecs(unittest.TestCase):
     """The `PCT[% REMINDER]` grammar and the plan it builds."""
 

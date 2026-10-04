@@ -67,6 +67,11 @@ def _data_dir():
 
 DEFAULT_THRESHOLDS = (50, 75, 90, 95)
 
+# A reading this many points below the one before it is a new context climb - a compaction, or a restarted session -
+# and the watch starts over (#39). Usage only falls when context is thrown away, so the margin just keeps a small trim
+# from re-firing a breakpoint it sits beside.
+RESTART_DROP_PCT = 10
+
 THRESHOLD_SPEC = re.compile(r"\s*(\d+(?:\.\d+)?)\s*%?\s*(.*)", re.S)
 
 
@@ -415,6 +420,12 @@ def advance(w, r, now, plan):
         return
     w["problem"] = None
 
+    # An external poller has no compaction event to hook, so a compaction is inferred from the fall it causes. Forgetting
+    # `prev` sends this reading down the start path: every breakpoint above it re-arms, and a fresh start line says so.
+    last, w["last"] = w.get("last"), r["pct"]
+    if last is not None and r["pct"] < last - RESTART_DROP_PCT:
+        w["prev"] = None
+
     if w["prev"] is None:
         # Armed before the event is yielded, because breakpoints this session
         # started too late to see are part of what the start line reports - and
@@ -494,7 +505,7 @@ def cmd_watch(args):
     plan = threshold_plan(args.thresholds) if args.thresholds else {t: None for t in DEFAULT_THRESHOLDS}
     # A list, not a dict: the same target twice is a caller's business, not a
     # collision to silently collapse.
-    watches = [{"target": t, "prev": None, "armed": set(), "problem": None}
+    watches = [{"target": t, "prev": None, "last": None, "armed": set(), "problem": None}
                for t in targets]
     label = len(watches) > 1
 
