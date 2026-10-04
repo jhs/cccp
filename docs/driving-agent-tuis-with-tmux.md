@@ -170,7 +170,7 @@ CCCP_COMRADE_ID="dev@host:cc-probe1" cccp dispatch <cell> --to <target-id> - <<<
 **Verify what actually landed**, rather than trusting a pane:
 
 ```bash
-cccp read <cell> | tail -5          # full history, including messages nobody received
+cccp read <cell> | tail -5          # recent history, including messages nobody received
 cccp status                         # is my watchtower alive, and which cells it holds
 cccp status <cell>                  # am I in this cell, and if not, why it ended
 pgrep -af "cccp watchtower"         # is the process really there (`--serve -- <id>` per session)

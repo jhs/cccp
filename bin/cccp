@@ -99,6 +99,8 @@ IDLE_MAX_SECONDS = 24 * 3600   # cap for the idle backoff - past this, idles fir
                                # at most once a day so a long-silent watchtower
                                # stops forcing Claude to wake and respond
 FETCH_WORKERS = 16   # concurrent gazette fetches in `read` and alias seeding (#53)
+ACTIVE_HOURS_DEFAULT = 96   # a gazette written within this many hours is active: `read` and alias seeding fetch only those (#54).
+                            # Defined by meaning, not mechanism, so a layout change can implement the same window another way.
 PUBLISH_MAX = 256 * 1024 * 1024   # single-PUT publish ceiling; larger needs staging
 AUTODOWNLOAD_MAX_DEFAULT = "1m"   # watchtower auto-downloads published files at or
                                   # under this size; larger ones are only announced
@@ -388,7 +390,7 @@ def _env_layer():
 # than carrying to the use site. Backend params are absent on purpose: they are
 # opaque strings (an account name, a SAS) that only the store can judge, which
 # `cccp backend check` does over the network.
-TYPED_KEYS = ("CCCP_AUTODOWNLOAD_MAX", "CCCP_ALIAS_TRIGGER", "CCCP_IDLE", "CCCP_QUIET")
+TYPED_KEYS = ("CCCP_AUTODOWNLOAD_MAX", "CCCP_ALIAS_TRIGGER", "CCCP_IDLE", "CCCP_QUIET", "CCCP_ACTIVE_HOURS")
 
 
 def _typed_key_error(key, value):
@@ -411,6 +413,8 @@ def _typed_key_error(key, value):
                 f"something deliberate, like 'Intro:'")
     if key == "CCCP_IDLE" and not (value.isdigit()):
         return f"{key} {value!r} is not a whole number of minutes (0 disables heartbeats)"
+    if key == "CCCP_ACTIVE_HOURS" and _positive_hours(value) is None:
+        return f"{key} {value!r} is not a positive number of hours ('96', '24', '0.5')"
     if key == "CCCP_QUIET":
         bad = [e for e in _split_quiet(value) if e not in QUIET_EVENTS]
         if bad:
@@ -422,6 +426,15 @@ def _typed_key_error(key, value):
 def _split_quiet(value):
     """CCCP_QUIET is a comma-separated list of event types; empty means none."""
     return [e.strip() for e in (value or "").split(",") if e.strip()]
+
+
+def _positive_hours(value):
+    """CCCP_ACTIVE_HOURS as a float, or None unless it is a positive finite number."""
+    try:
+        hours = float(value)
+    except ValueError:
+        return None
+    return hours if 0 < hours < float("inf") else None
 
 
 def resolve_config():
@@ -513,6 +526,7 @@ def resolve_config():
         # None / [] when unset; watch_options applies the defaults.
         "IDLE": int(merged["CCCP_IDLE"]) if merged.get("CCCP_IDLE") else None,
         "QUIET": _split_quiet(merged.get("CCCP_QUIET")),
+        "ACTIVE_HOURS": _positive_hours(merged["CCCP_ACTIVE_HOURS"]) if merged.get("CCCP_ACTIVE_HOURS") else ACTIVE_HOURS_DEFAULT,
         "SOURCES": sources,
     }
 
@@ -1052,17 +1066,38 @@ def comrade_id():
     return f"{base_comrade_id()}:{harness}-{current_session_id()[:6]}"
 
 
-def cell_roster(client, prefix, slug):
-    """Return the sorted comrade ids registered in a cell. Gazette ownership IS
-    registration: every participation event (publish included) appends to the
-    sender's gazette, so listing gazettes/ alone sees everyone."""
+def cell_gazettes(client, prefix, slug):
+    """Every gazette in a cell: comrade id -> its listing props {"size", "last_modified"}. Gazette ownership IS registration: every
+    participation event (publish included) appends to the sender's gazette, so listing gazettes/ alone sees everyone."""
     head = gazettes_head(prefix, slug)
-    comrades = set()
-    for name in client.list(head):
+    gazettes = {}
+    for name, props in client.list(head).items():
         rest = name[len(head):]
         if rest.endswith(".jsonl") and "/" not in rest:
-            comrades.add(rest[:-len(".jsonl")])
-    return sorted(comrades)
+            gazettes[rest[:-len(".jsonl")]] = props
+    return gazettes
+
+
+def cell_roster(client, prefix, slug):
+    """Return the sorted comrade ids registered in a cell."""
+    return sorted(cell_gazettes(client, prefix, slug))
+
+
+def active_cutoff(hours):
+    """The CCCP_ACTIVE_HOURS window's start: a gazette last written at or after this is active."""
+    return datetime.now(timezone.utc) - timedelta(hours=hours)
+
+
+def written_since(props, cutoff):
+    """Whether a listed gazette was last written at or after `cutoff`. A gazette is append-only, so last_modified is its comrade's
+    last word. Absent or unparseable counts as written: a missing timestamp must not hide anyone's messages or cost them their alias."""
+    lm = props.get("last_modified")
+    if not lm:
+        return True
+    try:
+        return email.utils.parsedate_to_datetime(lm) >= cutoff
+    except (TypeError, ValueError):
+        return True
 
 
 def fetch_each(fetch, items):
@@ -1615,14 +1650,6 @@ ALIAS_SEED_BYTES = 64 * 1024   # per-gazette cap when seeding the map at startup
                                # The declaring intro sits at a gazette's START, so
                                # a small head read finds it without scanning a
                                # months-long history.
-ALIAS_SEED_MAX_AGE_SECONDS = 7 * 24 * 3600   # skip seeding from gazettes idle
-                               # longer than this: an old cell accumulates
-                               # gazettes from long-gone comrades forever (there
-                               # is no per-comrade cleanup), and each costs a
-                               # head read at startup. A quiet-but-present
-                               # comrade skipped here renders as a raw id until
-                               # it next speaks, when live learning re-acquires
-                               # the alias - so the cutoff errs generous.
 
 
 def is_comrade_id(s):
@@ -1852,8 +1879,9 @@ class Watchtower:
 
     def __init__(self, client, prefix, slug, me, idle_initial,
                  idle_max=IDLE_MAX_SECONDS, log=None, quiet=(), trigger=None,
-                 autodownload_max=None, store=None, also=()):
+                 autodownload_max=None, store=None, also=(), active_hours=ACTIVE_HOURS_DEFAULT):
         self.client = client
+        self.active_hours = active_hours   # seed aliases only from gazettes written within this window
         self.prefix = prefix
         self.slug = slug
         self.store = store   # for the ready line (#19); None omits it
@@ -1978,27 +2006,16 @@ class Watchtower:
         holds within the seeded window."""
         amap = load_aliases(self.slug, self.me)
         decls = []   # (ts, from_id, alias)
-        cutoff = (datetime.now(timezone.utc)
-                  - timedelta(seconds=ALIAS_SEED_MAX_AGE_SECONDS))
-        stale = 0
+        # Only gazettes inside the CCCP_ACTIVE_HOURS window (#54): an old cell accumulates gazettes from long-gone comrades forever,
+        # and each costs a head read at startup. A live comrade silent past the window renders as a raw id, and `--to <alias>`
+        # fails closed, until it introduces itself again and live learning re-acquires the alias.
         # My own gazette is included: my intro lands there and nowhere else, so
         # skipping self would resurrect a dead predecessor's mapping from backlog
         # while my own could never be seeded at all (issue #1).
-        fresh = []
-        for comrade, props in self._scan().items():
-            # A gazette is append-only, so last_modified is the comrade's last
-            # word; older than the cutoff means long departed (or long quiet -
-            # live learning recovers those). Absent/unparseable stays seeded:
-            # a missing timestamp must not cost anyone their alias.
-            lm = props.get("last_modified")
-            if lm:
-                try:
-                    if email.utils.parsedate_to_datetime(lm) < cutoff:
-                        stale += 1
-                        continue
-                except (TypeError, ValueError):
-                    pass
-            fresh.append(gazette_path(self.prefix, self.slug, comrade))
+        cutoff = active_cutoff(self.active_hours)
+        gazettes = self._scan()
+        fresh = [gazette_path(self.prefix, self.slug, c) for c, props in gazettes.items() if written_since(props, cutoff)]
+        stale = len(gazettes) - len(fresh)
         for st, data in fetch_each(lambda path: self.client.get_head(path, ALIAS_SEED_BYTES), fresh):
             if st not in (200, 206):
                 continue
@@ -2699,7 +2716,7 @@ class Serve:
         cell = Watchtower(self.client, self.cfg["PREFIX"], slug, self.me, idle_s,
                           log=self.log, quiet=quiet, trigger=rec.get("trigger"),
                           autodownload_max=self.cfg["AUTODOWNLOAD_MAX"],
-                          store=store_label(self.cfg), also=also)
+                          store=store_label(self.cfg), also=also, active_hours=self.cfg["ACTIVE_HOURS"])
         cell._reset_inbox()
         cell._write_pidfile()
         try:
@@ -3263,7 +3280,7 @@ def cmd_watchtower(args):
     Watchtower(client, cfg["PREFIX"], slug, me, idle * 60, log=log,
                quiet=quiet, trigger=cfg["ALIAS_TRIGGER"],
                autodownload_max=cfg["AUTODOWNLOAD_MAX"],
-               store=store_label(cfg), also=also_ids(args.also)).run()
+               store=store_label(cfg), also=also_ids(args.also), active_hours=cfg["ACTIVE_HOURS"]).run()
 
 
 def cmd_join(args):
@@ -3418,9 +3435,31 @@ def cmd_status(args):
             sys.exit(1)
 
 
+def parse_ts(value):
+    """An ISO 8601 timestamp as an aware datetime (UTC when it names no zone), or None if it is not one."""
+    try:
+        when = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    return when if when.tzinfo else when.replace(tzinfo=timezone.utc)
+
+
+def _since_arg(value):
+    """argparse type for `read --since`."""
+    when = parse_ts(value)
+    if when is None:
+        raise argparse.ArgumentTypeError(f"not an ISO 8601 timestamp (like 2026-01-02T03:04:05Z): {value!r}")
+    return when
+
+
 def cmd_read(args):
     """Print cell message history - the on-demand history tool. Filter by sender
-    (--from), recipient (--to), and select with --ts or --last."""
+    (--from), recipient (--to), and select with --ts or --last.
+
+    The roster is the gazettes written within CCCP_ACTIVE_HOURS (#54), so a read costs the cell's recent activity, not its all-time
+    comrade count. That window bounds the fetch, not the output: an active gazette prints its whole history. --since moves the cutoff
+    AND drops older messages, since it asks for messages since a time. --all reads every gazette; --from names one and is never
+    filtered by the window."""
     cfg = resolve_config()
     slug = slugify(args.cell)
     # Read-only, so the log path uses the bare user@host - it avoids requiring a
@@ -3432,8 +3471,18 @@ def cmd_read(args):
     with subcommand_footer(log):
         # Both filters name a comrade, so both take an alias.
         recipient = resolve_targets(slug, [args.to])[0] if args.to else None
-        senders = resolve_targets(slug, [args.from_]) if args.from_ else \
-            cell_roster(client, prefix, slug)
+        hidden, window = 0, ""
+        if args.from_:
+            senders = resolve_targets(slug, [args.from_])
+        else:
+            gazettes = cell_gazettes(client, prefix, slug)
+            senders = sorted(gazettes)
+            if not args.all:
+                cutoff = args.since or active_cutoff(cfg["ACTIVE_HOURS"])
+                window = f"since {args.since.isoformat()}" if args.since else f"in the last {cfg['ACTIVE_HOURS']:g}h (CCCP_ACTIVE_HOURS)"
+                senders = [c for c in senders if written_since(gazettes[c], cutoff)]
+                hidden = len(gazettes) - len(senders)
+            log.debug(f"ev=read_roster gazettes={len(gazettes)} fetched={len(senders)}")
         msgs = []
         fetched = fetch_each(client.get, [gazette_path(prefix, slug, sender) for sender in senders])
         for sender, (st, body) in zip(senders, fetched):
@@ -3451,12 +3500,16 @@ def cmd_read(args):
 
         if recipient:
             msgs = [m for m in msgs if addressed_to_me(m.get("to") or ["*"], recipient)]
+        if args.since:
+            msgs = [m for m in msgs if (parse_ts(m.get("ts")) or args.since) >= args.since]
         msgs.sort(key=lambda m: m.get("ts", ""))
+        # Said only when the window may be why nothing matched: on an old cell it hides departed comrades on every read.
+        hint = f" ({hidden} gazettes not written {window} were skipped; --all reads them)" if hidden else ""
 
         if args.ts:
             m = next((m for m in msgs if m.get("ts") == args.ts), None)
             if not m:
-                sys.exit(f"error: no message with ts={args.ts!r}")
+                sys.exit(f"error: no message with ts={args.ts!r}{hint}")
             out = message_read_output(m, full=args.full)
             sys.stdout.write(out if out.endswith("\n") else out + "\n")
             return
@@ -3468,6 +3521,8 @@ def cmd_read(args):
 
         if not msgs:
             print("(no messages)")
+            if hidden:
+                print(f"cccp: Skip gazettes not written {window}; --all reads them: {hidden}", file=sys.stderr)
             return
         for m in msgs:
             print(f"from={m.get('from')} to={render_to(m.get('to', ['*']))} ts={m.get('ts')}")
@@ -3832,7 +3887,7 @@ def _config_destinations():
     happily write a typo'd key and leave a <missing> to debug later."""
     dest = {"CCCP_DEBUG": "config", "CCCP_AUTODOWNLOAD_MAX": "config",
             "CCCP_ALIAS_TRIGGER": "config", "CCCP_IDLE": "config",
-            "CCCP_QUIET": "config"}
+            "CCCP_QUIET": "config", "CCCP_ACTIVE_HOURS": "config"}
     for name, spec in BACKENDS.items():
         for key in _config_keys(name):
             file = "secrets" if key in spec["secrets"] else "config"
@@ -3862,6 +3917,7 @@ def _global_rows(cfg):
          src.get("CCCP_IDLE", []), cfg["IDLE"]),
         ("CCCP_QUIET", ",".join(cfg["QUIET"]) or "none",
          src.get("CCCP_QUIET", []), ",".join(cfg["QUIET"]) or None),
+        ("CCCP_ACTIVE_HOURS", f"{cfg['ACTIVE_HOURS']:g}", src.get("CCCP_ACTIVE_HOURS", []), cfg["ACTIVE_HOURS"]),
         ("CCCP_ACTIVE_BACKEND", cfg["BACKEND"],
          src.get("CCCP_ACTIVE_BACKEND", []), cfg["BACKEND"]),
     ]
@@ -4193,11 +4249,21 @@ def build_parser():
     sts.add_argument("cell", nargs="?", help="Cell slug.")
     sts.set_defaults(func=cmd_status)
 
-    rd = sub.add_parser("read", help="Print cell message history.")
+    rd = sub.add_parser("read", help="Print cell message history.",
+                        description="Print cell message history from the gazettes written in the last CCCP_ACTIVE_HOURS (default "
+                                    f"{ACTIVE_HOURS_DEFAULT}). The window bounds which gazettes are fetched, not which messages print: "
+                                    "an active comrade's whole history shows, while a comrade silent longer than the window shows "
+                                    "nothing. Nothing is deleted - --all, --since and --from reach every gazette.")
     rd.add_argument("cell", help="Cell slug.")
     rd.add_argument("--from", dest="from_", metavar="COMRADE",
                     help="Only this sender's messages, by comrade id or alias "
-                         "(default: all comrades).")
+                         "(default: all comrades active in the window). Never limited by the window.")
+    w = rd.add_mutually_exclusive_group()
+    w.add_argument("--since", type=_since_arg, metavar="TS",
+                   help="Only messages sent at or after this ISO 8601 time (2026-01-02T03:04:05Z), from gazettes written since "
+                        "then. Replaces the CCCP_ACTIVE_HOURS window, wider or narrower.")
+    w.add_argument("--all", action="store_true",
+                   help="Read every gazette the cell has ever had, ignoring the window (archaeology, audits). Slow on an old cell.")
     rd.add_argument("--to", metavar="COMRADE",
                     help="Only messages a given comrade id or alias would receive "
                          "(incl. broadcasts).")

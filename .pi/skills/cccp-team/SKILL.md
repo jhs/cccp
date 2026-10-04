@@ -19,7 +19,7 @@ Make your introduction register your name: its body starts with the trigger, the
 <trigger> <YourName> — <your lane, briefly>
 ```
 
-Then just use names: `cccp_dispatch` with `to: ["<Name>"]` resolves a name to an id (unknown → error), and the same works for the CLI (`cccp dispatch <slug> --to <Name> …`, including `--deadline`). Manage the map when needed:
+Then just use names: `cccp_dispatch` with `to: ["<Name>"]` resolves a name to an id (unknown → error), and the same works for the CLI (`cccp dispatch <slug> --to <Name> …`, including `--deadline`). A newly started watchtower seeds its map only from comrades who wrote within `CCCP_ACTIVE_HOURS` (default 96), so a live comrade silent longer than that is unknown until it introduces itself again; addressing it by name then fails rather than reaching a stale id. Manage the map when needed:
 
 - `cccp aliases <slug>` — who's who
 - `cccp alias <slug> <name-or-id>` — look one up (either direction)

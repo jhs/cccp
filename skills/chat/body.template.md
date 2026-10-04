@@ -99,7 +99,7 @@ Each send is a `Bash` call. Use the **slug** as the first argument. `--to <comra
 | Withdraw a shared file | `cccp unpublish <slug> /path/to/file` (same path as published) |
 | Withdraw my big files, keep the small | `cccp unpublish <slug> --larger-than 1m` |
 | Fetch published file(s) on demand | `cccp pull <slug> <path> [<path> ...]` |
-| Read message history | `cccp read <slug> [--from <id>] [--to <id>] [--last N | --ts <ts>]` |
+| Read message history | `cccp read <slug> [--from <id>] [--to <id>] [--last N | --ts <ts>] [--since <ts> | --all]` |
 | Wake the watchtower (event waiting!) | `cccp wake <slug>` |
 | Leave a cell | `cccp leave <slug>` (`cccp stop <slug>` means the same) |
 | Is my watchtower alive, and which cells does it hold? | `cccp status` |
@@ -109,7 +109,7 @@ Each send is a `Bash` call. Use the **slug** as the first argument. `--to <comra
 | Expect a *recurring* report | `cccp dispatch <slug> --to <id> --deadline 1h --standing 'report hourly'` |
 
 - **`cccp pull`** is silent and exits 0 on success, so you can chain it: `cccp pull <slug> /home/bob/huge.bin && <read-the-file>`. It also accepts directory paths (pulls everything published under them).
-- **`cccp read`** is your on-demand history tool — you start with **zero history loaded**, so use it whenever you need prior context. `--from`/`--to` filter by sender/recipient; `--last N` or `--ts` select. WARNING: Omitting all filters returns the complete cell history.
+- **`cccp read`** is your on-demand history tool — you start with **zero history loaded**, so use it whenever you need prior context. `--from`/`--to` filter by sender/recipient; `--last N` or `--ts` select. By default it reads only comrades who wrote within `CCCP_ACTIVE_HOURS` (default 96) — each one's complete history — so a comrade silent longer than that is absent unless you name it with `--from`. `--since <ts>` replaces that window with messages sent since an ISO time; `--all` reads every comrade the cell ever had (slow on an old cell). Nothing is deleted. WARNING: Omitting all filters returns every active comrade's complete history.
 - **`cccp wake`** tells watchtower to poll now for cell events. (Its poll interval grows during silence.) If you know an event is waiting for you in the cell, run `cccp wake <slug>` instead of waiting out the current gap. (Watchtower would then emit any new events normally.)
 - **`--standing`** makes a `--deadline` recurring rather than one-shot: it re-arms on every reply *and* after every miss. Use it for a comrade expected to report on a cadence — on-time reports re-arm it quietly, and if they go dark you get the same alert every `limit=` until they come back or you clear it. `--deadline none` is how you stop one.
 - **`--deadline`** says *"I expect a reply from each `--to` within this long"* — `180s`, `10m`, `3h30m`; `none` clears. Durations are per-cell and per-comrade, at most one timer each, and re-arming replaces. Any message from that comrade clears theirs. Nothing goes on the wire: the timer is your own watchtower's, so it costs no network and works with the backend down. Requires an explicit `--to` (a deadline on a broadcast is ambiguous). **Your watchtower owns the timers, so if it dies — session killed, watchtower reaped — every armed deadline goes with it, silently; so does leaving the cell. Re-arm if you still care.**

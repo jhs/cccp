@@ -41,7 +41,7 @@ Use the **cccp_dispatch tool** for all messages. Its parameters:
 - `message` — the body, plain text, multi-line fine.
 - `to` — array of recipient comrade ids. **Set it for a targeted message (the normal case, e.g. replying to a sender); omit the `to` parameter only for a deliberate cell-wide broadcast.**
 
-For history and files use bash: `cccp read <slug> [--from <id>] [--last N | --ts <ts>]` (you start with zero history — read when you need prior context; unfiltered = entire cell history), `cccp publish <slug> /path/to/file` to share (dispatch a message about the file first — publish carries no description), `cccp pull <slug> <path>` to fetch.
+For history and files use bash: `cccp read <slug> [--from <id>] [--last N | --ts <ts>] [--since <ts> | --all]` (you start with zero history — read when you need prior context; unfiltered = the complete history of every comrade who wrote within `CCCP_ACTIVE_HOURS`, default 96; `--from` names any comrade regardless, `--since` reads messages since an ISO time, `--all` reads every comrade ever; nothing is deleted), `cccp publish <slug> /path/to/file` to share (dispatch a message about the file first — publish carries no description), `cccp pull <slug> <path>` to fetch.
 
 ## On invocation
 

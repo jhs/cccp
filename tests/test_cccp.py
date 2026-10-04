@@ -681,7 +681,7 @@ class SelfAliasLearning(unittest.TestCase):
         self.assertEqual(wt.aliases, {self.ME: "Captain"})
 
     def test_seed_skips_stale_gazettes(self):
-        # A gazette idle past ALIAS_SEED_MAX_AGE_SECONDS gets no head read at
+        # A gazette idle past CCCP_ACTIVE_HOURS gets no head read at
         # seed time; one with no last_modified at all is still seeded.
         gaz = self._gazette(self.OTHER)
         self.client.append(gaz, self._intro(self.OTHER, "Buddy",
@@ -1316,7 +1316,7 @@ class AliasTrigger(unittest.TestCase):
         # so the write path and the resolve path can never drift apart.
         self.assertEqual(cccp.TYPED_KEYS,
                          ("CCCP_AUTODOWNLOAD_MAX", "CCCP_ALIAS_TRIGGER",
-                          "CCCP_IDLE", "CCCP_QUIET"))
+                          "CCCP_IDLE", "CCCP_QUIET", "CCCP_ACTIVE_HOURS"))
         for key in cccp.TYPED_KEYS:
             self.assertIsNone(cccp._typed_key_error(key, ""))     # unset is fine
             self.assertIsNone(cccp._typed_key_error(key, None))
@@ -2057,7 +2057,7 @@ class RecipientResolution(unittest.TestCase):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             cccp.cmd_read(self._args(**dict({"to": None, "from_": None, "ts": None,
-                                             "last": None, "full": False}, **kw)))
+                                             "last": None, "full": False, "all": False, "since": None}, **kw)))
         return out.getvalue()
 
     def test_read_to_alias_selects_that_comrade_s_messages(self):
@@ -2325,7 +2325,7 @@ class UnpublishLargerThan(unittest.TestCase):
 def _serve_cfg():
     return {"BACKEND": "local-fs", "PARAMS": {}, "PREFIX": "", "DEBUG": None,
             "AUTODOWNLOAD_MAX": cccp.parse_size("1m"), "ALIAS_TRIGGER": None,
-            "IDLE": None, "QUIET": [], "SOURCES": {}}
+            "IDLE": None, "QUIET": [], "ACTIVE_HOURS": cccp.ACTIVE_HOURS_DEFAULT, "SOURCES": {}}
 
 
 class ServeMembership(unittest.TestCase):
@@ -2758,7 +2758,8 @@ class ParallelGazetteFetch(unittest.TestCase):
         return Gated(root)
 
     def test_read_output_matches_serial(self):
-        args = type("Args", (), {"cell": self.SLUG, "to": None, "from_": None, "ts": None, "last": None, "full": False})()
+        args = type("Args", (), {"cell": self.SLUG, "to": None, "from_": None, "ts": None, "last": None, "full": False,
+                                     "all": False, "since": None})()
         out = io.StringIO()
         with mock.patch.object(cccp, "make_backend", return_value=self.client), contextlib.redirect_stdout(out):
             cccp.cmd_read(args)
@@ -2776,6 +2777,167 @@ class ParallelGazetteFetch(unittest.TestCase):
         # Oldest-first, last-writer-wins: D took "Scout" from B, B then renamed itself "Bravo"; C's gazette 404'd, so no "Ghost".
         self.assertEqual(wt.aliases, {self.A: "Anchor", self.B: "Bravo", self.D: "Scout", self.ME: "Me"})
         self.assertEqual(cccp.load_aliases(self.SLUG, self.ME), wt.aliases)
+
+
+class ActiveWindow(unittest.TestCase):
+    """#54: `read` and alias seeding fetch only gazettes written within CCCP_ACTIVE_HOURS, judged by the listing's last_modified, so
+    their cost follows recent activity instead of every comrade the cell ever had. --all and --since reach past the window; --from
+    names one gazette and is never filtered. Fixture gazettes sit on either side of the window by mtime on a local-fs store."""
+
+    SLUG = "demo"
+    ME = "me@h:cc-aaaaaa"
+    NEW = "new@h:cc-111111"
+    OLD = "old@h:cc-222222"
+
+    def setUp(self):
+        self.data = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.data, True))
+        self.now = cccp.datetime.now(cccp.timezone.utc)
+        self.env = _isolated_env(self.data, CCCP_COMRADE_ID=self.ME)
+        self.env.__enter__()
+        self.addCleanup(lambda: self.env.__exit__(None, None, None))
+        self.client = cccp.make_backend(cccp.resolve_config())
+        self.fetched = []
+        for meth in ("get", "get_head"):
+            real = getattr(self.client, meth)
+            setattr(self.client, meth, lambda path, *a, _real=real: self.fetched.append(path) or _real(path, *a))
+        self._write(self.NEW, [(self.now - cccp.timedelta(hours=1), "Alias: Fresh - new here")])
+        # OLD last wrote ten days ago: well outside the default 96h window. Its first message is older still.
+        self._write(self.OLD, [(self.now - cccp.timedelta(days=12), "Alias: Relic - long gone"),
+                               (self.now - cccp.timedelta(days=10), "old news")])
+
+    def _ts(self, when):
+        return when.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+    def _write(self, frm, msgs):
+        path = cccp.gazette_path("", self.SLUG, frm)
+        for when, body in msgs:
+            rec = {"type": "message", "from": frm, "ts": self._ts(when), "to": ["*"], "body": body}
+            self.client.append_block(path, (json.dumps(rec) + "\n").encode())
+        last = msgs[-1][0].timestamp()
+        os.utime(self.client._abs(path), (last, last))
+
+    def _read(self, **kw):
+        args = type("Args", (), dict({"cell": self.SLUG, "to": None, "from_": None, "ts": None, "last": None, "full": False,
+                                      "all": False, "since": None}, **kw))()
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(cccp, "make_backend", return_value=self.client), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            cccp.cmd_read(args)
+        return out.getvalue(), err.getvalue()
+
+    def _gazette(self, comrade):
+        return cccp.gazette_path("", self.SLUG, comrade)
+
+    def test_default_read_fetches_only_active_gazettes(self):
+        out, _ = self._read()
+        self.assertIn("new here", out)
+        self.assertNotIn("old news", out)
+        self.assertEqual(self.fetched, [self._gazette(self.NEW)])
+
+    def test_all_reads_every_gazette(self):
+        out, _ = self._read(all=True)
+        self.assertIn("new here", out)
+        self.assertIn("long gone", out)
+        self.assertIn("old news", out)
+
+    def test_since_widens_the_roster_and_drops_older_messages(self):
+        since = self.now - cccp.timedelta(days=11)
+        out, _ = self._read(since=since)
+        self.assertIn("new here", out)
+        self.assertIn("old news", out)
+        self.assertNotIn("long gone", out)   # in a fetched gazette, but written before --since
+
+    def test_since_narrows_too(self):
+        out, _ = self._read(since=self.now - cccp.timedelta(minutes=30))
+        self.assertEqual(out, "(no messages)\n")
+        self.assertEqual(self.fetched, [])
+
+    def test_from_an_old_comrade_is_never_filtered(self):
+        out, _ = self._read(from_=self.OLD)
+        self.assertIn("long gone", out)
+        self.assertIn("old news", out)
+
+    def test_since_still_filters_messages_under_from(self):
+        out, _ = self._read(from_=self.OLD, since=self.now - cccp.timedelta(days=11))
+        self.assertIn("old news", out)
+        self.assertNotIn("long gone", out)
+
+    def test_config_sets_the_window(self):
+        os.environ["CCCP_ACTIVE_HOURS"] = "0.5"
+        out, _ = self._read()
+        self.assertEqual(out, "(no messages)\n")
+        os.environ["CCCP_ACTIVE_HOURS"] = "300"
+        out, _ = self._read()
+        self.assertIn("old news", out)
+
+    def test_empty_read_says_what_the_window_hid(self):
+        os.environ["CCCP_ACTIVE_HOURS"] = "0.5"
+        _, err = self._read()
+        self.assertIn("--all", err)
+        self.assertIn(": 2", err)
+
+    def test_ts_miss_points_at_all(self):
+        with self.assertRaises(SystemExit) as cm:
+            self._read(ts=self._ts(self.now - cccp.timedelta(days=10)))
+        self.assertIn("--all", str(cm.exception))
+
+    def _seed(self, **kw):
+        wt = cccp.Watchtower(self.client, "", self.SLUG, self.ME, 0, trigger="Alias:", **kw)
+        wt.seed_aliases()
+        return wt.aliases
+
+    def test_seeding_skips_gazettes_outside_the_window(self):
+        self.assertEqual(self._seed(), {self.NEW: "Fresh"})
+        self.assertEqual(self.fetched, [self._gazette(self.NEW)])
+
+    def test_seeding_follows_the_configured_window(self):
+        self.assertEqual(self._seed(active_hours=0.5), {})
+        self.assertEqual(self._seed(active_hours=300), {self.NEW: "Fresh", self.OLD: "Relic"})
+
+    def test_hardcoded_seed_age_is_gone(self):
+        self.assertFalse(hasattr(cccp, "ALIAS_SEED_MAX_AGE_SECONDS"))
+
+
+class ActiveHoursConfig(unittest.TestCase):
+    """CCCP_ACTIVE_HOURS is a typed key: a positive finite number of hours, default 96, refused at `cccp config` when malformed."""
+
+    def setUp(self):
+        self.data = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.data, True))
+
+    def test_validation(self):
+        for bad in ("0", "-1", "soon", "nan", "inf", "96h"):
+            self.assertIsNotNone(cccp._typed_key_error("CCCP_ACTIVE_HOURS", bad), bad)
+        for good in ("96", "0.5", "168"):
+            self.assertIsNone(cccp._typed_key_error("CCCP_ACTIVE_HOURS", good), good)
+
+    def test_config_write_rejects_a_bad_value(self):
+        with _isolated_env(self.data), self.assertRaises(SystemExit) as cm, contextlib.redirect_stdout(io.StringIO()):
+            cccp._config_set(["CCCP_ACTIVE_HOURS=0"])
+        self.assertIn("CCCP_ACTIVE_HOURS", str(cm.exception))
+
+    def test_resolves_with_a_default_and_shows_in_the_dump(self):
+        with _isolated_env(self.data):
+            self.assertEqual(cccp.resolve_config()["ACTIVE_HOURS"], 96)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                cccp._print_config_dump()
+            self.assertRegex(out.getvalue(), r"CCCP_ACTIVE_HOURS\s+default\s+96\n")
+            with contextlib.redirect_stdout(io.StringIO()):
+                cccp._config_set(["CCCP_ACTIVE_HOURS=24"])
+            self.assertEqual(cccp.resolve_config()["ACTIVE_HOURS"], 24)
+
+    def test_read_flags(self):
+        parser = cccp.build_parser()
+        args = parser.parse_args(["read", "demo", "--since", "2026-01-02T03:04:05Z"])
+        self.assertEqual(args.since, cccp.datetime(2026, 1, 2, 3, 4, 5, tzinfo=cccp.timezone.utc))
+        self.assertTrue(parser.parse_args(["read", "demo", "--all"]).all)
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["read", "demo", "--all", "--since", "2026-01-02T03:04:05Z"])
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["read", "demo", "--since", "yesterday"])
 
 
 class MonitorsManifest(unittest.TestCase):
