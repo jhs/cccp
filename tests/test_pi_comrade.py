@@ -616,6 +616,86 @@ class SurviveReload(unittest.TestCase):
         self.assertIn('proc.on("error"', arm,
                       "a spawn failure must be reported as one dead cell, not kill the whole comrade")
 
+class SurviveHardDeath(unittest.TestCase):
+    """A session resumed after its process died hard must come back hearing, and a session switch must not go deaf (#50).
+
+    Measured in a live pi 0.85.1 TUI: `pi --session <id>` in a fresh process reports `startup`, not `resume`, so a gate
+    naming `resume` would never fire for the case it exists for. And `/new` left `stash.closed` set for the rest of the
+    process, dropping every event - a rejoin's `ready` line and dispatches included - while the watchtower ran fine.
+    """
+
+    def setUp(self):
+        self.src = EXTENSION.read_text()
+
+    def _start(self):
+        m = re.search(r'pi\.on\("session_start".*?\n\t\}\);', self.src, re.DOTALL)
+        self.assertIsNotNone(m, "the session_start handler moved; re-point this test")
+        return m.group(0)
+
+    def _recover(self):
+        m = re.search(r'async function recoverAfterHardDeath.*?\n\t\}', self.src, re.DOTALL)
+        self.assertIsNotNone(m, "recoverAfterHardDeath moved or was renamed; re-point this test")
+        return m.group(0)
+
+    def test_joined_cells_come_from_the_sessions_own_join_results(self):
+        script = (
+            'import { joinedCells } from "./integrations/pi/cccp-comrade.ts";'
+            'const tr = (toolName, details) => ({ type: "message", message: { role: "toolResult", toolName, details } });'
+            'console.log(JSON.stringify(joinedCells(['
+            '  tr("cccp_join", { cell: "a" }), tr("cccp_dispatch", { cell: "x" }), { type: "custom", customType: "cccp-cells-orphaned" },'
+            '  tr("cccp_join", { cell: "a", idleMinutes: 0 }), tr("cccp_join", { cell: "b" }), tr("cccp_join", {})])));'
+        )
+        r = subprocess.run(["node", "--no-warnings", "--input-type=module", "-e", script], cwd=REPO, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, f"node failed:\n{r.stderr}")
+        self.assertEqual(json.loads(r.stdout.strip().splitlines()[-1]), [{"cell": "a", "idleMinutes": 0}, {"cell": "b"}],
+                         "one entry per cell, the newest idle setting winning, and nothing from other tools")
+
+    def test_join_records_its_idle_setting_in_the_session(self):
+        self.assertIn("details: { cell, idleMinutes: params.idle_minutes }", self.src,
+                      "a re-arm after a hard death can only restore the idle setting the join recorded")
+
+    def test_every_start_but_a_reload_checks_for_a_hard_death(self):
+        start = self._start()
+        self.assertRegex(start, r'if \(event\.reason === "reload"\) recoverAfterReload\(recorded\);\s*(//.*\n\s*)*else void recoverAfterHardDeath\(',
+                         "the hard-death path must cover every non-reload reason: a fresh-process resume reports `startup`")
+        self.assertLess(start.index("resolveEnvironment"), start.index("recoverAfterHardDeath"),
+                        "re-arming needs the resolved environment, as the reload path does")
+
+    def test_only_a_hard_death_is_rearmed(self):
+        """`cccp status` already tells a hard death (`dead ... stale`) from a leave or a quit (`stopped`); a cell left
+        on purpose must stay left."""
+        recover = self._recover()
+        self.assertIn('startsWith("dead ")', recover, "only a stale pid record means the watchtower died with the process")
+        self.assertIn("armWatchtower", recover, "and that is re-armed through the one shared spawn site")
+
+    def test_a_successful_rearm_is_a_quiet_note_and_a_failure_an_alarm(self):
+        recover = self._recover()
+        success = recover.split("armed.length > 0")[1].split("failed.length > 0")[0]
+        self.assertIn('deliverAs: "nextTurn"', success, "a recovered comrade is not deaf; the note waits for the next turn")
+        self.assertNotIn("triggerTurn: true", success)
+        self.assertIn("cccp read", success, "the note must point at the backlog the restart cannot replay")
+        failure = recover.split("failed.length > 0")[1]
+        self.assertIn("triggerTurn: true", failure, "a failed re-arm IS the deaf comrade")
+        self.assertIn("cccp_join", failure)
+
+    def test_a_new_session_reopens_the_stash(self):
+        start = self._start()
+        self.assertIn("stash.closed = false", start, "`new`, `resume` and `fork` start a successor in the same process")
+        self.assertLess(start.index("stash.closed = false"), start.index("stash.pending.splice(0)"))
+
+    def test_a_watchtower_killed_at_a_session_switch_never_speaks_into_the_next(self):
+        shutdown = re.search(r'pi\.on\("session_shutdown".*?\n\t\}\);', self.src, re.DOTALL).group(0)
+        kill = shutdown[shutdown.index("stash.closed = true"):]
+        self.assertLess(kill.index("tower.released = true"), kill.index("tower.proc.kill()"),
+                        "mark it released before the kill, or its shutdown line can beat the mark")
+        arm = re.search(r'function armWatchtower.*?\n\t\}', self.src, re.DOTALL).group(0)
+        reader = arm.split("input: proc.stdout!")[1].split("input: proc.stderr!")[0]
+        self.assertIn("tower.released", reader, "a released watchtower's last lines belong to the session that ended")
+        exit_handler = arm.split('proc.on("exit"')[1]
+        self.assertLess(exit_handler.index("tower.released"), exit_handler.index("emit("),
+                        "a released watchtower's death is not this session's deaf alarm")
+
+
 class WatchtowerDeath(unittest.TestCase):
     """How a watchtower died must reach the comrade, not just that it died.
 

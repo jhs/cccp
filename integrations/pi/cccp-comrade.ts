@@ -71,7 +71,7 @@ import { fileURLToPath } from "node:url";
 import { Container, Markdown, Text, type Component } from "@earendil-works/pi-tui";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { registerTokenWatch } from "./token-watch.ts";
 import * as telemetry from "./telemetry.ts";
 
@@ -178,6 +178,9 @@ type Tower = {
 	/** The caller's `idle_minutes`; undefined means "cccp's default", which is not the same as 0. */
 	idleMinutes?: number;
 	stderrTail: string[];
+	/** Set when a session switch kills this watchtower. Its last lines and its death arrive after the next session
+	 *  has started, and belong to the one that ended: without this they read as a fresh "you are deaf" alarm. */
+	released?: boolean;
 };
 
 /** One thing a watchtower needs to tell the session. */
@@ -207,8 +210,8 @@ type Stash = {
 	towers: Map<string, Tower>;
 	sink: ((cell: string, out: Outbound) => void) | null;
 	pending: { cell: string; out: Outbound }[];
-	/** Set when the session is ending for real, so emissions are dropped rather than buffered for a
-	 *  successor that is never coming. */
+	/** Set when the session ends, so emissions are dropped rather than buffered for a successor that may never
+	 *  come. Cleared when one does: `new`, `resume` and `fork` start a successor in the same process (#50). */
 	closed: boolean;
 };
 
@@ -269,6 +272,24 @@ export type RecordedCells = {
  *  Entries ACCUMULATE, so only the newest is the truth, and consuming one writes an empty tombstone
  *  rather than deleting anything. Both facts measured against a real session across two reloads. */
 const ORPHAN_ENTRY = "cccp-cells-orphaned";
+
+/** The cells this session's own `cccp_join` calls named, newest idle setting winning. History, not a claim about now:
+ *  whether any of them still needs a watchtower is for `cccp status` to say, not for a transcript to guess. */
+export function joinedCells(entries: readonly SessionEntry[]): JoinedCell[] {
+	const cells = new Map<string, JoinedCell>();
+	for (const entry of entries) {
+		if (entry.type !== "message" || entry.message.role !== "toolResult" || entry.message.toolName !== "cccp_join") continue;
+		const { cell, idleMinutes } = (entry.message.details ?? {}) as Partial<JoinedCell>;
+		if (typeof cell === "string") cells.set(cell, { cell, idleMinutes: typeof idleMinutes === "number" ? idleMinutes : undefined });
+	}
+	return [...cells.values()];
+}
+
+/** `cccp status <cell>`'s one line for this comrade. It exits non-zero for every state but alive, so the line is read
+ *  whatever the exit code; a spawn failure reads as empty, which is never mistaken for a hard death. */
+function cellStatus(cell: string): Promise<string> {
+	return new Promise((resolve) => execFile(CCCP, ["status", cell], (_err, stdout) => resolve(String(stdout ?? "").trim())));
+}
 
 /** Read the newest record and tombstone it, so a resume, a fork, or a later reload can never re-arm
  *  cells this comrade left behind long ago. Taken on every start regardless of reason; what happens
@@ -339,6 +360,7 @@ export default function (pi: ExtensionAPI) {
 				log("ERROR", `Drop cell ${cell} event, the session refused it (${e instanceof Error ? e.message : String(e)}): ${JSON.stringify(out.content)}`);
 			}
 		};
+		stash.closed = false;
 		const held = stash.pending.splice(0);
 		if (held.length > 0) log("INFO", `Flush events held across the handover: ${held.length}`);
 		for (const { cell, out } of held) stash.sink(cell, out);
@@ -365,6 +387,10 @@ export default function (pi: ExtensionAPI) {
 		// and sequenced BEFORE telemetry because every millisecond spent deaf is a millisecond of events
 		// nobody hears. Telemetry and the first-run notice can wait; a silent comrade cannot.
 		if (event.reason === "reload") recoverAfterReload(recorded);
+		// Every other start may be a session coming back after its process died hard - a power cut, `kill -9`, the OOM
+		// killer - with nothing having run to record what it held. In this Pi that resume reports `startup`, not
+		// `resume`, which is why no reason is named here (#50).
+		else void recoverAfterHardDeath(joinedCells(ctx.sessionManager.getEntries()));
 		// Only now can this be judged: the writable path it needs is what resolveEnvironment just filled in.
 		// A misconfiguration is reported rather than swallowed - silently-no-telemetry looks exactly like a
 		// dead agent to whatever is watching this session from outside, which is the whole point of writing.
@@ -426,7 +452,10 @@ export default function (pi: ExtensionAPI) {
 		stash.pending.length = 0;
 		if (stash.towers.size === 0) return;
 		log("INFO", `Kill watchtowers on session ${event.reason}: ${[...stash.towers.keys()].join(", ")}`);
-		for (const tower of stash.towers.values()) tower.proc.kill();
+		for (const tower of stash.towers.values()) {
+			tower.released = true;
+			tower.proc.kill();
+		}
 		stash.towers.clear();
 	});
 
@@ -442,7 +471,7 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId: string, params: { cell: string; idle_minutes?: number }) {
 			const cell = params.cell;
 			if (stash.towers.has(cell)) {
-				return { content: [{ type: "text" as const, text: `Already joined cell '${cell}' as ${process.env.CCCP_COMRADE_ID}` }], details: { cell } };
+				return { content: [{ type: "text" as const, text: `Already joined cell '${cell}' as ${process.env.CCCP_COMRADE_ID}` }], details: { cell } as JoinedCell };
 			}
 			// Normally a no-op after session_start; re-checking keeps join loud when the environment is broken.
 			const res = resolveEnvironment(sessionId);
@@ -454,7 +483,8 @@ export default function (pi: ExtensionAPI) {
 			armWatchtower(cell, params.idle_minutes);
 			return {
 				content: [{ type: "text" as const, text: `Joined cell '${cell}' as ${process.env.CCCP_COMRADE_ID}. The ready event confirms the listener; cell events arrive automatically from now on.` }],
-				details: { cell },
+				// The idle setting rides in the session so a re-arm after a hard death restores it (see joinedCells).
+				details: { cell, idleMinutes: params.idle_minutes },
 			};
 		},
 	});
@@ -529,6 +559,51 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	/** Come back from a process that died hard still able to hear (#50).
+	 *
+	 *  Nothing ran on the way down, so there is no record to take - but `cccp status` already tells a hard death from a
+	 *  clean one: a pid record whose watchtower is gone is `dead ... stale`, while a leave or a quit leaves `stopped`. So
+	 *  each cell the session ever joined is asked, and only the ones that died with it are re-armed. A cell left on
+	 *  purpose stays left, a forked session (a new comrade id) finds no record at all, and a session that never joined
+	 *  anything spawns nothing. */
+	async function recoverAfterHardDeath(cells: JoinedCell[]): Promise<void> {
+		if (cells.length === 0) return;
+		const stale = (await Promise.all(cells.map(async (joined) => ((await cellStatus(joined.cell)).startsWith("dead ") ? [joined] : [])))).flat();
+		if (stale.length === 0) return;
+		log("WARN", `The previous process died with its watchtowers, re-arm them: ${JSON.stringify(stale)}`);
+		const armed: string[] = [];
+		const failed: { cell: string; reason: string }[] = [];
+		for (const { cell, idleMinutes } of stale) {
+			if (stash.towers.has(cell)) continue;
+			try {
+				armWatchtower(cell, idleMinutes);
+				armed.push(cell);
+			} catch (e) {
+				const reason = e instanceof Error ? e.message : String(e);
+				log("ERROR", `Re-arm the watchtower for cell ${cell} failed: ${reason}`);
+				failed.push({ cell, reason });
+			}
+		}
+		if (armed.length > 0) {
+			emit(stash, armed[0], {
+				content:
+					`Re-armed CCCP watchtowers for ${armed.map((c) => `'${c}'`).join(", ")}, lost when this session's previous process died hard; no need to rejoin. Anything sent meanwhile was missed: \`cccp read <cell> --last 5\`.`,
+				deliverAs: "nextTurn",
+				triggerTurn: false,
+			});
+		}
+		if (failed.length > 0) {
+			emit(stash, failed[0].cell, {
+				content:
+					`CCCP could NOT restart your watchtowers for ${failed.map((f) => `'${f.cell}' (${f.reason})`).join(", ")}, which died with this session's previous process. ` +
+					`You are NOT receiving those cells' events, though outgoing cccp_dispatch may still work. Anything sent to you while you were down is unread — ` +
+					`\`cccp read <cell>\` shows it. Tell the user, and rejoin with cccp_join if the work is still live.`,
+				deliverAs: "followUp",
+				triggerTurn: true,
+			});
+		}
+	}
+
 	/** Spawn one cell's watchtower and attach its readers, ONCE, for the life of the pi process.
 	 *
 	 *  The first join and the fallback re-arm both come through here, deliberately: a watchtower armed by
@@ -543,6 +618,10 @@ export default function (pi: ExtensionAPI) {
 		const proc = tower.proc;
 		stash.towers.set(cell, tower);
 		readline.createInterface({ input: proc.stdout! }).on("line", (line) => {
+			if (tower.released) {
+				log("INFO", `Drop cell ${cell} line from a watchtower released at a session switch: ${line}`);
+				return;
+			}
 			// Full parity with the Monitor tool a Claude Code comrade gets: every cell event costs a turn.
 			emit(stash, cell, { content: eventMessage(cell, line), deliverAs: "followUp", triggerTurn: true });
 		});
@@ -576,6 +655,7 @@ export default function (pi: ExtensionAPI) {
 			const how = signal ? `signal=${signal}` : `code=${code}`;
 			log(code === 0 ? "INFO" : "ERROR", `Cell ${cell} watchtower exited: ${how}`);
 			if (stash.towers.get(cell)?.proc === proc) stash.towers.delete(cell);
+			if (tower.released) return;
 			// Clean exits need no alarm: a deliberate stop (session end, `cccp stop`) already announced itself
 			// via the shutdown event. Anything else means a DEAF comrade — cell events stop arriving while
 			// dispatch may still work, which the model cannot detect on its own. Silence here was the failure
