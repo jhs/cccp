@@ -1153,9 +1153,9 @@ def gazette_path(prefix, slug, comrade):
     return f"{gazettes_head(prefix, slug)}{comrade}.jsonl"
 
 
-def append_dispatch(client, prefix, slug, me, dispatch):
-    """Append one dispatch (a JSON object) as a line to my gazette append blob,
-    then read it back from the store.
+def append_dispatch(client, prefix, slug, me, *dispatches):
+    """Append dispatches (JSON objects) as lines to my gazette append blob, in one
+    append so a reader sees all of them or none, then read them back from the store.
 
     The read-back is the delivery guarantee (#7): exit 0 must mean "the store
     has it", not "the store said yes". A middlebox or store that returns 201
@@ -1163,7 +1163,7 @@ def append_dispatch(client, prefix, slug, me, dispatch):
     peer's silence days later. Costs one ranged GET per send."""
     path = gazette_path(prefix, slug, me)
     client.ensure_append_blob(path)
-    line = (json.dumps(dispatch, separators=(",", ":")) + "\n").encode("utf-8")
+    line = b"".join((json.dumps(d, separators=(",", ":")) + "\n").encode("utf-8") for d in dispatches)
     st, offset = client.append_block(path, line)
     if st != 201:
         raise BlobError(st, b"gazette append failed")
@@ -1635,9 +1635,11 @@ def wake_recipients(slug, to, log=None):
 # Aliases are human/LLM-friendly names for comrades, kept as a LOCAL projection:
 # the wire and the data model always carry raw user@host:hex ids. A comrade
 # declares its alias in an intro whose body starts with the CCCP_ALIAS_TRIGGER
-# prefix; every armed comrade - including the declarer's own watchtower, which
-# reads its own gazette for exactly this - learns it and translates on the way in
-# (watchtower metadata) and out (dispatch --to).
+# prefix, and its `dispatch` writes an `alias` record beside that intro; every
+# armed comrade - including the declarer's own watchtower, which reads its own
+# gazette for exactly this - learns it from the record (or, from a pre-3.15
+# sender, from the intro text) and translates on the way in (watchtower
+# metadata) and out (dispatch --to).
 #
 # The trigger is config, not a watchtower flag: a cell-wide convention every
 # comrade must agree on reads as configuration, with ALIAS_TRIGGER_DEFAULT when
@@ -1675,19 +1677,78 @@ def alias_map_path(slug, me):
     return mirror_dir() / slug / me / "aliases.json"
 
 
+def alias_versions_path(slug, me):
+    return mirror_dir() / slug / me / "alias-versions.json"
+
+
+def own_alias_path(slug, me):
+    return mirror_dir() / slug / me / "own-alias.json"
+
+
+def _load_json_dict(path):
+    """A local JSON object file. Missing/corrupt -> None."""
+    try:
+        data = json.loads(path.read_text())
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _save_json_dict(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, sort_keys=True))
+
+
 def load_aliases(slug, me):
     """The local {comrade_id: alias} map for this cell. Missing/corrupt -> {}."""
-    try:
-        data = json.loads(alias_map_path(slug, me).read_text())
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
+    return _load_json_dict(alias_map_path(slug, me)) or {}
 
 
 def save_aliases(slug, me, amap):
-    path = alias_map_path(slug, me)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(amap, sort_keys=True))
+    _save_json_dict(alias_map_path(slug, me), amap)
+
+
+def load_alias_versions(slug, me):
+    """{comrade_id: cccp version} from each comrade's newest `alias` record, or None for a comrade whose alias came only from the
+    pre-3.15 intro-text fallback. Shown by `cccp aliases`. Missing/corrupt -> {}."""
+    return _load_json_dict(alias_versions_path(slug, me)) or {}
+
+
+def save_alias_versions(slug, me, versions):
+    _save_json_dict(alias_versions_path(slug, me), versions)
+
+
+def load_own_alias(slug, me):
+    """The `alias` record of my latest intro to this cell, or None. #57 writes it again at the head of each new day file."""
+    return _load_json_dict(own_alias_path(slug, me))
+
+
+def save_own_alias(slug, me, record):
+    _save_json_dict(own_alias_path(slug, me), record)
+
+
+def alias_record(me, ts, body, trigger):
+    """The `alias` record my outgoing `body` declares, or None. A sender writes one beside each message that starts with its own
+    configured trigger, so readers learn the name from structure, whatever trigger they run with themselves."""
+    name = parse_alias(body, trigger)
+    return {"type": "alias", "from": me, "ts": ts, "alias": name, "v": cccp_version()} if name else None
+
+
+def alias_declaration(d, trigger, record_senders):
+    """The (comrade id, alias, version) one gazette record declares, or None. An `alias` record declares itself. A message declares
+    only through the intro-text fallback, and only when its sender is not in `record_senders`: a sender that writes records says
+    its intros in them, so its message bodies are never parsed (a matching intro would learn twice, a mismatched trigger wrongly)."""
+    frm = d.get("from")
+    if not frm:
+        return None
+    if d.get("type") == "alias":
+        name = d.get("alias")
+        return (frm, name, d.get("v")) if isinstance(name, str) and ALIAS_TOKEN.fullmatch(name) else None
+    # Fallback for pre-3.15 senders, which write no alias records. Removed in 4.0 (#57).
+    if d.get("type") == "message" and frm not in record_senders:
+        name = parse_alias(d.get("body", ""), trigger)
+        return (frm, name, None) if name else None
+    return None
 
 
 def parse_alias(body, trigger):
@@ -1894,6 +1955,7 @@ class Watchtower:
         # and the whole feature is inert (no seed, no learn, no translation).
         self.trigger = trigger
         self.aliases = {}   # comrade_id -> alias; reloaded from disk each poll
+        self.record_senders = set()   # comrades seen writing `alias` records: their message bodies are never parsed for intros
         self.quiet = set(quiet)   # event types to handle but not emit (e.g. a
                                   # coordination hub suppresses 'filesystem' - the
                                   # file still auto-downloads, just no notify turn)
@@ -2006,7 +2068,8 @@ class Watchtower:
         live changes do. Declarations are applied oldest-first so last-writer-wins
         holds within the seeded window."""
         amap = load_aliases(self.slug, self.me)
-        decls = []   # (ts, from_id, alias)
+        versions = load_alias_versions(self.slug, self.me)
+        records = []
         # Only gazettes inside the CCCP_ACTIVE_HOURS window (#54): an old cell accumulates gazettes from long-gone comrades forever,
         # and each costs a head read at startup. A live comrade silent past the window renders as a raw id, and `--to <alias>`
         # fails closed, until it introduces itself again and live learning re-acquires the alias.
@@ -2022,17 +2085,21 @@ class Watchtower:
                 continue
             for chunk in data.splitlines():
                 try:
-                    dd = json.loads(chunk)
+                    records.append(json.loads(chunk))
                 except ValueError:
                     continue   # a byte-capped head can end mid-line - skip it
-                if dd.get("type") != "message":
-                    continue
-                name = parse_alias(dd.get("body", ""), self.trigger)
-                if name and dd.get("from"):
-                    decls.append((dd.get("ts", ""), dd["from"], name))
-        for _ts, cid, name in sorted(decls, key=lambda x: x[0]):
+        # Every record sender is known before any message is judged, so the fallback skips them wherever their records sit.
+        self.record_senders.update(d["from"] for d in records if d.get("type") == "alias" and d.get("from"))
+        decls = []   # (ts, (from_id, alias, version))
+        for d in records:
+            decl = alias_declaration(d, self.trigger, self.record_senders)
+            if decl:
+                decls.append((d.get("ts", ""), decl))
+        for _ts, (cid, name, v) in sorted(decls, key=lambda x: x[0]):
             learn_alias(amap, cid, name)   # silent: discard the event line
+            versions[cid] = v
         save_aliases(self.slug, self.me, amap)
+        save_alias_versions(self.slug, self.me, versions)
         self.aliases = amap
         self.log.debug(f"ev=aliases_seeded count={len(amap)} stale_skipped={stale}")
 
@@ -2356,17 +2423,25 @@ class Watchtower:
                 data, on_bad=lambda c, who=comrade: self._log(
                     f"skip unparseable gazette line from {who}: {c[:120]!r}"))
             for d in records:
-                # Learn aliases from every visible message (not just those
-                # addressed to me - intros broadcast), before the render filter.
-                if self.trigger and d.get("type") == "message":
-                    name = parse_alias(d.get("body", ""), self.trigger)
-                    if name and d.get("from"):
-                        ev = learn_alias(self.aliases, d["from"], name)
+                # Learn aliases from every visible record (not just those addressed
+                # to me - intros broadcast), before the render filter. A sender's
+                # `alias` record precedes its intro message in the same append.
+                if self.trigger:
+                    if d.get("type") == "alias" and d.get("from"):
+                        self.record_senders.add(d["from"])
+                    decl = alias_declaration(d, self.trigger, self.record_senders)
+                    if decl:
+                        cid, name, v = decl
+                        ev = learn_alias(self.aliases, cid, name)
                         if ev:
                             alias_dirty = True
                             messages.append((d.get("ts", now_iso()), ev))
-                if is_me:
-                    continue   # learn-only: no echo, no deadline credit
+                        versions = load_alias_versions(self.slug, self.me)
+                        if cid not in versions or versions[cid] != v:
+                            versions[cid] = v
+                            save_alias_versions(self.slug, self.me, versions)
+                if d.get("type") == "alias" or is_me:
+                    continue   # learn-only (an alias record, or my own gazette): no event, no deadline credit
                 # Any message from this comrade proves they are alive and answering,
                 # so it clears their deadline - even one addressed elsewhere, and
                 # even one _render filtered out.
@@ -3206,9 +3281,13 @@ def cmd_dispatch(args):
                 "body": body,
             }
             sent = d["ts"]
+            # An intro carries its alias as a structured record too, first and in the same append, so no reader needs my trigger.
+            intro = alias_record(me, sent, body, cfg["ALIAS_TRIGGER"])
             with TimeLogger(log, "dispatch_append", body_chars=len(body),
-                            to_count=len(args.to) if args.to else 0):
-                append_dispatch(client, cfg["PREFIX"], slug, me, d)
+                            to_count=len(args.to) if args.to else 0, alias=bool(intro)):
+                append_dispatch(client, cfg["PREFIX"], slug, me, *([intro] if intro else []), d)
+            if intro:
+                save_own_alias(slug, me, intro)
             # After the append, never before: a woken watchtower polls at once,
             # and must find the message already there.
             wake_recipients(slug, to, log)
@@ -3707,14 +3786,21 @@ def cmd_pull(args):
 # ---------- argparse ----------
 
 def cmd_aliases(args):
-    """List this cell's local alias map (name = id), one per line. Purely local -
-    no config, no network."""
-    amap = load_aliases(slugify(args.cell), comrade_id())
+    """List this cell's local alias map (name = id), one per line, with the cccp
+    version each comrade's newest `alias` record carried. A name learned only from
+    intro text is from a sender older than 3.15; one set by hand shows no version.
+    Purely local - no config, no network."""
+    slug, me = slugify(args.cell), comrade_id()
+    amap = load_aliases(slug, me)
     if not amap:
         print("(no aliases)")
         return
+    versions = load_alias_versions(slug, me)
     for cid, name in sorted(amap.items(), key=lambda kv: kv[1]):
-        print(f"{name} = {cid}")
+        if cid not in versions:
+            print(f"{name} = {cid}")
+        else:
+            print(f"{name} = {cid} ({'v' + versions[cid] if versions[cid] else 'older than v3.15'})")
 
 
 def cmd_alias(args):

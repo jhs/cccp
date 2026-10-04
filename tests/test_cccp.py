@@ -3058,6 +3058,131 @@ class ActiveHoursConfig(unittest.TestCase):
                 parser.parse_args(["read", "demo", "--since", "yesterday"])
 
 
+class AliasRecords(unittest.TestCase):
+    """Design update on #55: a sender whose own message starts with its configured trigger also writes an `alias` record, in the same
+    append and carrying its cccp version. Readers learn from records in ts order and parse message bodies only for senders that never
+    wrote one (pre-3.15). Otherwise the record is inert: never an event line, never a `read` line."""
+
+    SLUG = "demo"
+    ME = "me@h:cc-aaaaaa"
+    NEW = "new@h:cc-111111"   # a 3.15 sender: its intros carry a record
+    OLD = "old@h:cc-222222"   # a pre-3.15 sender: its intros are message bodies only
+
+    def setUp(self):
+        self.data = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.data, True))
+        self.env = _isolated_env(self.data, CCCP_COMRADE_ID=self.ME, CCCP_ALIAS_TRIGGER="Alias:")
+        self.env.__enter__()
+        self.addCleanup(lambda: self.env.__exit__(None, None, None))
+        self.client = cccp.make_backend(cccp.resolve_config())
+
+    def _args(self, **kw):
+        return type("Args", (), dict({"cell": self.SLUG}, **kw))()
+
+    def _dispatch(self, body):
+        with mock.patch.object(cccp, "make_backend", return_value=self.client), contextlib.redirect_stdout(io.StringIO()):
+            cccp.cmd_dispatch(self._args(to=[], body=body, deadline=None, standing=False))
+
+    def _records(self, comrade):
+        st, body = self.client.get(cccp.gazette_path("", self.SLUG, comrade))
+        return [json.loads(line) for line in body.splitlines()] if st == 200 else []
+
+    def _append(self, comrade, records):
+        self.client.append_block(cccp.gazette_path("", self.SLUG, comrade), b"".join((json.dumps(r) + "\n").encode() for r in records))
+
+    def _intro(self, frm, name, ts, record=True, body=None):
+        msg = {"type": "message", "from": frm, "ts": ts, "to": ["*"], "body": body or f"Alias: {name} - here"}
+        return ([{"type": "alias", "from": frm, "ts": ts, "alias": name, "v": "3.15.0"}] if record else []) + [msg]
+
+    def _watchtower(self):
+        wt = cccp.Watchtower(self.client, "", self.SLUG, self.ME, 0, trigger="Alias:")
+        wt.emitted = []
+        wt._emit = wt.emitted.append
+        return wt
+
+    def _read(self, **kw):
+        out = io.StringIO()
+        with mock.patch.object(cccp, "make_backend", return_value=self.client), contextlib.redirect_stdout(out):
+            cccp.cmd_read(self._args(**dict({"to": None, "from_": None, "ts": None, "last": None, "full": False, "all": False,
+                                             "since": None}, **kw)))
+        return out.getvalue()
+
+    def test_intro_dispatch_writes_the_record_first_in_one_append(self):
+        with mock.patch.object(self.client, "append_block", wraps=self.client.append_block) as append:
+            self._dispatch("Alias: Builder - on the ticket")
+        self.assertEqual(append.call_count, 1)
+        recs = self._records(self.ME)
+        self.assertEqual([r["type"] for r in recs], ["alias", "message"])
+        self.assertEqual(recs[0], {"type": "alias", "from": self.ME, "ts": recs[1]["ts"], "alias": "Builder", "v": cccp.cccp_version()})
+
+    def test_intro_is_remembered_locally(self):
+        self.assertIsNone(cccp.load_own_alias(self.SLUG, self.ME))
+        self._dispatch("Alias: Builder - on the ticket")
+        self._dispatch("Alias: Rebuilt - new name")
+        self.assertEqual(cccp.load_own_alias(self.SLUG, self.ME), self._records(self.ME)[2])
+
+    def test_other_dispatches_write_no_record(self):
+        self._dispatch("hello all")
+        self._dispatch("Intro: Bob - not my configured trigger")
+        self.assertEqual([r["type"] for r in self._records(self.ME)], ["message", "message"])
+        self.assertIsNone(cccp.load_own_alias(self.SLUG, self.ME))
+
+    def test_poll_learns_a_record_once_and_never_emits_it(self):
+        wt = self._watchtower()
+        wt.initial_scan()
+        self._append(self.NEW, self._intro(self.NEW, "Scout", "2026-10-04T10:00:00.000000Z"))
+        wt._poll_once()
+        self.assertEqual(wt.aliases, {self.NEW: "Scout"})
+        self.assertEqual([line.split(" ")[0] for line in wt.emitted], ["alias", "message"])
+
+    def test_poll_learns_a_record_whatever_the_body_says(self):
+        # Two machines with different triggers: the record alone names the sender.
+        wt = self._watchtower()
+        wt.initial_scan()
+        self._append(self.NEW, self._intro(self.NEW, "Scout", "2026-10-04T10:00:00.000000Z", body="Hello: Scout - other trigger"))
+        wt._poll_once()
+        self.assertEqual(wt.aliases, {self.NEW: "Scout"})
+
+    def test_poll_parses_bodies_only_for_senders_without_records(self):
+        wt = self._watchtower()
+        wt.initial_scan()
+        self._append(self.OLD, self._intro(self.OLD, "Relic", "2026-10-04T10:00:00.000000Z", record=False))
+        self._append(self.NEW, self._intro(self.NEW, "Scout", "2026-10-04T10:00:01.000000Z"))
+        wt._poll_once()
+        self._append(self.NEW, [{"type": "message", "from": self.NEW, "ts": "2026-10-04T10:00:02.000000Z", "to": ["*"],
+                                 "body": "Alias: Ghost - quoting someone else's syntax"}])
+        wt._poll_once()
+        self.assertEqual(wt.aliases, {self.OLD: "Relic", self.NEW: "Scout"})
+        self.assertEqual(cccp.load_alias_versions(self.SLUG, self.ME), {self.OLD: None, self.NEW: "3.15.0"})
+
+    def test_seed_applies_records_and_fallback_in_ts_order(self):
+        self._append(self.NEW, self._intro(self.NEW, "Scout", "2026-10-04T10:00:01.000000Z"))
+        self._append(self.OLD, self._intro(self.OLD, "Scout", "2026-10-04T10:00:02.000000Z", record=False))   # takes the name
+        self._append(self.NEW, [{"type": "message", "from": self.NEW, "ts": "2026-10-04T10:00:03.000000Z", "to": ["*"],
+                                 "body": "Alias: Ghost - not an intro from a sender that writes records"}])
+        self._append(self.NEW, self._intro(self.NEW, "Bravo", "2026-10-04T10:00:04.000000Z"))
+        wt = self._watchtower()
+        wt.seed_aliases()
+        self.assertEqual(wt.aliases, {self.OLD: "Scout", self.NEW: "Bravo"})
+        self.assertEqual(cccp.load_alias_versions(self.SLUG, self.ME), {self.OLD: None, self.NEW: "3.15.0"})
+
+    def test_aliases_shows_each_comrade_s_version(self):
+        self._append(self.NEW, self._intro(self.NEW, "Scout", "2026-10-04T10:00:01.000000Z"))
+        self._append(self.OLD, self._intro(self.OLD, "Relic", "2026-10-04T10:00:02.000000Z", record=False))
+        self._watchtower().seed_aliases()
+        with contextlib.redirect_stdout(io.StringIO()):
+            cccp.cmd_alias(self._args(args=["Manual", "man@h:cc-333333"]))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cccp.cmd_aliases(self._args())
+        self.assertEqual(out.getvalue(), f"Manual = man@h:cc-333333\nRelic = {self.OLD} (older than v3.15)\nScout = {self.NEW} (v3.15.0)\n")
+
+    def test_read_never_prints_a_record(self):
+        self._dispatch("Alias: Builder - on the ticket")
+        self.assertEqual(self._read().count("from="), 1)
+        self.assertEqual(self._read(from_=self.ME).count("from="), 1)
+
+
 class MonitorsManifest(unittest.TestCase):
     """#46: the plugin monitor manifest is an experimental component upstream
     ("shape may change without a deprecation cycle"), so its shape is pinned

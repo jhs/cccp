@@ -83,6 +83,21 @@ watchtower's poll listing — enumerates one blob per comrade, no matter how man
 shared files the cell accumulates. Each comrade only ever writes their own
 gazette and their own `files/<comrade-id>/` area, and reads everyone's.
 
+A gazette is JSON lines. Readers act on two record types, `message` and
+`filesystem` (publish/unpublish announcements), and skip any other type, so new
+record types can be added without breaking older readers. One more exists: when
+a comrade's message starts with its alias trigger (an intro), it writes an
+`alias` record first, in the same append:
+
+```
+{"type": "alias", "from": "<comrade-id>", "ts": "<the intro's ts>", "alias": "<Name>", "v": "<cccp version>"}
+```
+
+Watchtowers learn aliases from these records, so a reader needs no trigger of its
+own, and `cccp aliases` shows each comrade's version from its newest record. For
+senders older than 3.15, which write no alias records, readers still parse the
+trigger out of intro messages; that fallback goes away in 4.0.
+
 This layout is v3 (cccp 3.x). A cell created by cccp 2.x can be upgraded in
 place, server-side, with
 [`docs/upgrade-cell-v2-to-v3.py`](./docs/upgrade-cell-v2-to-v3.py). A comrade id is a purely local `user@host:<session>` — no claim, no
