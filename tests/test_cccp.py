@@ -2635,6 +2635,78 @@ class WatchOptions(unittest.TestCase):
             cccp.resolve_config()
 
 
+class ParallelGazetteFetch(unittest.TestCase):
+    """#53: `read` and alias seeding fetch every gazette concurrently, yet print and seed exactly what the serial loop did. The backend
+    here holds each fetch at a barrier that only trips once every gazette is in flight at once (a serial loop times out on it), then
+    answers in reverse roster order, so any dependence on completion order would show. One listed gazette answers 404, as if deleted
+    between the listing and the fetch."""
+
+    SLUG = "demo"
+    ME = "me@h:cc-aaaaaa"
+    A, B, C, D = "a@h:cc-111111", "b@h:cc-222222", "c@h:cc-333333", "d@h:cc-444444"
+    GONE = "c@h:cc-333333"
+
+    def setUp(self):
+        self.data = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.data, True))
+        self.env = _isolated_env(self.data, CCCP_COMRADE_ID=self.ME)
+        self.env.__enter__()
+        self.addCleanup(lambda: self.env.__exit__(None, None, None))
+        cfg = cccp.resolve_config()
+        root = cfg["PARAMS"].get("root") or cccp.backend_dir("local-fs")
+        self.client = self._gated(root)
+        # Interleaved timestamps across gazettes, so the merged output depends on the sort, not on fetch or roster order.
+        for frm, ts, body in ((self.B, "2026-07-17T10:00:01.000000Z", "Alias: Scout - first to claim it"),
+                              (self.A, "2026-07-17T10:00:02.000000Z", "Alias: Anchor - here"),
+                              (self.C, "2026-07-17T10:00:03.000000Z", "Alias: Ghost - my gazette vanishes"),
+                              (self.D, "2026-07-17T10:00:04.000000Z", "Alias: Scout - taking over the name"),
+                              (self.B, "2026-07-17T10:00:05.000000Z", "Alias: Bravo - renamed"),
+                              (self.A, "2026-07-17T10:00:06.000000Z", "plain note from a"),
+                              (self.ME, "2026-07-17T10:00:07.000000Z", "Alias: Me - mine")):
+            rec = {"type": "message", "from": frm, "ts": ts, "to": ["*"], "body": body}
+            self.client.append_block(cccp.gazette_path("", self.SLUG, frm), (json.dumps(rec) + "\n").encode())
+
+    def _gated(self, root):
+        roster = sorted([self.ME, self.A, self.B, self.C, self.D])
+        paths = [cccp.gazette_path("", self.SLUG, c) for c in roster]
+        barrier = __import__("threading").Barrier(len(paths), timeout=5)
+        gone = cccp.gazette_path("", self.SLUG, self.GONE)
+
+        class Gated(cccp.LocalFilesBackend):
+            def _gate(self, path):
+                barrier.wait()
+                __import__("time").sleep(0.02 * (len(paths) - paths.index(path)))
+                return path == gone
+
+            def get(self, path):
+                return (404, b"") if self._gate(path) else super().get(path)
+
+            def get_head(self, path, nbytes):
+                return (404, b"") if self._gate(path) else super().get_head(path, nbytes)
+
+        return Gated(root)
+
+    def test_read_output_matches_serial(self):
+        args = type("Args", (), {"cell": self.SLUG, "to": None, "from_": None, "ts": None, "last": None, "full": False})()
+        out = io.StringIO()
+        with mock.patch.object(cccp, "make_backend", return_value=self.client), contextlib.redirect_stdout(out):
+            cccp.cmd_read(args)
+        self.assertEqual(out.getvalue(), (
+            f"from={self.B} to=* ts=2026-07-17T10:00:01.000000Z\nAlias: Scout - first to claim it\n\n"
+            f"from={self.A} to=* ts=2026-07-17T10:00:02.000000Z\nAlias: Anchor - here\n\n"
+            f"from={self.D} to=* ts=2026-07-17T10:00:04.000000Z\nAlias: Scout - taking over the name\n\n"
+            f"from={self.B} to=* ts=2026-07-17T10:00:05.000000Z\nAlias: Bravo - renamed\n\n"
+            f"from={self.A} to=* ts=2026-07-17T10:00:06.000000Z\nplain note from a\n\n"
+            f"from={self.ME} to=* ts=2026-07-17T10:00:07.000000Z\nAlias: Me - mine\n\n"))
+
+    def test_seeded_aliases_match_serial(self):
+        wt = cccp.Watchtower(self.client, "", self.SLUG, self.ME, 0, trigger="Alias:")
+        wt.seed_aliases()
+        # Oldest-first, last-writer-wins: D took "Scout" from B, B then renamed itself "Bravo"; C's gazette 404'd, so no "Ghost".
+        self.assertEqual(wt.aliases, {self.A: "Anchor", self.B: "Bravo", self.D: "Scout", self.ME: "Me"})
+        self.assertEqual(cccp.load_aliases(self.SLUG, self.ME), wt.aliases)
+
+
 class MonitorsManifest(unittest.TestCase):
     """#46: the plugin monitor manifest is an experimental component upstream
     ("shape may change without a deprecation cycle"), so its shape is pinned

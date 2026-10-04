@@ -39,6 +39,7 @@ Subcommands:
 """
 
 import argparse
+import concurrent.futures
 import contextlib
 import email.utils
 import json
@@ -97,6 +98,7 @@ SERVE_ARM_GRACE_SECONDS = 10      # how long `cccp join`/`leave` wait for the se
 IDLE_MAX_SECONDS = 24 * 3600   # cap for the idle backoff - past this, idles fire
                                # at most once a day so a long-silent watchtower
                                # stops forcing Claude to wake and respond
+FETCH_WORKERS = 16   # concurrent gazette fetches in `read` and alias seeding (#53)
 PUBLISH_MAX = 256 * 1024 * 1024   # single-PUT publish ceiling; larger needs staging
 AUTODOWNLOAD_MAX_DEFAULT = "1m"   # watchtower auto-downloads published files at or
                                   # under this size; larger ones are only announced
@@ -605,8 +607,9 @@ class TimeLogger:
     """Context manager that times its block and emits one duration line on
     exit. Inspired by companion/job.py's TimeLogger, pared to the essentials:
     no Start/Finish lines (the duration is the deliverable), no thread-local
-    indent (single-threaded I/O), and `done(**fields)` for post-hoc metadata
-    only knowable inside the block (HTTP status, bytes, response headers).
+    indent (each instance lives on one thread, even under fetch_each's workers),
+    and `done(**fields)` for post-hoc metadata only knowable inside the block
+    (HTTP status, bytes, response headers).
 
     On exception, the duration line still fires with exc=<ExcName>. The
     exception is not suppressed.
@@ -1060,6 +1063,18 @@ def cell_roster(client, prefix, slug):
         if rest.endswith(".jsonl") and "/" not in rest:
             comrades.add(rest[:-len(".jsonl")])
     return sorted(comrades)
+
+
+def fetch_each(fetch, items):
+    """Yield fetch(item) for each item, in the order given, with up to FETCH_WORKERS fetches in flight. A whole-cell `read` or alias
+    seed touches every gazette, so one round trip at a time made it gazettes x latency (#53). Callers parse the results on their own
+    thread; only `fetch` runs on a worker. If one fetch raises, the exception reaches the caller as it did serially, and the queued
+    rest are cancelled rather than drained."""
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=FETCH_WORKERS)
+    try:
+        yield from pool.map(fetch, items)
+    finally:
+        pool.shutdown(cancel_futures=True)
 
 
 # ---------- journals ----------
@@ -1957,6 +1972,7 @@ class Watchtower:
         # My own gazette is included: my intro lands there and nowhere else, so
         # skipping self would resurrect a dead predecessor's mapping from backlog
         # while my own could never be seeded at all (issue #1).
+        fresh = []
         for comrade, props in self._scan().items():
             # A gazette is append-only, so last_modified is the comrade's last
             # word; older than the cutoff means long departed (or long quiet -
@@ -1970,8 +1986,8 @@ class Watchtower:
                         continue
                 except (TypeError, ValueError):
                     pass
-            st, data = self.client.get_head(
-                gazette_path(self.prefix, self.slug, comrade), ALIAS_SEED_BYTES)
+            fresh.append(gazette_path(self.prefix, self.slug, comrade))
+        for st, data in fetch_each(lambda path: self.client.get_head(path, ALIAS_SEED_BYTES), fresh):
             if st not in (200, 206):
                 continue
             for chunk in data.splitlines():
@@ -3401,8 +3417,8 @@ def cmd_read(args):
         senders = resolve_targets(slug, [args.from_]) if args.from_ else \
             cell_roster(client, prefix, slug)
         msgs = []
-        for sender in senders:
-            st, body = client.get(gazette_path(prefix, slug, sender))
+        fetched = fetch_each(client.get, [gazette_path(prefix, slug, sender) for sender in senders])
+        for sender, (st, body) in zip(senders, fetched):
             if st != 200:
                 continue
             for line in body.splitlines():
