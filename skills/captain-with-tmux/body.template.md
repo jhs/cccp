@@ -105,7 +105,7 @@ A re-join re-applies the options in place — nothing restarts, nothing is misse
 
 An Emeritus is a decaying asset, so the successor sets itself a deadline for dealing with one: on joining, it arms an early milestone on its own token watch — `claude-tokens watch --threshold 20 --threshold 50 ...` — as a **forcing point**. When that milestone fires, resolve the Emeritus one of two ways. Don't let it drift past.
 
-- **Kill it — the default.** If it isn't actively adding value: `tmux kill-window -t CaptainEmeritus`. No ceremony and no goodbye dispatch; a quiet comrade is just quiet.
+- **Kill it — the default.** If it isn't actively adding value: `tmux kill-window -t CaptainEmeritus`. No ceremony and no goodbye dispatch; a quiet comrade is just quiet. First re-join with `cccp join <slug> --also <its comrade id>` (the `was_id=` of the alias `reassign` that announced you): comrades who missed your intro still send to its raw id, and once it is gone those messages reach nobody else. They arrive with `to=` still naming it — reply as yourself, so the sender learns your id.
 - **Escalate — the exception.** If it *is* still adding value, it holds something the cell never absorbed. Surface that to your principal instead of quietly leaning on it: a near-full session is itself at risk of exhausting its context and losing what it knows, so how to preserve it is their call, not a dependency to take on silently.
 
 Either way, querying an Emeritus is expensive — each input re-processes its whole context. That cost is the reason for the forcing point.

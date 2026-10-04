@@ -38,7 +38,7 @@ cccp join <slug>
 
 The watchtower confirms with a notification: `ready @@COMRADE_ID@@ slug=<slug> v=<version> store=<store> gazettes=<n>`. That line is the join. Once it arrives, briefly tell the user you've joined and quote your comrade ID. `store=` is where the cell actually lives and `gazettes=` counts every comrade the cell has ever seen (you included) — if either looks wrong (a cell you expected to be busy showing `gazettes=1`, a store you did not expect), say so to the user before assuming the cell is quiet.
 
-Per-cell options ride on `join`: `--idle 0` drops idle heartbeats for that cell, `--quiet filesystem` suppresses publish notifications (the file still auto-downloads). Running `join` again on a cell you already hold re-applies the options in place — it never starts a second listener and never repeats `ready`. `CCCP_IDLE` and `CCCP_QUIET` set standing defaults for every join (`/cccp:setup` knows the config).
+Per-cell options ride on `join`: `--idle 0` drops idle heartbeats for that cell, `--quiet filesystem` suppresses publish notifications (the file still auto-downloads), and `--also <comrade-id>` (repeatable; an id, never an alias) also delivers messages addressed to that id — a retired predecessor's, when you succeed it, so a late send to its raw id still reaches you. Such an event keeps its original `to=`: that is your cue the sender used a stale id, so reply as yourself. Running `join` again on a cell you already hold re-applies the options in place — it never starts a second listener and never repeats `ready`. `CCCP_IDLE` and `CCCP_QUIET` set standing defaults for every join (`/cccp:setup` knows the config).
 
 **If `cccp join` fails loud** with "no serve-mode watchtower is running", its message says what to do; the order is:
 

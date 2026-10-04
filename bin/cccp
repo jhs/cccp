@@ -1632,6 +1632,17 @@ def is_comrade_id(s):
     return "@" in s and ":" in s
 
 
+def also_ids(values):
+    """`--also` (#52): the extra comrade ids a cell's watchtower delivers for - a
+    retired predecessor's, so a late raw-id send still reaches its successor. Ids
+    only: an alias already follows the successor, and a raw id is the one thing
+    a send never re-resolves. Deduplicated, order kept."""
+    bad = [v for v in values if not is_comrade_id(v)]
+    if bad:
+        sys.exit(f"error: --also takes a comrade id (user@host:session), not an alias: {', '.join(bad)}")
+    return list(dict.fromkeys(values))
+
+
 def alias_map_path(slug, me):
     return mirror_dir() / slug / me / "aliases.json"
 
@@ -1841,7 +1852,7 @@ class Watchtower:
 
     def __init__(self, client, prefix, slug, me, idle_initial,
                  idle_max=IDLE_MAX_SECONDS, log=None, quiet=(), trigger=None,
-                 autodownload_max=None, store=None):
+                 autodownload_max=None, store=None, also=()):
         self.client = client
         self.prefix = prefix
         self.slug = slug
@@ -1849,6 +1860,7 @@ class Watchtower:
         self.autodownload_max = (autodownload_max if autodownload_max is not None
                                  else parse_size(AUTODOWNLOAD_MAX_DEFAULT))
         self.me = me
+        self.also = set(also)   # more ids to deliver for, besides me (#52)
         # Alias support is opt-in: with no --alias-trigger, `self.trigger` is None
         # and the whole feature is inert (no seed, no learn, no translation).
         self.trigger = trigger
@@ -2420,7 +2432,10 @@ class Watchtower:
         return out
 
     def _render(self, d):
-        if not addressed_to_me(d.get("to") or ["*"], self.me):
+        to = d.get("to") or ["*"]
+        # A message to an --also id is delivered with its `to=` untouched, so the
+        # reader sees it was meant for a predecessor and replies as itself.
+        if not (addressed_to_me(to, self.me) or self.also.intersection(to)):
             return None
         t = d.get("type")
         if t == "message":
@@ -2664,17 +2679,19 @@ class Serve:
             return
         idle_s = int(rec.get("idle", WATCH_IDLE_DEFAULT_MIN)) * 60
         quiet = [q for q in (rec.get("quiet") or []) if q in QUIET_EVENTS]
+        also = [a for a in (rec.get("also") or []) if is_comrade_id(a)]
         cell = self.cells.get(slug)
         if cell is not None:
             cell.set_idle(idle_s)
             cell.quiet = set(quiet)
+            cell.also = set(also)
             # Re-claim the cell's pid record too. A hand-armed single-cell
             # watchtower on a cell we hold takes the record over at start and
             # removes it on exit, after which wake and `cccp status` no longer
             # see us in the cell; a re-join is the operator's repair.
             cell._write_pidfile()
             self.log.debug(f"ev=cell_rejoin slug={_kv(slug)} idle_s={idle_s} "
-                           f"quiet={_kv(','.join(quiet))}")
+                           f"quiet={_kv(','.join(quiet))} also={_kv(','.join(also))}")
             # The record must describe the cell as held, and the trigger is
             # the one it was joined with - not whatever this re-join carried.
             self._remember(slug, {**rec, "trigger": cell.trigger})
@@ -2682,7 +2699,7 @@ class Serve:
         cell = Watchtower(self.client, self.cfg["PREFIX"], slug, self.me, idle_s,
                           log=self.log, quiet=quiet, trigger=rec.get("trigger"),
                           autodownload_max=self.cfg["AUTODOWNLOAD_MAX"],
-                          store=store_label(self.cfg))
+                          store=store_label(self.cfg), also=also)
         cell._reset_inbox()
         cell._write_pidfile()
         try:
@@ -2749,7 +2766,7 @@ class Serve:
 
     def _remember(self, slug, rec):
         cells = self._recorded_cells()
-        cells[slug] = {k: rec[k] for k in ("slug", "idle", "quiet", "trigger") if k in rec}
+        cells[slug] = {k: rec[k] for k in ("slug", "idle", "quiet", "trigger", "also") if k in rec}
         self._write_cells(cells)
 
     def _forget(self, slug):
@@ -3233,8 +3250,8 @@ def cmd_watchtower(args):
     # with a reason, which is the richer lifecycle record for a long-lived
     # process.
     if args.serve:
-        if args.idle is not None or args.quiet:
-            sys.exit("error: --idle and --quiet are per-cell: pass them to `cccp join`")
+        if args.idle is not None or args.quiet or args.also:
+            sys.exit("error: --idle, --quiet and --also are per-cell: pass them to `cccp join`")
         log = setup_logging(cfg, "_serve", me, sys.argv)
         client.log = log
         Serve(client, cfg, me, log=log).run()
@@ -3246,7 +3263,7 @@ def cmd_watchtower(args):
     Watchtower(client, cfg["PREFIX"], slug, me, idle * 60, log=log,
                quiet=quiet, trigger=cfg["ALIAS_TRIGGER"],
                autodownload_max=cfg["AUTODOWNLOAD_MAX"],
-               store=store_label(cfg)).run()
+               store=store_label(cfg), also=also_ids(args.also)).run()
 
 
 def cmd_join(args):
@@ -3258,6 +3275,7 @@ def cmd_join(args):
     exactly as the same prefix on `cccp watchtower <slug>` did. Idempotent: a
     held cell gets its options re-applied, never a second poller."""
     slug = slugify(args.cell)
+    also = also_ids(args.also)
     me = comrade_id()
     cfg = resolve_config()
     log = setup_logging(cfg, slug, me, sys.argv)
@@ -3266,14 +3284,14 @@ def cmd_join(args):
         idle, quiet = watch_options(cfg, args.idle, args.quiet)
         held = live_watchtower(slug, me) == pid
         rec = {"ev": "join", "slug": slug, "idle": idle, "quiet": quiet,
-               "trigger": cfg["ALIAS_TRIGGER"], "ts": now_iso()}
+               "trigger": cfg["ALIAS_TRIGGER"], "also": also, "ts": now_iso()}
         woke = inbox_send(None, me, [rec])
         log.debug(f"ev=join_sent slug={_kv(slug)} held={held} woke={woke}")
         if not woke:
             sys.exit("error: the serve-mode watchtower exited before the join "
                      "could be delivered - the request was discarded. Run "
                      "`cccp status`, then retry")
-        opts = f"idle={idle}m quiet={','.join(quiet) or 'none'}"
+        opts = f"idle={idle}m quiet={','.join(quiet) or 'none'} also={','.join(also) or 'none'}"
         if held:
             print(f"already joined cell {slug!r}; options re-applied ({opts})")
         else:
@@ -4105,6 +4123,9 @@ def build_parser():
                   "coordination hub passes `--quiet filesystem` to drop redundant "
                   "publish pings when a pointer dispatch already announced the "
                   "file. Default: CCCP_QUIET, else none.")
+    also_help = ("Repeatable. Also deliver messages addressed to this comrade id - a "
+                 "retired predecessor's, so a late send to its raw id still reaches you. "
+                 "The event keeps the original `to=`. Ids only, not aliases.")
     wt = sub.add_parser("watchtower",
                         help="Stream live cell events: one cell, or --serve for the "
                              "session-wide watchtower that holds cells joined with "
@@ -4116,6 +4137,7 @@ def build_parser():
     wt.add_argument("--idle", type=int, default=None, metavar="MIN", help=idle_help)
     wt.add_argument("--quiet", action="append", default=[], choices=list(QUIET_EVENTS),
                     metavar="EVENT", help=quiet_help)
+    wt.add_argument("--also", action="append", default=[], metavar="COMRADE_ID", help=also_help)
     wt.set_defaults(func=cmd_watchtower)
 
     jn = sub.add_parser("join",
@@ -4124,6 +4146,7 @@ def build_parser():
     jn.add_argument("--idle", type=int, default=None, metavar="MIN", help=idle_help)
     jn.add_argument("--quiet", action="append", default=[], choices=list(QUIET_EVENTS),
                     metavar="EVENT", help=quiet_help)
+    jn.add_argument("--also", action="append", default=[], metavar="COMRADE_ID", help=also_help)
     jn.set_defaults(func=cmd_join)
 
     lv = sub.add_parser("leave",

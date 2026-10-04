@@ -163,9 +163,14 @@ export function eventMessage(slug: string, line: string): string {
 	return `CCCP cell event ${slug}: ${line}`;
 }
 
-/** Omit --idle to preserve cccp's default; zero explicitly disables heartbeats. */
-export function watchtowerArgs(cell: string, idleMinutes?: number): string[] {
-	return ["watchtower", cell, ...(idleMinutes === undefined ? [] : ["--idle", String(idleMinutes)])];
+/** Omit --idle to preserve cccp's default; zero explicitly disables heartbeats. One --also per extra comrade id (#52). */
+export function watchtowerArgs(cell: string, idleMinutes?: number, also: readonly string[] = []): string[] {
+	return ["watchtower", cell, ...(idleMinutes === undefined ? [] : ["--idle", String(idleMinutes)]), ...also.flatMap((id) => ["--also", id])];
+}
+
+/** cccp's own test (`is_comrade_id`): an id always carries both '@' and ':', a shell-safe alias never does. */
+export function isComradeId(s: string): boolean {
+	return s.includes("@") && s.includes(":");
 }
 
 /** One live watchtower: the process, the join argument that produced it, and its recent stderr.
@@ -177,6 +182,8 @@ type Tower = {
 	proc: ChildProcess;
 	/** The caller's `idle_minutes`; undefined means "cccp's default", which is not the same as 0. */
 	idleMinutes?: number;
+	/** The caller's `also` ids, for the same reason: a re-armed watchtower must keep hearing a predecessor's id (#52). */
+	also?: string[];
 	stderrTail: string[];
 	/** Set when a session switch kills this watchtower. Its last lines and its death arrive after the next session
 	 *  has started, and belong to the one that ended: without this they read as a fresh "you are deaf" alarm. */
@@ -247,7 +254,15 @@ function emit(stash: Stash, cell: string, out: Outbound): void {
 }
 
 /** A cell this session joined, as recorded for an instance that may have lost the stash. */
-export type JoinedCell = { cell: string; idleMinutes?: number };
+export type JoinedCell = { cell: string; idleMinutes?: number; also?: string[] };
+
+/** One recorded join, read back defensively: a session record or a tool result may predate a field, or be malformed. */
+function readJoinedCell(record: unknown): JoinedCell | undefined {
+	const { cell, idleMinutes, also } = (record ?? {}) as Partial<JoinedCell>;
+	if (typeof cell !== "string") return undefined;
+	const ids = Array.isArray(also) ? also.filter((id): id is string => typeof id === "string") : [];
+	return { cell, idleMinutes: typeof idleMinutes === "number" ? idleMinutes : undefined, ...(ids.length ? { also: ids } : {}) };
+}
 
 /** What the session record had to say about cells this session joined. */
 export type RecordedCells = {
@@ -279,8 +294,8 @@ export function joinedCells(entries: readonly SessionEntry[]): JoinedCell[] {
 	const cells = new Map<string, JoinedCell>();
 	for (const entry of entries) {
 		if (entry.type !== "message" || entry.message.role !== "toolResult" || entry.message.toolName !== "cccp_join") continue;
-		const { cell, idleMinutes } = (entry.message.details ?? {}) as Partial<JoinedCell>;
-		if (typeof cell === "string") cells.set(cell, { cell, idleMinutes: typeof idleMinutes === "number" ? idleMinutes : undefined });
+		const joined = readJoinedCell(entry.message.details);
+		if (joined) cells.set(joined.cell, joined);
 	}
 	return [...cells.values()];
 }
@@ -302,12 +317,9 @@ function takeOrphanedCells(pi: ExtensionAPI, entries: readonly { type: string; c
 		const recorded = Array.isArray(cells) ? cells : [];
 		const taken: RecordedCells = { cells: [], unreadable: [] };
 		for (const record of recorded) {
-			const { cell, idleMinutes } = (record ?? {}) as JoinedCell;
-			if (typeof cell !== "string") {
-				taken.unreadable.push(record);
-				continue;
-			}
-			taken.cells.push({ cell, idleMinutes: typeof idleMinutes === "number" ? idleMinutes : undefined });
+			const joined = readJoinedCell(record);
+			if (joined) taken.cells.push(joined);
+			else taken.unreadable.push(record);
 		}
 		if (recorded.length > 0) pi.appendEntry(ORPHAN_ENTRY, { cells: [] });
 		return taken;
@@ -434,7 +446,7 @@ export default function (pi: ExtensionAPI) {
 			// record is written anyway — it is the only way an instance that comes up WITHOUT this stash can
 			// tell "never joined" from "joined and now deaf", and it is tombstoned unread on the fast path.
 			if (stash.towers.size > 0) {
-				const joined: JoinedCell[] = [...stash.towers.entries()].map(([cell, tower]) => ({ cell, idleMinutes: tower.idleMinutes }));
+				const joined: JoinedCell[] = [...stash.towers.entries()].map(([cell, tower]) => ({ cell, idleMinutes: tower.idleMinutes, also: tower.also }));
 				log("INFO", `Hold watchtowers across the reload: ${JSON.stringify(joined)}`);
 				try {
 					pi.appendEntry(ORPHAN_ENTRY, { cells: joined });
@@ -467,11 +479,25 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({
 			cell: Type.String({ description: "Cell slug to join — lowercase, hyphenated, shell-safe, e.g. 'demo-cell'" }),
 			idle_minutes: Type.Optional(Type.Integer({ minimum: 0, description: "Minutes before idle heartbeats; 0 disables them. Omit for cccp's default." })),
+			also: Type.Optional(
+				Type.Array(Type.String({ description: "A comrade id (user@host:session), never an alias" }), {
+					description:
+						"Also receive messages addressed to these comrade ids — a retired predecessor's, when you succeed it, so a late send to its raw id still reaches you. The event keeps the original `to=`; reply as yourself.",
+				}),
+			),
 		}),
-		async execute(_toolCallId: string, params: { cell: string; idle_minutes?: number }) {
+		async execute(_toolCallId: string, params: { cell: string; idle_minutes?: number; also?: string[] }) {
 			const cell = params.cell;
-			if (stash.towers.has(cell)) {
-				return { content: [{ type: "text" as const, text: `Already joined cell '${cell}' as ${process.env.CCCP_COMRADE_ID}` }], details: { cell } as JoinedCell };
+			const tower = stash.towers.get(cell);
+			if (tower) {
+				// The tower's own settings, not this call's: joinedCells reads the newest result, and a re-arm must restore what is running.
+				const text = `Already joined cell '${cell}' as ${process.env.CCCP_COMRADE_ID}`;
+				return { content: [{ type: "text" as const, text }], details: { cell, idleMinutes: tower.idleMinutes, also: tower.also } as JoinedCell };
+			}
+			const aliases = (params.also ?? []).filter((id) => !isComradeId(id));
+			if (aliases.length > 0) {
+				const text = `Cannot join cell '${cell}': 'also' takes comrade ids (user@host:session), not aliases: ${aliases.join(", ")}`;
+				return { content: [{ type: "text" as const, text }], details: { cell, error: text } };
 			}
 			// Normally a no-op after session_start; re-checking keeps join loud when the environment is broken.
 			const res = resolveEnvironment(sessionId);
@@ -480,11 +506,11 @@ export default function (pi: ExtensionAPI) {
 				return { content: [{ type: "text" as const, text: `Cannot join cell '${cell}': ${res.problem}. Tell the user; joining needs a corrected environment.` }], details: { cell } };
 			}
 			log("INFO", `Join cell ${cell} as comrade: ${process.env.CCCP_COMRADE_ID}`);
-			armWatchtower(cell, params.idle_minutes);
+			armWatchtower(cell, params.idle_minutes, params.also);
 			return {
 				content: [{ type: "text" as const, text: `Joined cell '${cell}' as ${process.env.CCCP_COMRADE_ID}. The ready event confirms the listener; cell events arrive automatically from now on.` }],
-				// The idle setting rides in the session so a re-arm after a hard death restores it (see joinedCells).
-				details: { cell, idleMinutes: params.idle_minutes },
+				// The idle setting and --also ids ride in the session so a re-arm after a hard death restores them (see joinedCells).
+				details: { cell, idleMinutes: params.idle_minutes, also: params.also },
 			};
 		},
 	});
@@ -524,9 +550,9 @@ export default function (pi: ExtensionAPI) {
 		log("WARN", `The reload lost the watchtower stash, re-arm from the session record: ${JSON.stringify(recorded.cells)}`);
 		const armed: string[] = [];
 		const failed: { cell: string; reason: string }[] = [];
-		for (const { cell, idleMinutes } of recorded.cells) {
+		for (const { cell, idleMinutes, also } of recorded.cells) {
 			try {
-				armWatchtower(cell, idleMinutes);
+				armWatchtower(cell, idleMinutes, also);
 				armed.push(cell);
 			} catch (e) {
 				const reason = e instanceof Error ? e.message : String(e);
@@ -573,10 +599,10 @@ export default function (pi: ExtensionAPI) {
 		log("WARN", `The previous process died with its watchtowers, re-arm them: ${JSON.stringify(stale)}`);
 		const armed: string[] = [];
 		const failed: { cell: string; reason: string }[] = [];
-		for (const { cell, idleMinutes } of stale) {
+		for (const { cell, idleMinutes, also } of stale) {
 			if (stash.towers.has(cell)) continue;
 			try {
-				armWatchtower(cell, idleMinutes);
+				armWatchtower(cell, idleMinutes, also);
 				armed.push(cell);
 			} catch (e) {
 				const reason = e instanceof Error ? e.message : String(e);
@@ -613,8 +639,8 @@ export default function (pi: ExtensionAPI) {
 	 *  Nothing attached here may capture `pi`. The readers outlive every extension instance, so they route
 	 *  through `emit` and the stash's sink instead — that indirection IS the #33 guard, and it is what makes
 	 *  a reload survivable without detaching and re-attaching anything. */
-	function armWatchtower(cell: string, idleMinutes?: number): void {
-		const tower: Tower = { proc: spawn(CCCP, watchtowerArgs(cell, idleMinutes), { stdio: ["ignore", "pipe", "pipe"] }), idleMinutes, stderrTail: [] };
+	function armWatchtower(cell: string, idleMinutes?: number, also?: string[]): void {
+		const tower: Tower = { proc: spawn(CCCP, watchtowerArgs(cell, idleMinutes, also), { stdio: ["ignore", "pipe", "pipe"] }), idleMinutes, also, stderrTail: [] };
 		const proc = tower.proc;
 		stash.towers.set(cell, tower);
 		readline.createInterface({ input: proc.stdout! }).on("line", (line) => {
@@ -674,11 +700,16 @@ export default function (pi: ExtensionAPI) {
 		name: "cccp_dispatch",
 		label: "CCCP Dispatch",
 		description:
-			"Send a message to a joined CCCP cell (join with cccp_join first). Set 'to' with recipient comrade ids (like user@host:cc-abc123) for a targeted message — the normal case. Omit 'to' only for a true cell-wide broadcast.",
+			"Send a message to a joined CCCP cell (join with cccp_join first). Set 'to' for a targeted message — the normal case — preferring each recipient's alias over its raw comrade id. Omit 'to' only for a true cell-wide broadcast.",
 		parameters: Type.Object({
 			cell: Type.String({ description: "Cell slug to send to — one this session has joined" }),
 			message: Type.String({ description: "Message body, plain text; multi-line is fine" }),
-			to: Type.Optional(Type.Array(Type.String({ description: "Recipient comrade id" }), { description: "Recipient comrade ids; omit to broadcast" })),
+			to: Type.Optional(
+				Type.Array(Type.String({ description: "Recipient alias (e.g. 'Captain'), or a comrade id (user@host:cc-abc123) for one with no alias" }), {
+					description:
+						"Recipients; omit to broadcast. Prefer aliases: an alias follows a role to its successor, while a raw comrade id stays with one session and goes unread once that session retires.",
+				}),
+			),
 		}),
 		async execute(_toolCallId: string, params: { cell: string; message: string; to?: string[] }) {
 			if (!stash.towers.has(params.cell)) {

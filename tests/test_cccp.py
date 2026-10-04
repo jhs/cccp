@@ -2504,6 +2504,48 @@ class ServeMembership(unittest.TestCase):
         self._join("b")
         self.assertEqual(self.serve.cells["b"].idle_initial, cccp.WATCH_IDLE_DEFAULT_MIN * 60)
 
+    OLD = "me@h:oooooo"     # a retired predecessor whose id a late sender still uses (#52)
+    THIRD = "carol@h:cccccc"
+
+    def _say_to(self, slug, to, body):
+        self.client.append(cccp.gazette_path("", slug, self.BOB),
+                           {"type": "message", "from": self.BOB, "ts": "2026-09-16T00:00:00.000000Z", "to": to, "body": body})
+
+    def _messages(self):
+        return [l for l in self.lines if l.startswith("message ")]
+
+    def test_also_delivers_a_message_to_a_retired_id_with_its_raw_to(self):
+        self._join("a", also=[self.OLD])
+        self._say_to("a", [self.OLD], "late for the predecessor")
+        self._tick_all()
+        msgs = self._messages()
+        self.assertEqual(len(msgs), 1)
+        self.assertIn(f"to={self.OLD} ", msgs[0], "the reader must see the message was misrouted, not to=you")
+        self.assertIn('body="late for the predecessor"', msgs[0])
+
+    def test_also_does_not_deliver_to_an_unlisted_id(self):
+        self._join("a", also=[self.OLD])
+        self._say_to("a", [self.THIRD], "not for us")
+        self._tick_all()
+        self.assertEqual(self._messages(), [])
+
+    def test_rejoin_reapplies_the_also_set_in_place(self):
+        self._join("a", also=[self.OLD])
+        self._join("a", also=[self.THIRD])
+        self.assertEqual(len([l for l in self.lines if l.startswith("ready ")]), 1)
+        self._say_to("a", [self.OLD], "dropped from the set")
+        self._say_to("a", [self.THIRD], "added to the set")
+        self._tick_all()
+        msgs = self._messages()
+        self.assertEqual(len(msgs), 1)
+        self.assertIn('body="added to the set"', msgs[0])
+        self.assertEqual(json.loads(cccp.cells_path(self.ME).read_text())["a"]["also"], [self.THIRD],
+                         "a successor serve process must rejoin with the current set")
+
+    def test_also_drops_anything_but_a_comrade_id(self):
+        self._join("a", also=[self.OLD, "Captain"])
+        self.assertEqual(self.serve.cells["a"].also, {self.OLD})
+
 
 class ServeLifecycle(unittest.TestCase):
     """The serve process's own records: what a successor for the same session
@@ -2599,13 +2641,42 @@ class ServeLifecycle(unittest.TestCase):
     def test_join_fails_loud_when_the_wake_finds_nobody(self):
         """The serve process can exit between require_serve's check and the
         signal; a discarded join must never print success."""
-        args = mock.Mock(cell="demo", idle=None, quiet=[])
+        args = mock.Mock(cell="demo", idle=None, quiet=[], also=[])
         with mock.patch.object(cccp, "comrade_id", return_value=self.ME), \
              mock.patch.object(cccp, "require_serve", return_value=4242), \
              mock.patch.object(cccp, "inbox_send", return_value=0), \
              self.assertRaises(SystemExit) as cm:
             cccp.cmd_join(args)
         self.assertIn("discarded", str(cm.exception))
+
+    def test_join_carries_also_in_its_inbox_record(self):
+        old = "me@h:oooooo"
+        args = cccp.build_parser().parse_args(["join", "demo", "--also", old, "--also", old])
+        with mock.patch.object(cccp, "comrade_id", return_value=self.ME), \
+             mock.patch.object(cccp, "require_serve", return_value=4242), \
+             mock.patch.object(cccp, "inbox_send", return_value=1) as send, \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            cccp.cmd_join(args)
+        self.assertEqual(send.call_args.args[2][0]["also"], [old])
+        self.assertIn(f"also={old}", out.getvalue())
+
+    def test_join_refuses_an_alias_as_also(self):
+        args = cccp.build_parser().parse_args(["join", "demo", "--also", "Captain"])
+        with mock.patch.object(cccp, "comrade_id", return_value=self.ME), \
+             mock.patch.object(cccp, "inbox_send") as send, \
+             self.assertRaises(SystemExit) as cm:
+            cccp.cmd_join(args)
+        self.assertIn("comrade id", str(cm.exception))
+        send.assert_not_called()
+
+    def test_single_cell_watchtower_takes_also_and_serve_refuses_it(self):
+        args = cccp.build_parser().parse_args(["watchtower", "demo", "--also", "me@h:oooooo"])
+        self.assertEqual(args.also, ["me@h:oooooo"])
+        args = cccp.build_parser().parse_args(["watchtower", "--serve", "--also", "me@h:oooooo"])
+        with mock.patch.object(cccp.sys, "argv", ["cccp", "watchtower", "--serve", "--", self.ME]), \
+             self.assertRaises(SystemExit) as cm:
+            cccp.cmd_watchtower(args)
+        self.assertIn("per-cell", str(cm.exception))
 
     def test_require_serve_fails_loud_with_the_way_out(self):
         with self.assertRaises(SystemExit) as cm:

@@ -296,7 +296,8 @@ class EventSurface(unittest.TestCase):
             '  console.log(JSON.stringify({'
             '    event: m.eventMessage("second-cell", "idle quiet=30m"),'
             '    defaultArgs: m.watchtowerArgs("second-cell"),'
-            '    disabledArgs: m.watchtowerArgs("second-cell", 0)'
+            '    disabledArgs: m.watchtowerArgs("second-cell", 0),'
+            '    alsoArgs: m.watchtowerArgs("second-cell", undefined, ["me@h:pi-aaaaaa", "me@h:pi-bbbbbb"])'
             '  }));'
             '}, e => { console.error(e.message); process.exit(1); });'
         )
@@ -331,6 +332,11 @@ class EventSurface(unittest.TestCase):
         self.assertEqual(out["defaultArgs"], ["watchtower", "second-cell"],
                          "omitting idle_minutes must leave cccp's own default in force")
         self.assertEqual(out["disabledArgs"], ["watchtower", "second-cell", "--idle", "0"])
+
+    def test_also_ids_reach_the_watchtower_one_flag_each(self):
+        """#52: a successor hears messages still sent to its predecessor's raw id."""
+        out = self._extension_values()
+        self.assertEqual(out["alsoArgs"], ["watchtower", "second-cell", "--also", "me@h:pi-aaaaaa", "--also", "me@h:pi-bbbbbb"])
 
 
 class ReloadSurvival(unittest.TestCase):
@@ -514,6 +520,7 @@ class SurviveReload(unittest.TestCase):
         self.assertIn("idleMinutes", reload_branch,
                       "the record must carry each cell's idle setting, or a fallback re-arm silently "
                       "restores heartbeats the comrade had disabled (#38)")
+        self.assertIn("also", reload_branch, "and its --also ids, or a fallback re-arm stops hearing the predecessor's id (#52)")
 
     def test_the_record_is_taken_on_every_start_whatever_the_reason(self):
         start = self._start()
@@ -605,8 +612,8 @@ class SurviveReload(unittest.TestCase):
         self.assertEqual(self.src.count("spawn(CCCP"), 1,
                          "exactly one place may spawn a watchtower, so join and re-arm cannot disagree")
         arm = re.search(r'function armWatchtower.*?\n\t\}', self.src, re.DOTALL).group(0)
-        self.assertIn("watchtowerArgs(cell, idleMinutes)", arm,
-                      "the shared spawn must pass the recorded idle setting through")
+        self.assertIn("watchtowerArgs(cell, idleMinutes, also)", arm,
+                      "the shared spawn must pass the recorded idle setting and --also ids through")
 
     def test_a_watchtower_that_cannot_spawn_is_never_an_uncaught_error(self):
         """An unhandled `error` event on a ChildProcess is thrown, and a throw in an async callback is
@@ -643,16 +650,33 @@ class SurviveHardDeath(unittest.TestCase):
             'const tr = (toolName, details) => ({ type: "message", message: { role: "toolResult", toolName, details } });'
             'console.log(JSON.stringify(joinedCells(['
             '  tr("cccp_join", { cell: "a" }), tr("cccp_dispatch", { cell: "x" }), { type: "custom", customType: "cccp-cells-orphaned" },'
-            '  tr("cccp_join", { cell: "a", idleMinutes: 0 }), tr("cccp_join", { cell: "b" }), tr("cccp_join", {})])));'
+            '  tr("cccp_join", { cell: "a", idleMinutes: 0 }), tr("cccp_join", { cell: "b" }), tr("cccp_join", {}),'
+            '  tr("cccp_join", { cell: "c", also: ["me@h:pi-aaaaaa", 7] })])));'
         )
         r = subprocess.run(["node", "--no-warnings", "--input-type=module", "-e", script], cwd=REPO, capture_output=True, text=True, timeout=60)
         self.assertEqual(r.returncode, 0, f"node failed:\n{r.stderr}")
-        self.assertEqual(json.loads(r.stdout.strip().splitlines()[-1]), [{"cell": "a", "idleMinutes": 0}, {"cell": "b"}],
+        self.assertEqual(json.loads(r.stdout.strip().splitlines()[-1]), [{"cell": "a", "idleMinutes": 0}, {"cell": "b"}, {"cell": "c", "also": ["me@h:pi-aaaaaa"]}],
                          "one entry per cell, the newest idle setting winning, and nothing from other tools")
 
     def test_join_records_its_idle_setting_in_the_session(self):
-        self.assertIn("details: { cell, idleMinutes: params.idle_minutes }", self.src,
-                      "a re-arm after a hard death can only restore the idle setting the join recorded")
+        self.assertIn("details: { cell, idleMinutes: params.idle_minutes, also: params.also }", self.src,
+                      "a re-arm after a hard death can only restore the idle setting and --also ids the join recorded")
+
+    def test_an_already_joined_result_records_what_the_tower_holds(self):
+        """joinedCells takes the NEWEST cccp_join result per cell, so an `Already joined` result with a bare cell
+        would make a later re-arm forget the idle setting and --also ids the tower was armed with."""
+        self.assertRegex(self.src, r"(?s)Already joined cell.{0,300}?details: \{ cell, idleMinutes: tower\.idleMinutes, also: tower\.also \}")
+
+    def test_join_refuses_an_alias_as_also(self):
+        m = re.search(r'name: "cccp_join".*?\n\t\}\);', self.src, re.DOTALL)
+        self.assertIsNotNone(m, "the cccp_join tool moved; re-point this test")
+        self.assertIn("isComradeId", m.group(0), "an alias in `also` must be refused at the join, not by a watchtower that then dies")
+
+    def test_dispatch_prefers_aliases_over_raw_ids(self):
+        """#52: every traced late misroute addressed a retired seat's raw id; an alias follows the seat."""
+        m = re.search(r'name: "cccp_dispatch".*?parameters: Type\.Object\(\{.*?\}\),', self.src, re.DOTALL)
+        self.assertIsNotNone(m, "the cccp_dispatch tool moved; re-point this test")
+        self.assertRegex(m.group(0), r"(?i)prefer[^.]*alias", "the `to` schema must steer the model to aliases first")
 
     def test_every_start_but_a_reload_checks_for_a_hard_death(self):
         start = self._start()

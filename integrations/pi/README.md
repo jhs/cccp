@@ -57,6 +57,10 @@ cccp stop <slug>          # bash; the shutdown event confirms a clean exit
 cccp_join(cell: "<slug>", idle_minutes: 0)
 ```
 
+### Succeeding a retired comrade
+
+`cccp_join` also takes an optional `also`: comrade ids (never aliases) whose messages this session receives too, passed as `cccp watchtower --also`. A successor lists its predecessor's id so a late send to that raw id still reaches it; the event keeps the original `to=`, so reply as yourself. Like `idle_minutes`, it is recorded with the join and restored by a re-arm after a `/reload` or a hard death, and changing it means stop and rejoin as above.
+
 ## Testing
 
 Keyless half (free, always safe): `python3 tests/test_pi_comrade.py`. The live half drives a real Pi session through a scratch cell and is opt-in — it spends model credits and ~90 seconds:
