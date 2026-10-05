@@ -117,7 +117,11 @@ export type EnvResolution = {
 	problem: string | null;
 };
 
-/** Fill in every derivable env var (idempotent, explicit env always wins). Runs at session_start. */
+/** Fill in every derivable env var (idempotent, explicit env always wins). Runs at session_start.
+ *
+ *  The comrade id is the exception to "already set means leave it": this process set it for an earlier session, so an
+ *  in-process `/new`, `/resume` or `/fork` re-derives it from the current session (#59). Only an id the user exported
+ *  before pi started is kept, and that fact lives on the stash because module scope does not survive `/reload`. */
 export function resolveEnvironment(sessionId: string | undefined): EnvResolution {
 	let created: string | null = null;
 	if (!process.env.CCCP_PLUGIN_DATA) {
@@ -141,7 +145,7 @@ export function resolveEnvironment(sessionId: string | undefined): EnvResolution
 			process.env.CCCP_PLUGIN_DATA = piDir;
 		}
 	}
-	if (!process.env.CCCP_COMRADE_ID) {
+	if (!getStash().userComradeId) {
 		// Pi session ids are UUIDv7 (time-ordered): the leading hex is a timestamp,
 		// so sibling sessions started close together share the same first-6 prefix.
 		// Take the LAST 6 hex (the random tail) to avoid collisions.
@@ -220,6 +224,8 @@ type Stash = {
 	/** Set when the session ends, so emissions are dropped rather than buffered for a successor that may never
 	 *  come. Cleared when one does: `new`, `resume` and `fork` start a successor in the same process (#50). */
 	closed: boolean;
+	/** CCCP_COMRADE_ID as the user exported it before pi started, else undefined: read once per process (#59). */
+	userComradeId: string | undefined;
 };
 
 /** Namespaced because `globalThis` is shared with the whole Pi runtime and every other extension. */
@@ -229,7 +235,7 @@ function getStash(): Stash {
 	const g = globalThis as Record<string, unknown>;
 	let stash = g[STASH_KEY] as Stash | undefined;
 	if (!stash) {
-		stash = { towers: new Map(), sink: null, pending: [], closed: false };
+		stash = { towers: new Map(), sink: null, pending: [], closed: false, userComradeId: process.env.CCCP_COMRADE_ID };
 		g[STASH_KEY] = stash;
 	}
 	return stash;

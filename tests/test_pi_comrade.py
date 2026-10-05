@@ -234,6 +234,33 @@ class EnvSurface(unittest.TestCase):
         self.assertRegex(out["id"], r"^[^@\s]+@[^:\s]+:pi-444444$")
         self.assertEqual(out["pathHead"], str(REPO / "bin"))
 
+    def _ids_across_sessions(self, preset):
+        """The comrade id after each of two session starts in ONE process: an in-process /new, /resume or /fork (#59)."""
+        script = (
+            'import("./integrations/pi/cccp-comrade.ts").then(m => {'
+            '  m.resolveEnvironment("abcdef99-1111-2222-3333-444444444444"); const first = process.env.CCCP_COMRADE_ID;'
+            '  m.resolveEnvironment("abcdef99-1111-2222-3333-555555555555"); const second = process.env.CCCP_COMRADE_ID;'
+            '  console.log(JSON.stringify({first, second}));'
+            '}, e => { console.error(e.message); process.exit(1); });'
+        )
+        with tempfile.TemporaryDirectory() as td:
+            env = {k: v for k, v in os.environ.items() if k != "CCCP_COMRADE_ID"}
+            env["CCCP_PLUGIN_DATA"] = td
+            if preset:
+                env["CCCP_COMRADE_ID"] = preset
+            r = subprocess.run(["node", "--no-warnings", "-e", script], cwd=REPO, env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, f"node failed:\n{r.stderr}")
+        return json.loads(r.stdout.strip().splitlines()[-1])
+
+    def test_a_new_session_in_the_same_process_gets_its_own_id(self):
+        out = self._ids_across_sessions(None)
+        self.assertRegex(out["first"], r":pi-444444$")
+        self.assertRegex(out["second"], r":pi-555555$", "a session switch must not keep the previous session's identity")
+
+    def test_an_id_the_user_exported_is_kept_across_sessions(self):
+        out = self._ids_across_sessions("me@box:pinned")
+        self.assertEqual(out, {"first": "me@box:pinned", "second": "me@box:pinned"})
+
     def test_data_dir_auto_creation_on_claude_less_machine(self):
         """No CCCP_PLUGIN_DATA, no Claude plugin data dir => resolveEnvironment
         creates ~/.pi/cccp (HOME-scoped), exports it, and reports the creation
