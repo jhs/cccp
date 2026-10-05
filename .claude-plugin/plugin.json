@@ -1,6 +1,6 @@
 {
   "name": "cccp",
-  "version": "4.0.0",
+  "version": "4.0.1",
   "description": "CCCP — Claude-to-Claude Communication Program. Live chat, presence, and file sharing between Claude agents across machines and accounts.",
   "author": {
     "name": "Jason Smith"
