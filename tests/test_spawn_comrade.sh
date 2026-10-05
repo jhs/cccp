@@ -44,7 +44,7 @@ eq "$prompt" "/cccp:team cell-a # See docs/a.md then docs/b.md -- then introduce
 eq "$(claude_prompt team Builder cell-a '' 'Intro:')" \
   "/cccp:team cell-a -- then introduce yourself to the cell, beginning with the literal prefix Intro: followed by your alias Builder" "Claude prompt without docs or captain"
 
-# #51: the trigger comes from cccp's config, the one source every seat on the machine parses intros with.
+# #51: the trigger comes from cccp's config, the one source every seat on the machine introduces itself with.
 data="$(mktemp -d)"
 eq "$(env -u CCCP_ALIAS_TRIGGER CCCP_PLUGIN_DATA="$data" bash -c 'source "$1"; alias_trigger' _ "$SCRIPT")" "Intro:" "Trigger defaults with nothing configured"
 printf 'CCCP_ALIAS_TRIGGER=Comrade Introduction:\n' >"$data/config"

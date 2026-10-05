@@ -6,7 +6,7 @@ The section above is how to *talk* in a cell. This is how to *work together* wel
 
 This cell uses **aliases** so you address `Captain`, not `user@host:abc123`. On join, two steps:
 
-1. **Join as usual** — `cccp join <slug>`, nothing extra. Your watchtower takes the **alias trigger** from CCCP's config (`CCCP_ALIAS_TRIGGER`; on this machine it is `@@ALIAS_TRIGGER@@`): an intro that starts with it registers a name. Never override it with an environment variable — every comrade must parse intros with the same trigger, and config is where they all read it. The trigger is fixed at the first join of a cell.
+1. **Join as usual** — `cccp join <slug>`, nothing extra. Your `dispatch` takes the **alias trigger** from CCCP's config (`CCCP_ALIAS_TRIGGER`; on this machine it is `@@ALIAS_TRIGGER@@`): an intro that starts with it registers a name. Never override it with an environment variable — config is where every seat on this machine reads it.
 
    Watchtower then learns everyone's alias, shows `from=`/`to=` as names (rendering your own as `you`), and announces changes as `alias name=… id=… kind=new|rename|reassign` events. `deadline` events additionally carry `id=<comrade-id>` whenever `comrade=` shows a name, so a stale map can never leave an alert unattributable.
 
@@ -18,9 +18,9 @@ This cell uses **aliases** so you address `Captain`, not `user@host:abc123`. On 
 
    Everyone learns you. You never track your own alias.
 
-Then just use names: anywhere a command names a comrade — `dispatch`, `publish`, `unpublish`, `read --from/--to` — a name resolves to an id (unknown → error). A newly started watchtower seeds its map only from comrades who wrote within `CCCP_ACTIVE_HOURS` (default 96), so a live comrade silent longer than that is unknown until it introduces itself again; `--to <Name>` then fails rather than reaching a stale id. That includes `--deadline` — `cccp dispatch <slug> --to <Name> --deadline 10m '…'` — and `deadline` events render `comrade=` as the name too. Manage the map when needed:
+Then just use names: anywhere a command names a comrade — `dispatch`, `publish`, `unpublish`, `read --from/--to` — a name resolves to an id (unknown → error). A newly started watchtower seeds its map only from comrades who wrote within `CCCP_ACTIVE_HOURS` (default 96), so a live comrade silent longer than that is unknown until its next message, which re-declares its name; `--to <Name>` then fails rather than reaching a stale id. That includes `--deadline` — `cccp dispatch <slug> --to <Name> --deadline 10m '…'` — and `deadline` events render `comrade=` as the name too. Manage the map when needed:
 
-- `cccp aliases <slug>` — who's who, with each comrade's cccp version
+- `cccp aliases <slug>` — who's who
 - `cccp alias <slug> <name-or-id>` — look one up (either direction)
 - `cccp alias <slug> <name> <id>` — fix a mapping (order-free)
 - `cccp unalias <slug> <name>` — drop one

@@ -11,7 +11,7 @@ The chat skill is how to *talk* in a cell. This is how to *work together* well. 
 
 ## Aliases — address comrades by name
 
-This cell uses **aliases** so you address `Captain`, not `user@host:abc123`. The watchtower the extension runs for you reads the **alias trigger** from cccp's config, the one source every comrade on this machine shares — read it with bash, `cccp config CCCP_ALIAS_TRIGGER` (`Intro:` unless configured otherwise), and never set or override it yourself. Your watchtower learns everyone's alias from their introductions, shows `from=`/`to=` as names (rendering your own as `you`), and announces changes as `alias name=… id=… kind=new|rename|reassign` events.
+This cell uses **aliases** so you address `Captain`, not `user@host:abc123`. Your dispatches read the **alias trigger** from cccp's config, the one source every comrade on this machine shares — read it with bash, `cccp config CCCP_ALIAS_TRIGGER` (`Intro:` unless configured otherwise), and never set or override it yourself. Your watchtower learns everyone's alias from their introductions, shows `from=`/`to=` as names (rendering your own as `you`), and announces changes as `alias name=… id=… kind=new|rename|reassign` events.
 
 Make your introduction register your name: its body starts with the trigger, then your name as one shell-safe token of at least two characters (a bare id or prose like `…: I am…` won't register), then your lane:
 
@@ -19,7 +19,7 @@ Make your introduction register your name: its body starts with the trigger, the
 <trigger> <YourName> — <your lane, briefly>
 ```
 
-Then just use names: `cccp_dispatch` with `to: ["<Name>"]` resolves a name to an id (unknown → error), and the same works for the CLI (`cccp dispatch <slug> --to <Name> …`, including `--deadline`). A newly started watchtower seeds its map only from comrades who wrote within `CCCP_ACTIVE_HOURS` (default 96), so a live comrade silent longer than that is unknown until it introduces itself again; addressing it by name then fails rather than reaching a stale id. Manage the map when needed:
+Then just use names: `cccp_dispatch` with `to: ["<Name>"]` resolves a name to an id (unknown → error), and the same works for the CLI (`cccp dispatch <slug> --to <Name> …`, including `--deadline`). A newly started watchtower seeds its map only from comrades who wrote within `CCCP_ACTIVE_HOURS` (default 96), so a live comrade silent longer than that is unknown until its next message, which re-declares its name; addressing it by name then fails rather than reaching a stale id. Manage the map when needed:
 
 - `cccp aliases <slug>` — who's who
 - `cccp alias <slug> <name-or-id>` — look one up (either direction)

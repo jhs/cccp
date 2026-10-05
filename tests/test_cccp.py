@@ -468,7 +468,7 @@ class Aliases(unittest.TestCase):
         self.assertIn("unknown alias", err)
 
     def test_watchtower_translates_metadata_only(self):
-        wt = cccp.Watchtower(None, "p", "demo", "me@h:mmm", 0, trigger="Alias:")
+        wt = cccp.Watchtower(None, "p", "demo", "me@h:mmm", 0)
         wt.aliases = {"u@h:bbb": "Bob"}
         d = {"type": "message", "from": "u@h:bbb",
              "ts": "2026-01-01T00:00:00.000000Z",
@@ -479,10 +479,20 @@ class Aliases(unittest.TestCase):
         self.assertIn("u@h:ccc", out)           # unknown -> raw id
         self.assertIn("u@h:bbb in the body stays", out)  # body untouched
 
-    def test_watchtower_aliased_is_noop_when_off(self):
-        wt = cccp.Watchtower(None, "p", "demo", "me@h:mmm", 0)   # no trigger
+    def test_watchtower_aliased_is_noop_with_no_aliases(self):
+        wt = cccp.Watchtower(None, "p", "demo", "me@h:mmm", 0)
         d = {"type": "message", "from": "u@h:bbb", "to": ["*"], "body": "hi"}
         self.assertIs(wt._aliased(d), d)        # empty map -> same object, no work
+
+
+class _Clock:
+    """Pins cccp.utc_today, the one clock the day layout reads (#57), for the rest of a test. Set `.day` ('YYYY-MM-DD') to move it."""
+
+    def __init__(self, test, day):
+        self.day = day
+        patch = mock.patch.object(cccp, "utc_today", lambda: cccp.datetime.strptime(self.day, "%Y-%m-%d").date(), create=True)
+        patch.start()
+        test.addCleanup(patch.stop)
 
 
 class _FakeBlobClient:
@@ -614,7 +624,7 @@ class AzureListPagination(unittest.TestCase):
 
 
 class SelfAliasLearning(unittest.TestCase):
-    """Issue #1: an armed watchtower must learn its OWN comrade's intro - the
+    """Issue #1: a watchtower must learn its OWN comrade's intro - the
     declaring comrade appends to its own gazette, so skipping self entirely made
     self-aliases structurally unregistrable (and stale predecessors immortal).
     Own dispatches must still never echo back as events."""
@@ -635,13 +645,12 @@ class SelfAliasLearning(unittest.TestCase):
     def _gazette(self, comrade):
         return cccp.gazette_path("", self.SLUG, comrade)
 
-    def _intro(self, frm, alias, ts):
-        return {"type": "message", "from": frm, "ts": ts, "to": ["*"],
-                "body": f"Alias: {alias} — reporting"}
+    def _intro(self, path, frm, alias, ts):
+        self.client.append(path, {"type": "alias", "from": frm, "ts": ts, "alias": alias})
+        self.client.append(path, {"type": "message", "from": frm, "ts": ts, "to": ["*"], "body": f"Alias: {alias} — reporting"})
 
-    def _watchtower(self, trigger="Alias:"):
-        wt = cccp.Watchtower(self.client, "", self.SLUG, self.ME, 0,
-                             trigger=trigger)
+    def _watchtower(self):
+        wt = cccp.Watchtower(self.client, "", self.SLUG, self.ME, 0)
         wt.emitted = []
         wt._emit = wt.emitted.append
         return wt
@@ -649,9 +658,7 @@ class SelfAliasLearning(unittest.TestCase):
     def test_poll_learns_own_intro(self):
         wt = self._watchtower()
         wt.initial_scan()
-        self.client.append(self._gazette(self.ME),
-                           self._intro(self.ME, "Captain",
-                                       "2026-07-17T15:35:00.000000Z"))
+        self._intro(self._gazette(self.ME), self.ME, "Captain", "2026-07-17T15:35:00.000000Z")
         wt._poll_once()
         self.assertEqual(wt.aliases.get(self.ME), "Captain")
         self.assertTrue(any(l.startswith("alias name=Captain") for l in wt.emitted))
@@ -662,56 +669,23 @@ class SelfAliasLearning(unittest.TestCase):
         cccp.save_aliases(self.SLUG, self.ME, {self.DEAD: "Captain"})
         wt = self._watchtower()
         wt.initial_scan()
-        self.client.append(self._gazette(self.ME),
-                           self._intro(self.ME, "Captain",
-                                       "2026-07-17T15:35:00.000000Z"))
+        self._intro(self._gazette(self.ME), self.ME, "Captain", "2026-07-17T15:35:00.000000Z")
         wt._poll_once()
         self.assertEqual(wt.aliases, {self.ME: "Captain"})
 
     def test_seed_learns_own_intro(self):
-        # A restarted armed watchtower re-learns its own alias from backlog
+        # A restarted watchtower re-learns its own alias from backlog
         # instead of only resurrecting the dead predecessor's.
-        self.client.append(self._gazette(self.DEAD),
-                           self._intro(self.DEAD, "Captain",
-                                       "2026-07-13T00:00:00.000000Z"))
-        self.client.append(self._gazette(self.ME),
-                           self._intro(self.ME, "Captain",
-                                       "2026-07-17T15:35:00.000000Z"))
+        self._intro(self._gazette(self.DEAD), self.DEAD, "Captain", "2026-07-13T00:00:00.000000Z")
+        self._intro(self._gazette(self.ME), self.ME, "Captain", "2026-07-17T15:35:00.000000Z")
         wt = self._watchtower()
         wt.seed_aliases()
         self.assertEqual(wt.aliases, {self.ME: "Captain"})
-
-    def test_seed_skips_stale_gazettes(self):
-        # A gazette idle past CCCP_ACTIVE_HOURS gets no head read at
-        # seed time; one with no last_modified at all is still seeded.
-        gaz = self._gazette(self.OTHER)
-        self.client.append(gaz, self._intro(self.OTHER, "Buddy",
-                                            "2026-01-01T00:00:00.000000Z"))
-        self.client.lm[gaz] = "Thu, 01 Jan 2026 00:00:00 GMT"
-        self.client.append(self._gazette(self.ME),
-                           self._intro(self.ME, "Captain",
-                                       "2026-07-17T15:35:00.000000Z"))
-        wt = self._watchtower()
-        wt.seed_aliases()
-        self.assertEqual(wt.aliases, {self.ME: "Captain"})
-        self.assertNotIn(gaz, self.client.fetched)
-
-    def test_poll_skips_own_gazette_when_unarmed(self):
-        wt = self._watchtower(trigger=None)
-        wt.initial_scan()
-        self.client.append(self._gazette(self.ME),
-                           self._intro(self.ME, "Captain",
-                                       "2026-07-17T15:35:00.000000Z"))
-        wt._poll_once()
-        self.assertNotIn(self._gazette(self.ME), self.client.fetched)
-        self.assertEqual(wt.emitted, [])
 
     def test_poll_still_learns_inbound_intros(self):
         wt = self._watchtower()
         wt.initial_scan()
-        self.client.append(self._gazette(self.OTHER),
-                           self._intro(self.OTHER, "Buddy",
-                                       "2026-07-17T15:36:00.000000Z"))
+        self._intro(self._gazette(self.OTHER), self.OTHER, "Buddy", "2026-07-17T15:36:00.000000Z")
         wt._poll_once()
         self.assertEqual(wt.aliases.get(self.OTHER), "Buddy")
         # Inbound broadcasts DO render as message events.
@@ -820,8 +794,8 @@ class BackendPaths(unittest.TestCase):
         self.assertEqual(cccp.cell_head("__default__", "demo"), "__default__/demo/")
 
     def test_gazette_and_published_paths(self):
-        self.assertEqual(cccp.gazette_path("__default__", "demo", "u@h:aaa"),
-                         "__default__/demo/gazettes/u@h:aaa.jsonl")
+        self.assertEqual(cccp.gazette_path("__default__", "demo", "u@h:aaa", "2026-10-04"),
+                         "__default__/demo/gazettes/2026-10-04/u@h:aaa.jsonl")
         self.assertEqual(cccp.gazettes_head("", "demo"), "demo/gazettes/")
         # The wire path keeps its files/ prefix; the blob key regroups it under
         # the cell-level files/ area, outside the polled gazettes/ prefix.
@@ -1447,8 +1421,9 @@ class SingleAliasTrigger(unittest.TestCase):
             cfg = cccp.resolve_config()
             client = cccp.make_backend(cfg)
             rec = {"type": "message", "from": self.CAPTAIN, "ts": cccp.now_iso(), "to": ["*"], "body": "Intro: Captain — coordinating"}
-            client.append_block(cccp.gazette_path("", "demo", self.CAPTAIN), (json.dumps(rec) + "\n").encode())
-            wt = cccp.Watchtower(client, "", "demo", self.ME, 0, trigger=cfg["ALIAS_TRIGGER"])
+            intro = cccp.alias_record(self.CAPTAIN, rec["ts"], rec["body"], cfg["ALIAS_TRIGGER"])
+            client.append_block(cccp.gazette_path("", "demo", self.CAPTAIN), b"".join((json.dumps(r) + "\n").encode() for r in (intro, rec)))
+            wt = cccp.Watchtower(client, "", "demo", self.ME, 0)
             wt.seed_aliases()
         self.assertEqual(wt.aliases, {self.CAPTAIN: "Captain"})
 
@@ -1712,10 +1687,13 @@ class AppendDispatchReadBack(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.b = cccp.LocalFilesBackend(self._tmp.name)
+        self.env = _isolated_env(self._tmp.name)
+        self.env.__enter__()
+        self.addCleanup(lambda: self.env.__exit__(None, None, None))
 
     def test_honest_store_round_trips(self):
         cccp.append_dispatch(self.b, "p", "cell", "u@h:aaa", {"type": "message"})
-        st, body = self.b.get("p/cell/gazettes/u@h:aaa.jsonl")
+        st, body = self.b.get(cccp.gazette_path("p", "cell", "u@h:aaa"))
         self.assertEqual(st, 200)
         self.assertEqual(json.loads(body), {"type": "message"})
 
@@ -2606,13 +2584,11 @@ class ServeMembership(unittest.TestCase):
         self.serve._wake_cells()
         self.assertEqual(set(self.serve.due.values()), {0.0})
 
-    def test_rejoin_keeps_the_trigger_it_was_joined_with(self):
-        self._join("a", trigger="Intro:")
-        self._join("a", idle=0)   # a plain shell's re-join carries no trigger
-        self.assertEqual(self.serve.cells["a"].trigger, "Intro:")
+    def test_cells_record_carries_no_trigger(self):
+        self._join("a")
+        self._join("a", idle=0)
         recorded = json.loads(cccp.cells_path(self.ME).read_text())
-        self.assertEqual(recorded["a"]["trigger"], "Intro:",
-                         "a successor must rejoin with aliases still on")
+        self.assertNotIn("trigger", recorded["a"], "readers learn aliases from records: no trigger to remember")
         self.assertEqual(recorded["a"]["idle"], 0)
 
     def test_options_default_and_are_bounded(self):
@@ -2853,7 +2829,8 @@ class ParallelGazetteFetch(unittest.TestCase):
                               (self.A, "2026-07-17T10:00:06.000000Z", "plain note from a"),
                               (self.ME, "2026-07-17T10:00:07.000000Z", "Alias: Me - mine")):
             rec = {"type": "message", "from": frm, "ts": ts, "to": ["*"], "body": body}
-            self.client.append_block(cccp.gazette_path("", self.SLUG, frm), (json.dumps(rec) + "\n").encode())
+            recs = [r for r in (cccp.alias_record(frm, ts, body, "Alias:"), rec) if r]
+            self.client.append_block(cccp.gazette_path("", self.SLUG, frm), b"".join((json.dumps(r) + "\n").encode() for r in recs))
 
     def _gated(self, root):
         roster = sorted([self.ME, self.A, self.B, self.C, self.D])
@@ -2890,50 +2867,58 @@ class ParallelGazetteFetch(unittest.TestCase):
             f"from={self.ME} to=* ts=2026-07-17T10:00:07.000000Z\nAlias: Me - mine\n\n"))
 
     def test_seeded_aliases_match_serial(self):
-        wt = cccp.Watchtower(self.client, "", self.SLUG, self.ME, 0, trigger="Alias:")
+        wt = cccp.Watchtower(self.client, "", self.SLUG, self.ME, 0)
         wt.seed_aliases()
         # Oldest-first, last-writer-wins: D took "Scout" from B, B then renamed itself "Bravo"; C's gazette 404'd, so no "Ghost".
         self.assertEqual(wt.aliases, {self.A: "Anchor", self.B: "Bravo", self.D: "Scout", self.ME: "Me"})
         self.assertEqual(cccp.load_aliases(self.SLUG, self.ME), wt.aliases)
 
 
-class ActiveWindow(unittest.TestCase):
-    """#54: `read` and alias seeding fetch only gazettes written within CCCP_ACTIVE_HOURS, judged by the listing's last_modified, so
-    their cost follows recent activity instead of every comrade the cell ever had. --all and --since reach past the window; --from
-    names one gazette and is never filtered. Fixture gazettes sit on either side of the window by mtime on a local-fs store."""
+class DayWindows(unittest.TestCase):
+    """#58: the hot paths list only in-window day folders, so their cost follows recent activity instead of every day the cell ever
+    had. The poll lists yesterday through tomorrow; seeding and default `read` list today - ceil(CCCP_ACTIVE_HOURS/24) through
+    tomorrow; `read --since` starts at its date; `read --all` and `--from` list the whole gazettes/ prefix. A flat gazette from before
+    v4 is never read at all."""
 
     SLUG = "demo"
     ME = "me@h:cc-aaaaaa"
-    NEW = "new@h:cc-111111"
-    OLD = "old@h:cc-222222"
+    A = "a@h:cc-111111"
+    TODAY = "2026-10-04"
+    IN_WINDOW = ("2026-09-30", "2026-10-01", "2026-10-03", "2026-10-04", "2026-10-05")   # 96h: today - 4 days through tomorrow
+    POLLED = ("2026-10-03", "2026-10-04", "2026-10-05")
+    WINDOW = ("2026-09-30", "2026-10-01", "2026-10-02") + POLLED
+    OUTSIDE = ("2026-09-20", "2026-09-29", "2026-10-06")
 
     def setUp(self):
         self.data = tempfile.mkdtemp()
         self.addCleanup(lambda: __import__("shutil").rmtree(self.data, True))
-        self.now = cccp.datetime.now(cccp.timezone.utc)
         self.env = _isolated_env(self.data, CCCP_COMRADE_ID=self.ME)
         self.env.__enter__()
         self.addCleanup(lambda: self.env.__exit__(None, None, None))
+        self.clock = _Clock(self, self.TODAY)
         self.client = cccp.make_backend(cccp.resolve_config())
-        self.fetched = []
-        for meth in ("get", "get_head"):
+        self.head = cccp.gazettes_head("", self.SLUG)
+        for day in self.IN_WINDOW + self.OUTSIDE:
+            self._append(day, f"written {day}")
+        flat = f"{self.head}{self.A}.jsonl"   # a pre-v4 flat gazette: not part of the layout any more
+        self.client.append_block(flat, (json.dumps(self._msg("flat history", "2026-10-04T00:00:00.000000Z")) + "\n").encode())
+        self.listed, self.fetched = [], []
+        real_list = self.client.list
+        self.client.list = lambda prefix: self.listed.append(prefix) or real_list(prefix)
+        for meth in ("get", "get_head", "get_range"):
             real = getattr(self.client, meth)
             setattr(self.client, meth, lambda path, *a, _real=real: self.fetched.append(path) or _real(path, *a))
-        self._write(self.NEW, [(self.now - cccp.timedelta(hours=1), "Alias: Fresh - new here")])
-        # OLD last wrote ten days ago: well outside the default 96h window. Its first message is older still.
-        self._write(self.OLD, [(self.now - cccp.timedelta(days=12), "Alias: Relic - long gone"),
-                               (self.now - cccp.timedelta(days=10), "old news")])
 
-    def _ts(self, when):
-        return when.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    def _msg(self, body, ts):
+        return {"type": "message", "from": self.A, "ts": ts, "to": ["*"], "body": body}
 
-    def _write(self, frm, msgs):
-        path = cccp.gazette_path("", self.SLUG, frm)
-        for when, body in msgs:
-            rec = {"type": "message", "from": frm, "ts": self._ts(when), "to": ["*"], "body": body}
-            self.client.append_block(path, (json.dumps(rec) + "\n").encode())
-        last = msgs[-1][0].timestamp()
-        os.utime(self.client._abs(path), (last, last))
+    def _append(self, day, body, header=None):
+        recs = ([{"type": "alias", "from": self.A, "ts": f"{day}T00:00:00.000000Z", "alias": header}] if header else [])
+        recs.append(self._msg(body, f"{day}T12:00:00.000000Z"))
+        self.client.append_block(cccp.gazette_path("", self.SLUG, self.A, day), b"".join((json.dumps(r) + "\n").encode() for r in recs))
+
+    def _days(self, days):
+        return [f"{self.head}{day}/" for day in days]
 
     def _read(self, **kw):
         args = type("Args", (), dict({"cell": self.SLUG, "to": None, "from_": None, "ts": None, "last": None, "full": False,
@@ -2944,74 +2929,120 @@ class ActiveWindow(unittest.TestCase):
             cccp.cmd_read(args)
         return out.getvalue(), err.getvalue()
 
-    def _gazette(self, comrade):
-        return cccp.gazette_path("", self.SLUG, comrade)
+    def _watchtower(self, **kw):
+        wt = cccp.Watchtower(self.client, "", self.SLUG, self.ME, 0, **kw)
+        wt.emitted = []
+        wt._emit = wt.emitted.append
+        return wt
 
-    def test_default_read_fetches_only_active_gazettes(self):
+    def _bodies(self, wt):
+        return [json.loads(re.search(r' body=(".*")$', line).group(1)) for line in wt.emitted if line.startswith("message ")]
+
+    def test_poll_lists_yesterday_through_tomorrow(self):
+        wt = self._watchtower()
+        wt.initial_scan()
+        self.assertEqual(sorted(self.listed), self._days(self.POLLED))
+        for day in self.IN_WINDOW + self.OUTSIDE:
+            self._append(day, f"later {day}")
+        self.listed.clear()
+        wt._poll_once()
+        self.assertEqual(sorted(self.listed), self._days(self.POLLED))
+        self.assertEqual(self._bodies(wt), [f"later {day}" for day in self.POLLED])
+        self.assertEqual(sorted(set(self.fetched)), [cccp.gazette_path("", self.SLUG, self.A, day) for day in self.POLLED])
+
+    def test_a_writer_ahead_past_midnight_is_delivered(self):
+        # The writer's clock already reads tomorrow; its file lands in tomorrow's folder, which the poll lists.
+        wt = self._watchtower()
+        wt.initial_scan()
+        self._append("2026-10-05", "from a fast clock")
+        wt._poll_once()
+        self.assertEqual(self._bodies(wt), ["from a fast clock"])
+
+    def test_poll_follows_the_clock_across_midnight(self):
+        wt = self._watchtower()
+        wt.initial_scan()
+        self.clock.day = "2026-10-05"
+        self.listed.clear()
+        wt._poll_once()
+        self.assertEqual(sorted(self.listed), self._days(("2026-10-04", "2026-10-05", "2026-10-06")))
+        # 10-06 was written before the watchtower's first scan but outside its window then: new to it now, so it is delivered.
+        self.assertEqual(self._bodies(wt), ["written 2026-10-06"])
+
+    def test_seeding_lists_the_active_window(self):
+        for day in self.IN_WINDOW + self.OUTSIDE:
+            self._append(day, "renamed", header=f"N{day.replace('-', '')}")
+        wt = self._watchtower()
+        wt.seed_aliases()
+        self.assertEqual(sorted(self.listed), self._days(self.WINDOW))
+        self.assertEqual(wt.aliases, {self.A: "N20261005"})   # the newest header in the window; 10-06 is outside it
+        self.assertTrue(all(path.split("/")[-2] in self.IN_WINDOW for path in self.fetched), self.fetched)
+
+    def test_seeding_follows_the_configured_window(self):
+        self._watchtower(active_hours=0.5).seed_aliases()
+        self.assertEqual(sorted(self.listed), self._days(self.POLLED))
+        self.listed.clear()
+        self._watchtower(active_hours=24 * 15).seed_aliases()
+        self.assertEqual(sorted(self.listed), [f"{self.head}2026-09-{d}/" for d in range(19, 31)] + self._days(self.WINDOW[1:]))
+
+    def test_default_read_lists_the_window(self):
         out, _ = self._read()
-        self.assertIn("new here", out)
-        self.assertNotIn("old news", out)
-        self.assertEqual(self.fetched, [self._gazette(self.NEW)])
+        self.assertEqual(sorted(self.listed), self._days(self.WINDOW))
+        for day in self.IN_WINDOW:
+            self.assertIn(f"written {day}", out)
+        for day in self.OUTSIDE:
+            self.assertNotIn(f"written {day}", out)
+        self.assertNotIn("flat history", out)
 
-    def test_all_reads_every_gazette(self):
-        out, _ = self._read(all=True)
-        self.assertIn("new here", out)
-        self.assertIn("long gone", out)
-        self.assertIn("old news", out)
-
-    def test_since_widens_the_roster_and_drops_older_messages(self):
-        since = self.now - cccp.timedelta(days=11)
-        out, _ = self._read(since=since)
-        self.assertIn("new here", out)
-        self.assertIn("old news", out)
-        self.assertNotIn("long gone", out)   # in a fetched gazette, but written before --since
+    def test_since_widens_to_its_date(self):
+        out, _ = self._read(since=cccp.datetime(2026, 9, 20, 6, 0, tzinfo=cccp.timezone.utc))
+        self.assertEqual(sorted(self.listed), [f"{self.head}2026-09-{d}/" for d in range(20, 31)] + self._days(self.WINDOW[1:]))
+        self.assertIn("written 2026-09-20", out)
+        self.assertIn("written 2026-09-29", out)
+        self.assertNotIn("written 2026-10-06", out)
 
     def test_since_narrows_too(self):
-        out, _ = self._read(since=self.now - cccp.timedelta(minutes=30))
-        self.assertEqual(out, "(no messages)\n")
-        self.assertEqual(self.fetched, [])
+        out, _ = self._read(since=cccp.datetime(2026, 10, 4, 13, 0, tzinfo=cccp.timezone.utc))
+        self.assertEqual(sorted(self.listed), self._days(("2026-10-04", "2026-10-05")))
+        self.assertEqual(out, "from=a@h:cc-111111 to=* ts=2026-10-05T12:00:00.000000Z\nwritten 2026-10-05\n\n")
 
-    def test_from_an_old_comrade_is_never_filtered(self):
-        out, _ = self._read(from_=self.OLD)
-        self.assertIn("long gone", out)
-        self.assertIn("old news", out)
+    def test_all_lists_the_whole_prefix(self):
+        out, _ = self._read(all=True)
+        self.assertEqual(self.listed, [self.head])
+        for day in self.IN_WINDOW + self.OUTSIDE:
+            self.assertIn(f"written {day}", out)
+        self.assertNotIn("flat history", out)
+        self.assertNotIn(f"{self.head}{self.A}.jsonl", self.fetched)
+
+    def test_from_lists_the_whole_prefix(self):
+        out, _ = self._read(from_=self.A)
+        self.assertEqual(self.listed, [self.head])
+        self.assertIn("written 2026-09-20", out)
+        self.assertNotIn("flat history", out)
 
     def test_since_still_filters_messages_under_from(self):
-        out, _ = self._read(from_=self.OLD, since=self.now - cccp.timedelta(days=11))
-        self.assertIn("old news", out)
-        self.assertNotIn("long gone", out)
+        out, _ = self._read(from_=self.A, since=cccp.datetime(2026, 9, 29, tzinfo=cccp.timezone.utc))
+        self.assertIn("written 2026-09-29", out)
+        self.assertNotIn("written 2026-09-20", out)
 
     def test_config_sets_the_window(self):
         os.environ["CCCP_ACTIVE_HOURS"] = "0.5"
         out, _ = self._read()
-        self.assertEqual(out, "(no messages)\n")
-        os.environ["CCCP_ACTIVE_HOURS"] = "300"
+        self.assertNotIn("written 2026-10-01", out)
+        self.assertIn("written 2026-10-03", out)
+        os.environ["CCCP_ACTIVE_HOURS"] = "400"
         out, _ = self._read()
-        self.assertIn("old news", out)
+        self.assertIn("written 2026-09-20", out)
 
-    def test_empty_read_says_what_the_window_hid(self):
-        os.environ["CCCP_ACTIVE_HOURS"] = "0.5"
-        _, err = self._read()
-        self.assertIn("--all", err)
-        self.assertIn(": 2", err)
+    def test_empty_read_points_at_all(self):
+        out, err = self._read(since=cccp.datetime(2026, 10, 5, 13, 0, tzinfo=cccp.timezone.utc))
+        self.assertEqual(out, "(no messages)\n")
+        self.assertEqual(err, "cccp: Skip day folders before the --since window; --all reads them: '2026-10-05'\n")
+
 
     def test_ts_miss_points_at_all(self):
         with self.assertRaises(SystemExit) as cm:
-            self._read(ts=self._ts(self.now - cccp.timedelta(days=10)))
+            self._read(ts="2026-09-20T12:00:00.000000Z")
         self.assertIn("--all", str(cm.exception))
-
-    def _seed(self, **kw):
-        wt = cccp.Watchtower(self.client, "", self.SLUG, self.ME, 0, trigger="Alias:", **kw)
-        wt.seed_aliases()
-        return wt.aliases
-
-    def test_seeding_skips_gazettes_outside_the_window(self):
-        self.assertEqual(self._seed(), {self.NEW: "Fresh"})
-        self.assertEqual(self.fetched, [self._gazette(self.NEW)])
-
-    def test_seeding_follows_the_configured_window(self):
-        self.assertEqual(self._seed(active_hours=0.5), {})
-        self.assertEqual(self._seed(active_hours=300), {self.NEW: "Fresh", self.OLD: "Relic"})
 
     def test_hardcoded_seed_age_is_gone(self):
         self.assertFalse(hasattr(cccp, "ALIAS_SEED_MAX_AGE_SECONDS"))
@@ -3059,14 +3090,13 @@ class ActiveHoursConfig(unittest.TestCase):
 
 
 class AliasRecords(unittest.TestCase):
-    """Design update on #55: a sender whose own message starts with its configured trigger also writes an `alias` record, in the same
-    append and carrying its cccp version. Readers learn from records in ts order and parse message bodies only for senders that never
-    wrote one (pre-3.15). Otherwise the record is inert: never an event line, never a `read` line."""
+    """A sender whose own message starts with its configured trigger also writes an `alias` record, first and in the same append.
+    Readers learn aliases from these records alone, in ts order, with no trigger of their own: a message body never teaches a name.
+    Otherwise the record is inert: never an event line, never a `read` line."""
 
     SLUG = "demo"
     ME = "me@h:cc-aaaaaa"
-    NEW = "new@h:cc-111111"   # a 3.15 sender: its intros carry a record
-    OLD = "old@h:cc-222222"   # a pre-3.15 sender: its intros are message bodies only
+    NEW = "new@h:cc-111111"
 
     def setUp(self):
         self.data = tempfile.mkdtemp()
@@ -3092,10 +3122,10 @@ class AliasRecords(unittest.TestCase):
 
     def _intro(self, frm, name, ts, record=True, body=None):
         msg = {"type": "message", "from": frm, "ts": ts, "to": ["*"], "body": body or f"Alias: {name} - here"}
-        return ([{"type": "alias", "from": frm, "ts": ts, "alias": name, "v": "3.15.0"}] if record else []) + [msg]
+        return ([{"type": "alias", "from": frm, "ts": ts, "alias": name}] if record else []) + [msg]
 
     def _watchtower(self):
-        wt = cccp.Watchtower(self.client, "", self.SLUG, self.ME, 0, trigger="Alias:")
+        wt = cccp.Watchtower(self.client, "", self.SLUG, self.ME, 0)
         wt.emitted = []
         wt._emit = wt.emitted.append
         return wt
@@ -3113,7 +3143,7 @@ class AliasRecords(unittest.TestCase):
         self.assertEqual(append.call_count, 1)
         recs = self._records(self.ME)
         self.assertEqual([r["type"] for r in recs], ["alias", "message"])
-        self.assertEqual(recs[0], {"type": "alias", "from": self.ME, "ts": recs[1]["ts"], "alias": "Builder", "v": cccp.cccp_version()})
+        self.assertEqual(recs[0], {"type": "alias", "from": self.ME, "ts": recs[1]["ts"], "alias": "Builder"})
 
     def test_intro_is_remembered_locally(self):
         self.assertIsNone(cccp.load_own_alias(self.SLUG, self.ME))
@@ -3126,6 +3156,9 @@ class AliasRecords(unittest.TestCase):
         self._dispatch("Intro: Bob - not my configured trigger")
         self.assertEqual([r["type"] for r in self._records(self.ME)], ["message", "message"])
         self.assertIsNone(cccp.load_own_alias(self.SLUG, self.ME))
+
+    def test_watchtower_takes_no_trigger(self):
+        self.assertNotIn("trigger", __import__("inspect").signature(cccp.Watchtower).parameters)
 
     def test_poll_learns_a_record_once_and_never_emits_it(self):
         wt = self._watchtower()
@@ -3143,39 +3176,45 @@ class AliasRecords(unittest.TestCase):
         wt._poll_once()
         self.assertEqual(wt.aliases, {self.NEW: "Scout"})
 
-    def test_poll_parses_bodies_only_for_senders_without_records(self):
+    def test_a_message_body_never_teaches_an_alias(self):
         wt = self._watchtower()
         wt.initial_scan()
-        self._append(self.OLD, self._intro(self.OLD, "Relic", "2026-10-04T10:00:00.000000Z", record=False))
-        self._append(self.NEW, self._intro(self.NEW, "Scout", "2026-10-04T10:00:01.000000Z"))
+        self._append(self.NEW, self._intro(self.NEW, "Relic", "2026-10-04T10:00:00.000000Z", record=False))
+        self._append(self.NEW, [{"type": "message", "from": self.NEW, "ts": "2026-10-04T10:00:01.000000Z", "to": ["*"],
+                                 "body": "Intro: Ghost - the default trigger, still just text"}])
         wt._poll_once()
-        self._append(self.NEW, [{"type": "message", "from": self.NEW, "ts": "2026-10-04T10:00:02.000000Z", "to": ["*"],
-                                 "body": "Alias: Ghost - quoting someone else's syntax"}])
-        wt._poll_once()
-        self.assertEqual(wt.aliases, {self.OLD: "Relic", self.NEW: "Scout"})
-        self.assertEqual(cccp.load_alias_versions(self.SLUG, self.ME), {self.OLD: None, self.NEW: "3.15.0"})
+        self.assertEqual(wt.aliases, {})
+        self.assertFalse(any(line.startswith("alias ") for line in wt.emitted))
+        seat = self._watchtower()
+        seat.seed_aliases()
+        self.assertEqual(seat.aliases, {})
 
-    def test_seed_applies_records_and_fallback_in_ts_order(self):
+    def test_seed_applies_records_in_ts_order(self):
         self._append(self.NEW, self._intro(self.NEW, "Scout", "2026-10-04T10:00:01.000000Z"))
-        self._append(self.OLD, self._intro(self.OLD, "Scout", "2026-10-04T10:00:02.000000Z", record=False))   # takes the name
-        self._append(self.NEW, [{"type": "message", "from": self.NEW, "ts": "2026-10-04T10:00:03.000000Z", "to": ["*"],
-                                 "body": "Alias: Ghost - not an intro from a sender that writes records"}])
+        self._append(self.ME, self._intro(self.ME, "Scout", "2026-10-04T10:00:02.000000Z"))   # takes the name
         self._append(self.NEW, self._intro(self.NEW, "Bravo", "2026-10-04T10:00:04.000000Z"))
         wt = self._watchtower()
         wt.seed_aliases()
-        self.assertEqual(wt.aliases, {self.OLD: "Scout", self.NEW: "Bravo"})
-        self.assertEqual(cccp.load_alias_versions(self.SLUG, self.ME), {self.OLD: None, self.NEW: "3.15.0"})
+        self.assertEqual(wt.aliases, {self.ME: "Scout", self.NEW: "Bravo"})
 
-    def test_aliases_shows_each_comrade_s_version(self):
+    def test_version_machinery_is_gone(self):
         self._append(self.NEW, self._intro(self.NEW, "Scout", "2026-10-04T10:00:01.000000Z"))
-        self._append(self.OLD, self._intro(self.OLD, "Relic", "2026-10-04T10:00:02.000000Z", record=False))
+        wt = self._watchtower()
+        wt.seed_aliases()
+        wt._poll_once()
+        for name in ("alias_versions_path", "load_alias_versions", "save_alias_versions", "alias_declaration_version"):
+            self.assertFalse(hasattr(cccp, name), name)
+        self.assertEqual(list(Path(self.data).rglob("alias-versions.json")), [])
+
+    def test_aliases_lists_names_only(self):
+        self._append(self.NEW, self._intro(self.NEW, "Scout", "2026-10-04T10:00:01.000000Z"))
         self._watchtower().seed_aliases()
         with contextlib.redirect_stdout(io.StringIO()):
             cccp.cmd_alias(self._args(args=["Manual", "man@h:cc-333333"]))
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             cccp.cmd_aliases(self._args())
-        self.assertEqual(out.getvalue(), f"Manual = man@h:cc-333333\nRelic = {self.OLD} (older than v3.15)\nScout = {self.NEW} (v3.15.0)\n")
+        self.assertEqual(out.getvalue(), f"Manual = man@h:cc-333333\nScout = {self.NEW}\n")
 
     def test_read_never_prints_a_record(self):
         self._dispatch("Alias: Builder - on the ticket")
@@ -3184,8 +3223,10 @@ class AliasRecords(unittest.TestCase):
 
 
 class DayGazettes(unittest.TestCase):
-    """#56: every reader accepts both gazette layouts at once, legacy `gazettes/<id>.jsonl` and day-partitioned
-    `gazettes/<YYYY-MM-DD>/<id>.jsonl`, so the 4.0 writers of #57 are never invisible to a 3.15 reader. No writer changes here."""
+    """#57: writers append to `gazettes/<UTC YYYY-MM-DD>/<id>.jsonl` and never to a flat gazette. Nothing runs at midnight: the first
+    write of a day creates that day's file (201), and only that write starts the file with the remembered `alias` record, in the
+    same append as its own records. A write to an existing file (409) appends just itself; a comrade that never introduced itself
+    writes no header. Readers list day files only."""
 
     ME = "me@h:cc-aaaaaa"
     A = "a@h:cc-111111"
@@ -3198,34 +3239,30 @@ class DayGazettes(unittest.TestCase):
         self.env = _isolated_env(self.data, CCCP_COMRADE_ID=self.ME, CCCP_ALIAS_TRIGGER="Alias:")
         self.env.__enter__()
         self.addCleanup(lambda: self.env.__exit__(None, None, None))
+        self.clock = _Clock(self, self.DAY1)
         self.client = cccp.make_backend(cccp.resolve_config())
 
-    def _append(self, slug, comrade, records, day=None):
-        path = cccp.gazette_path("", slug, comrade, day)
-        self.client.ensure_append_blob(path)
-        self.client.append_block(path, b"".join((json.dumps(r) + "\n").encode() for r in records))
+    def _dispatch(self, who, body):
+        os.environ["CCCP_COMRADE_ID"] = who
+        try:
+            with mock.patch.object(cccp, "make_backend", return_value=self.client), contextlib.redirect_stdout(io.StringIO()):
+                cccp.cmd_dispatch(type("Args", (), {"cell": "demo", "to": [], "body": body, "deadline": None, "standing": False})())
+        finally:
+            os.environ["CCCP_COMRADE_ID"] = self.ME
 
-    def _msg(self, frm, n, to=("*",)):
-        return {"type": "message", "from": frm, "ts": f"2026-10-04T10:00:{n:02d}.000000Z", "to": list(to), "body": f"{frm} says {n}"}
+    def _records(self, who, day):
+        st, body = self.client.get(cccp.gazette_path("", "demo", who, day))
+        return [json.loads(line) for line in body.splitlines()] if st == 200 else None
 
-    def _watchtower(self, slug="demo"):
-        wt = cccp.Watchtower(self.client, "", slug, self.ME, 0, trigger="Alias:")
+    def _watchtower(self, me=None):
+        wt = cccp.Watchtower(self.client, "", "demo", me or self.ME, 0)
         wt.emitted = []
         wt._emit = wt.emitted.append
         return wt
 
-    def _read(self, slug, **kw):
-        args = type("Args", (), dict({"cell": slug, "to": None, "from_": None, "ts": None, "last": None, "full": False, "all": False,
-                                      "since": None}, **kw))()
-        out = io.StringIO()
-        with mock.patch.object(cccp, "make_backend", return_value=self.client), contextlib.redirect_stdout(out):
-            cccp.cmd_read(args)
-        return out.getvalue()
-
-    def test_gazette_entry_parses_both_layouts(self):
-        self.assertEqual(cccp.gazette_entry(f"{self.A}.jsonl"), (self.A, None))
+    def test_gazette_entry_accepts_day_files_only(self):
         self.assertEqual(cccp.gazette_entry(f"{self.DAY2}/{self.A}.jsonl"), (self.A, self.DAY2))
-        for other in (f"{self.DAY2}/x/{self.A}.jsonl", f"someday/{self.A}.jsonl", f"{self.A}.txt", f"{self.DAY2}/"):
+        for other in (f"{self.A}.jsonl", f"{self.DAY2}/x/{self.A}.jsonl", f"someday/{self.A}.jsonl", f"{self.A}.txt", f"{self.DAY2}/"):
             self.assertIsNone(cccp.gazette_entry(other), other)
 
     def test_day_path_round_trips_through_azure_url(self):
@@ -3234,11 +3271,120 @@ class DayGazettes(unittest.TestCase):
         be = cccp.AzureBlobBackend("acct", "cont", "sig=x")
         self.assertEqual(be._url(path), f"https://acct.blob.core.windows.net/cont/demo/gazettes/{self.DAY2}/{self.A}.jsonl?sig=x")
 
+    def test_gazette_path_defaults_to_today(self):
+        self.assertEqual(cccp.gazette_path("p", "demo", self.A), f"p/demo/gazettes/{self.DAY1}/{self.A}.jsonl")
+
+    def test_writes_on_two_days_make_two_day_files_and_no_flat_one(self):
+        self._dispatch(self.A, "day one")
+        self.clock.day = self.DAY2
+        self._dispatch(self.A, "day two")
+        names = sorted(self.client.list(cccp.gazettes_head("", "demo")))
+        self.assertEqual(names, [cccp.gazette_path("", "demo", self.A, day) for day in (self.DAY1, self.DAY2)])
+        self.assertEqual([r["body"] for r in self._records(self.A, self.DAY2)], ["day two"])
+
+    def test_first_write_of_a_day_starts_with_the_alias_header_in_one_append(self):
+        self._dispatch(self.A, "Alias: Anchor - here")
+        self._dispatch(self.A, "still day one")
+        self.assertEqual([r["type"] for r in self._records(self.A, self.DAY1)], ["alias", "message", "message"])
+        self.clock.day = self.DAY2
+        with mock.patch.object(self.client, "append_block", wraps=self.client.append_block) as append:
+            self._dispatch(self.A, "day two")
+        self.assertEqual(append.call_count, 1)
+        day2 = self._records(self.A, self.DAY2)
+        self.assertEqual(day2[0], self._records(self.A, self.DAY1)[0])   # the remembered record, verbatim: its ts is the intro's
+        self.assertEqual(day2[0], cccp.load_own_alias("demo", self.A))
+        self.assertEqual([r.get("body") for r in day2[1:]], ["day two"])
+        self._dispatch(self.A, "day two again")   # 409: the file exists, so no second header
+        self.assertEqual([r["type"] for r in self._records(self.A, self.DAY2)], ["alias", "message", "message"])
+
+    def test_the_header_is_the_latest_intro(self):
+        self._dispatch(self.A, "Alias: Anchor - here")
+        self._dispatch(self.A, "Alias: Bravo - renamed")
+        self.clock.day = self.DAY2
+        self._dispatch(self.A, "day two")
+        self.assertEqual(self._records(self.A, self.DAY2)[0]["alias"], "Bravo")
+
+    def test_an_intro_on_a_new_day_follows_the_old_header(self):
+        self._dispatch(self.A, "Alias: Anchor - here")
+        self.clock.day = self.DAY2
+        self._dispatch(self.A, "Alias: Bravo - renamed")
+        self.assertEqual([(r["type"], r.get("alias")) for r in self._records(self.A, self.DAY2)],
+                         [("alias", "Anchor"), ("alias", "Bravo"), ("message", None)])
+        wt = self._watchtower()
+        wt.seed_aliases()
+        self.assertEqual(wt.aliases, {self.A: "Bravo"})
+
+    def test_no_intro_no_header(self):
+        self._dispatch(self.A, "day one")
+        self.clock.day = self.DAY2
+        self._dispatch(self.A, "day two")
+        self.assertEqual([r["type"] for r in self._records(self.A, self.DAY2)], ["message"])
+
+    def test_publish_and_unpublish_announcements_carry_the_header(self):
+        self._dispatch(self.A, "Alias: Anchor - here")
+        self.clock.day = self.DAY2
+        cccp.append_dispatch(self.client, "", "demo", self.A, {"type": "filesystem", "op": "unpublish", "path": "files/x", "from": self.A})
+        self.assertEqual([r["type"] for r in self._records(self.A, self.DAY2)], ["alias", "filesystem"])
+
+    def test_a_creation_race_writes_one_header(self):
+        # Two processes of one comrade at midnight: only one ensure_append_blob can get 201, so exactly one header lands.
+        self._dispatch(self.A, "Alias: Anchor - here")
+        self.clock.day = self.DAY2
+        real = self.client.ensure_append_blob
+
+        def racing(path):
+            self.client.ensure_append_blob = real
+            st = real(path)                                # this process creates the file...
+            self._dispatch(self.A, "the other process")    # ...and the other one writes before this one appends
+            return st
+
+        self.client.ensure_append_blob = racing
+        self._dispatch(self.A, "this process")
+        recs = self._records(self.A, self.DAY2)
+        self.assertEqual([r["type"] for r in recs].count("alias"), 1)
+        self.assertEqual(sorted(r["body"] for r in recs if r["type"] == "message"), ["the other process", "this process"])
+
+    def test_watchtower_sees_every_message_across_a_day_change_once(self):
+        self._dispatch(self.A, "Alias: Anchor - here")
+        wt = self._watchtower()
+        wt.start()
+        wt.emitted.clear()
+
+        def polled():
+            wt.emitted.clear()
+            wt._poll_once()
+            return [json.loads(re.search(r' body=(".*")$', line).group(1)) for line in wt.emitted if line.startswith("message ")]
+
+        self._dispatch(self.A, "one")
+        self._dispatch(self.B, "from b")
+        self.assertEqual(polled(), ["one", "from b"])
+        self.clock.day = self.DAY2
+        self._dispatch(self.A, "two")
+        self.assertEqual(polled(), ["two"])
+        self.assertFalse(any(line.startswith("alias ") for line in wt.emitted), "the header re-declares a known name: no event")
+        self.assertEqual(polled(), [])
+        self.clock.day = self.DAY1
+        self._dispatch(self.A, "late, by a slow clock")   # a late append to yesterday's file resumes at its offset
+        self.clock.day = self.DAY2
+        self._dispatch(self.B, "b on day two")
+        self.assertEqual(polled(), ["late, by a slow clock", "b on day two"])
+        self.assertEqual(polled(), [])
+        self.assertEqual(wt.aliases, {self.A: "Anchor"})
+
+    def test_a_late_seat_seeds_the_alias_from_the_newest_header(self):
+        self._dispatch(self.A, "Alias: Anchor - here")
+        self.clock.day = "2026-10-08"   # day one has left a 1h window; day two's header is all a new seat sees
+        self._dispatch(self.A, "back again")
+        wt = self._watchtower()
+        wt.active_hours = 1
+        wt.seed_aliases()
+        self.assertEqual(wt.aliases, {self.A: "Anchor"})
+
     def test_roster_counts_comrades_not_files(self):
-        self._append("demo", self.A, [self._msg(self.A, 1)])
-        self._append("demo", self.A, [self._msg(self.A, 2)], day=self.DAY1)
-        self._append("demo", self.A, [self._msg(self.A, 3)], day=self.DAY2)
-        self._append("demo", self.B, [self._msg(self.B, 4)], day=self.DAY2)
+        self._dispatch(self.A, "a1")
+        self._dispatch(self.B, "b1")
+        self.clock.day = self.DAY2
+        self._dispatch(self.A, "a2")
         self.assertEqual(cccp.cell_roster(self.client, "", "demo"), [self.A, self.B])
         wt = self._watchtower()
         wt.start()
@@ -3246,62 +3392,15 @@ class DayGazettes(unittest.TestCase):
         out = io.StringIO()
         with mock.patch.object(cccp, "make_backend", return_value=self.client), contextlib.redirect_stdout(out):
             cccp.cmd_rm(type("Args", (), {"cell": "demo", "yes": False})())
-        self.assertIn("4 blobs across 2 comrades", out.getvalue())
+        self.assertIn("3 blobs across 2 comrades", out.getvalue())
 
-    def test_watchtower_emits_each_record_once_across_a_rollover(self):
-        self._append("demo", self.A, [self._msg(self.A, 1)])
-        self._append("demo", self.A, [self._msg(self.A, 2)], day=self.DAY1)
-        wt = self._watchtower()
-        wt.initial_scan()
-
-        def polled():
-            wt.emitted.clear()
-            wt._poll_once()
-            self.assertTrue(all(line.startswith(("message ", "alias ")) for line in wt.emitted), wt.emitted)
-            return [json.loads(re.search(r' body=(".*")$', line).group(1)) for line in wt.emitted if line.startswith("message ")]
-
-        self._append("demo", self.A, [self._msg(self.A, 3)])
-        self._append("demo", self.A, [self._msg(self.A, 4)], day=self.DAY1)
-        self.assertEqual(polled(), [f"{self.A} says 3", f"{self.A} says 4"])
-        self.assertEqual(polled(), [])
-        # Rollover: a new day file appears mid-run, led by its alias header.
-        header = {"type": "alias", "from": self.A, "ts": "2026-10-04T10:00:05.000000Z", "alias": "Anchor", "v": "4.0.0"}
-        self._append("demo", self.A, [header, self._msg(self.A, 5)], day=self.DAY2)
-        self.assertEqual(polled(), [f"{self.A} says 5"])
-        self.assertEqual(wt.aliases, {self.A: "Anchor"})
-        self.assertEqual(polled(), [])
-        self._append("demo", self.A, [self._msg(self.A, 6)], day=self.DAY2)
-        self._append("demo", self.A, [self._msg(self.A, 7)], day=self.DAY1)   # a late append to an older day file
-        self.assertEqual(polled(), [f"{self.A} says 6", f"{self.A} says 7"])
-        self.assertEqual(polled(), [])
-
-    def _history(self, frm, n, to=("*",)):
-        msgs = [self._msg(frm, n + i, to=to if i % 2 else ("*",)) for i in range(4)]
-        msgs[0]["body"] = f"Alias: Name{frm[0].upper()} - here"
-        return [{"type": "alias", "from": frm, "ts": msgs[0]["ts"], "alias": f"Name{frm[0].upper()}", "v": "3.15.0"}] + msgs
-
-    def test_reads_match_whether_history_is_flat_or_split(self):
-        a, b = self._history(self.A, 10, to=(self.B,)), self._history(self.B, 20, to=(self.A,))
-        self._append("flat", self.A, a)
-        self._append("flat", self.B, b)
-        self._append("split", self.A, a[:2])
-        self._append("split", self.A, a[2:4], day=self.DAY1)
-        self._append("split", self.A, a[4:], day=self.DAY2)
-        self._append("split", self.B, b, day=self.DAY2)
-        for kw in ({}, {"from_": self.A}, {"to": self.B}, {"last": 3}):
-            flat, split = self._read("flat", **kw), self._read("split", **kw)
-            self.assertEqual(flat, split, kw)
-            self.assertNotEqual(flat, "(no messages)\n", kw)
-        for slug in ("flat", "split"):
-            self._watchtower(slug).seed_aliases()
-        self.assertEqual(cccp.load_aliases("split", self.ME), {self.A: "NameA", self.B: "NameB"})
-        self.assertEqual(cccp.load_aliases("split", self.ME), cccp.load_aliases("flat", self.ME))
-
-    def test_published_catalogue_replays_across_layouts(self):
+    def test_published_catalogue_replays_across_days(self):
         pub = lambda path, op="publish": {"type": "filesystem", "op": op, "path": path, "from": self.A, "size": 1}
-        self._append("demo", self.A, [pub("files/a.txt"), pub("files/b.txt")])
-        self._append("demo", self.A, [pub("files/a.txt", "unpublish")], day=self.DAY1)
-        self._append("demo", self.A, [pub("files/c.txt")], day=self.DAY2)
+        cccp.append_dispatch(self.client, "", "demo", self.A, pub("files/a.txt"), pub("files/b.txt"))
+        self.clock.day = self.DAY2
+        cccp.append_dispatch(self.client, "", "demo", self.A, pub("files/a.txt", "unpublish"))
+        self.clock.day = "2026-10-09"
+        cccp.append_dispatch(self.client, "", "demo", self.A, pub("files/c.txt"))
         for senders in (None, [self.A]):
             cat = cccp.published_catalogue(self.client, "", "demo", senders=senders)
             self.assertEqual(sorted(wp for _, wp in cat), ["files/b.txt", "files/c.txt"])

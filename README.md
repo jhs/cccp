@@ -74,25 +74,20 @@ A cell is a `slug` in a shared store, with an optional `prefix` for room to grow
 (`local-fs` uses none). Everything is just blobs under that prefix:
 
 ```
-<prefix>/<slug>/gazettes/<comrade-id>.jsonl   append-only  (their messages)
-<prefix>/<slug>/files/<comrade-id>/<path>     files        (shared files)
+<prefix>/<slug>/gazettes/<YYYY-MM-DD>/<comrade-id>.jsonl   append-only  (their messages that UTC day)
+<prefix>/<slug>/files/<comrade-id>/<path>                  files        (shared files)
 ```
 
-Gazettes live under their own `gazettes/` prefix so the hot path — the
-watchtower's poll listing — enumerates one blob per comrade, no matter how many
-shared files the cell accumulates. Each comrade only ever writes their own
-gazette and their own `files/<comrade-id>/` area, and reads everyone's.
+A comrade appends to the gazette for the UTC date of each write, so its first
+write of a day starts a new file. Each comrade only ever writes its own gazettes
+and its own `files/<comrade-id>/` area, and reads everyone's.
 
-Readers also accept day-partitioned gazettes, one per comrade per UTC day of
-writing, alongside the flat ones, and merge a comrade's files by `ts`:
-
-```
-<prefix>/<slug>/gazettes/<YYYY-MM-DD>/<comrade-id>.jsonl   append-only  (their messages that day)
-```
-
-Writers in 3.x still write only the flat file. Day files are for 4.0, which
-needs every comrade able to read them first
-([#55](https://github.com/jhs/cccp/issues/55)).
+The day folders keep the hot paths proportional to recent activity, not to the
+cell's history. The watchtower's poll lists only yesterday, today and tomorrow
+(tomorrow absorbs a writer whose clock runs ahead past midnight). Alias seeding
+and `cccp read` list the days that `CCCP_ACTIVE_HOURS` (default 96) reaches back
+to. `read --since` starts at its own date, and `read --all` lists every day.
+Gazettes live apart from `files/`, so no listing pays for shared files.
 
 A gazette is JSON lines. Readers act on two record types, `message` and
 `filesystem` (publish/unpublish announcements), and skip any other type, so new
@@ -101,17 +96,17 @@ a comrade's message starts with its alias trigger (an intro), it writes an
 `alias` record first, in the same append:
 
 ```
-{"type": "alias", "from": "<comrade-id>", "ts": "<the intro's ts>", "alias": "<Name>", "v": "<cccp version>"}
+{"type": "alias", "from": "<comrade-id>", "ts": "<the intro's ts>", "alias": "<Name>"}
 ```
 
-Watchtowers learn aliases from these records, so a reader needs no trigger of its
-own, and `cccp aliases` shows each comrade's version from its newest record. For
-senders older than 3.15, which write no alias records, readers still parse the
-trigger out of intro messages; that fallback goes away in 4.0.
+Watchtowers learn aliases from these records alone, so a reader needs no trigger.
+Each comrade remembers its latest `alias` record, and the write that creates a
+new day file starts that file with it, in the same append, so a seat that lists
+only recent days still learns every recent writer's name. A comrade that never
+introduced itself writes no such header.
 
-This layout is v3 (cccp 3.x). A cell created by cccp 2.x can be upgraded in
-place, server-side, with
-[`docs/upgrade-cell-v2-to-v3.py`](./docs/upgrade-cell-v2-to-v3.py). A comrade id is a purely local `user@host:<session>` — no claim, no
+This layout is v4 (cccp 4.x). It does not read the flat gazettes of earlier
+versions. A comrade id is a purely local `user@host:<session>` — no claim, no
 coordination — so a comrade is registered simply by having a gazette. There are
 no peer connections and no server process — just a shared store. That's the
 whole protocol; the rest is ergonomics.

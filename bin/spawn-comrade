@@ -49,7 +49,7 @@ pi_model_ok() {
   fi
 }
 
-# The alias trigger every seat on this machine parses intros with. cccp's config is its one
+# The alias trigger every seat on this machine introduces itself with. cccp's config is its one
 # source (#51): a prompt that taught any other prefix would introduce a name nobody registers.
 alias_trigger() {
   "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/cccp" config CCCP_ALIAS_TRIGGER

@@ -15,11 +15,8 @@ Two ship today:
 
 Storage layout (a cell is a store + prefix + slug; local-fs uses no prefix):
 
-    <prefix>/<slug>/gazettes/<comrade-id>.jsonl   append-only, their messages
-    <prefix>/<slug>/files/<comrade-id>/<path>     shared files
-
-Readers also accept day-partitioned gazettes, gazettes/<YYYY-MM-DD>/<comrade-id>.jsonl
-(#55), which 4.0 writers will use; 3.x writers still write the flat file.
+    <prefix>/<slug>/gazettes/<YYYY-MM-DD>/<comrade-id>.jsonl   append-only, their messages written that UTC day
+    <prefix>/<slug>/files/<comrade-id>/<path>                  shared files
 
 A comrade is registered in a cell purely by having a gazette - identity is a
 local `user@host:<session>` computed offline, so there is no claim blob and no
@@ -44,10 +41,10 @@ Subcommands:
 import argparse
 import concurrent.futures
 import contextlib
-import email.utils
 import json
 import logging
 import logging.handlers
+import math
 import os
 import platform
 import pwd
@@ -102,8 +99,7 @@ IDLE_MAX_SECONDS = 24 * 3600   # cap for the idle backoff - past this, idles fir
                                # at most once a day so a long-silent watchtower
                                # stops forcing Claude to wake and respond
 FETCH_WORKERS = 16   # concurrent gazette fetches in `read` and alias seeding (#53)
-ACTIVE_HOURS_DEFAULT = 96   # a gazette written within this many hours is active: `read` and alias seeding fetch only those (#54).
-                            # Defined by meaning, not mechanism, so a layout change can implement the same window another way.
+ACTIVE_HOURS_DEFAULT = 96   # `read` and alias seeding list only the day folders this many hours reach back to (#54, #58)
 PUBLISH_MAX = 256 * 1024 * 1024   # single-PUT publish ceiling; larger needs staging
 AUTODOWNLOAD_MAX_DEFAULT = "1m"   # watchtower auto-downloads published files at or
                                   # under this size; larger ones are only announced
@@ -1070,21 +1066,37 @@ def comrade_id():
     return f"{base_comrade_id()}:{harness}-{current_session_id()[:6]}"
 
 
-GAZETTE_DAY = re.compile(r"\d{4}-\d{2}-\d{2}")   # a day-partitioned gazette's folder: the UTC date it was written (#55)
+GAZETTE_DAY = re.compile(r"\d{4}-\d{2}-\d{2}")   # a gazette's folder: the UTC date it was written (#55)
+
+
+def utc_today():
+    """Today's UTC date: the day folder a write lands in, and the anchor of every listing window. The one clock the layout reads."""
+    return datetime.now(timezone.utc).date()
+
+
+def gazette_days(first):
+    """The day folders ('YYYY-MM-DD') from `first` through tomorrow, UTC. Tomorrow absorbs a writer whose clock runs ahead past
+    midnight (#58)."""
+    last = utc_today() + timedelta(days=1)
+    return [(first + timedelta(days=n)).isoformat() for n in range((last - first).days + 1)]
+
+
+def window_start(hours):
+    """The first day folder an N-hour window reaches: today - ceil(N/24) (#58)."""
+    return utc_today() - timedelta(days=math.ceil(hours / 24))
 
 
 def gazette_entry(rest):
-    """(comrade id, day) for a blob name relative to gazettes/, or None if it names no gazette. Readers accept both layouts (#56):
-    legacy flat '<id>.jsonl' (day None) and day-partitioned '<YYYY-MM-DD>/<id>.jsonl'. Writers still write flat files in 3.x."""
+    """(comrade id, day) for a blob name relative to gazettes/, '<YYYY-MM-DD>/<id>.jsonl', or None if it names no gazette."""
     day, _, name = rest.rpartition("/")
-    if not name.endswith(".jsonl") or (day and not GAZETTE_DAY.fullmatch(day)):
+    if not name.endswith(".jsonl") or not GAZETTE_DAY.fullmatch(day):
         return None
-    return name[:-len(".jsonl")], day or None
+    return name[:-len(".jsonl")], day
 
 
 def gazettes_in(listing, head):
     """The gazettes in a listing of `head`: blob path -> its listing props plus "comrade" and "day". Keyed by blob path, not comrade,
-    because one comrade can own a legacy gazette and a file per day."""
+    because a comrade writes one file per day."""
     gazettes = {}
     for name, props in listing.items():
         entry = gazette_entry(name[len(head):])
@@ -1093,11 +1105,17 @@ def gazettes_in(listing, head):
     return gazettes
 
 
-def cell_gazettes(client, prefix, slug):
-    """Every gazette in a cell: blob path -> {"size", "last_modified", "comrade", "day"}. Gazette ownership IS registration: every
-    participation event (publish included) appends to the sender's gazette, so listing gazettes/ alone sees everyone."""
+def cell_gazettes(client, prefix, slug, days=None):
+    """The cell's gazettes: blob path -> {"size", "last_modified", "comrade", "day"}. `days` lists just those day folders, in parallel,
+    so a hot path costs the comrades active in them (#58); None lists the whole gazettes/ prefix, every day the cell has had.
+    Gazette ownership IS registration: every participation event (publish included) appends to the sender's gazette."""
     head = gazettes_head(prefix, slug)
-    return gazettes_in(client.list(head), head)
+    if days is None:
+        return gazettes_in(client.list(head), head)
+    gazettes = {}
+    for listing in fetch_each(lambda day: client.list(f"{head}{day}/"), days):
+        gazettes.update(gazettes_in(listing, head))
+    return gazettes
 
 
 def cell_roster(client, prefix, slug):
@@ -1105,26 +1123,9 @@ def cell_roster(client, prefix, slug):
     return sorted({g["comrade"] for g in cell_gazettes(client, prefix, slug).values()})
 
 
-def active_cutoff(hours):
-    """The CCCP_ACTIVE_HOURS window's start: a gazette last written at or after this is active."""
-    return datetime.now(timezone.utc) - timedelta(hours=hours)
-
-
-def written_since(props, cutoff):
-    """Whether a listed gazette was last written at or after `cutoff`. A gazette is append-only, so last_modified is its comrade's
-    last word. Absent or unparseable counts as written: a missing timestamp must not hide anyone's messages or cost them their alias."""
-    lm = props.get("last_modified")
-    if not lm:
-        return True
-    try:
-        return email.utils.parsedate_to_datetime(lm) >= cutoff
-    except (TypeError, ValueError):
-        return True
-
-
 def fetch_each(fetch, items):
-    """Yield fetch(item) for each item, in the order given, with up to FETCH_WORKERS fetches in flight. A whole-cell `read` or alias
-    seed touches every gazette, so one round trip at a time made it gazettes x latency (#53). Callers parse the results on their own
+    """Yield fetch(item) for each item, in the order given, with up to FETCH_WORKERS fetches in flight. A `read` or alias seed touches
+    every gazette in its window, so one round trip at a time made it gazettes x latency (#53). Callers parse the results on their own
     thread; only `fetch` runs on a worker. If one fetch raises, the exception reaches the caller as it did serially, and the queued
     rest are cancelled rather than drained."""
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=FETCH_WORKERS)
@@ -1171,20 +1172,29 @@ def journal_records(data, on_bad=None):
 # ---------- gazette ----------
 
 def gazette_path(prefix, slug, comrade, day=None):
-    """A comrade's gazette: legacy flat '<head><id>.jsonl', or '<head><YYYY-MM-DD>/<id>.jsonl' for one UTC day (#55)."""
-    return f"{gazettes_head(prefix, slug)}{day + '/' if day else ''}{comrade}.jsonl"
+    """A comrade's gazette for one UTC day, '<head><YYYY-MM-DD>/<id>.jsonl' (#55): today's unless `day` names another."""
+    return f"{gazettes_head(prefix, slug)}{day or utc_today().isoformat()}/{comrade}.jsonl"
 
 
 def append_dispatch(client, prefix, slug, me, *dispatches):
-    """Append dispatches (JSON objects) as lines to my gazette append blob, in one
+    """Append dispatches (JSON objects) as lines to today's gazette append blob, in one
     append so a reader sees all of them or none, then read them back from the store.
+
+    Nothing runs at midnight (#57). The write that creates today's file (201) starts
+    it with my remembered `alias` record, in that same append, so every day file
+    names its writer and a seat that only lists recent days still learns the alias.
+    A write to an existing file (409) appends just its own lines. Of two processes
+    racing at midnight only one can get 201, so a file gets one header at most; a
+    comrade that never introduced itself has no record and writes none.
 
     The read-back is the delivery guarantee (#7): exit 0 must mean "the store
     has it", not "the store said yes". A middlebox or store that returns 201
     without persisting is caught here, at send time, instead of surfacing as a
     peer's silence days later. Costs one ranged GET per send."""
     path = gazette_path(prefix, slug, me)
-    client.ensure_append_blob(path)
+    if client.ensure_append_blob(path) == 201:
+        header = load_own_alias(slug, me)
+        dispatches = ([header] if header else []) + list(dispatches)
     line = b"".join((json.dumps(d, separators=(",", ":")) + "\n").encode("utf-8") for d in dispatches)
     st, offset = client.append_block(path, line)
     if st != 201:
@@ -1213,9 +1223,9 @@ def published_catalogue(client, prefix, slug, senders=None):
     from hundreds.
     """
     catalogue = {}
-    # Each sender's legacy gazette first, then its day files in date order: the order it wrote them.
+    # Each sender's day files in date order: the order it wrote them.
     gazettes = cell_gazettes(client, prefix, slug)
-    for sender, _day, path in sorted((g["comrade"], g["day"] or "", path) for path, g in gazettes.items()
+    for sender, _day, path in sorted((g["comrade"], g["day"], path) for path, g in gazettes.items()
                                      if senders is None or g["comrade"] in senders):
         st, body = client.get(path)
         if st != 200:
@@ -1662,23 +1672,20 @@ def wake_recipients(slug, to, log=None):
 # the wire and the data model always carry raw user@host:hex ids. A comrade
 # declares its alias in an intro whose body starts with the CCCP_ALIAS_TRIGGER
 # prefix, and its `dispatch` writes an `alias` record beside that intro; every
-# armed comrade - including the declarer's own watchtower, which reads its own
-# gazette for exactly this - learns it from the record (or, from a pre-3.15
-# sender, from the intro text) and translates on the way in (watchtower
-# metadata) and out (dispatch --to).
+# watchtower - including the declarer's own, which reads its own gazette for
+# exactly this - learns it from the record, never from message text, and
+# translates on the way in (watchtower metadata) and out (dispatch --to).
 #
-# The trigger is config, not a watchtower flag: a cell-wide convention every
-# comrade must agree on reads as configuration, with ALIAS_TRIGGER_DEFAULT when
-# nothing sets it. Config is its ONE source (#51): the team skill renders the
-# configured trigger into its intro syntax and spawn-comrade asks `cccp config`
-# for it, so no seat pins a trigger of its own that the rest of the cell would
-# not parse.
+# The trigger is sender-side config: only `dispatch` reads it, with
+# ALIAS_TRIGGER_DEFAULT when nothing sets it. Config is its ONE source (#51): the
+# team skill renders the configured trigger into its intro syntax and
+# spawn-comrade asks `cccp config` for it.
 
 ALIAS_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")   # a shell-safe alias
 ALIAS_SEED_BYTES = 64 * 1024   # per-gazette cap when seeding the map at startup.
-                               # The declaring intro sits at a gazette's START, so
-                               # a small head read finds it without scanning a
-                               # months-long history.
+                               # A day file starts with its writer's alias header,
+                               # so a small head read finds it without scanning a
+                               # busy day.
 
 
 def is_comrade_id(s):
@@ -1701,10 +1708,6 @@ def also_ids(values):
 
 def alias_map_path(slug, me):
     return mirror_dir() / slug / me / "aliases.json"
-
-
-def alias_versions_path(slug, me):
-    return mirror_dir() / slug / me / "alias-versions.json"
 
 
 def own_alias_path(slug, me):
@@ -1734,18 +1737,8 @@ def save_aliases(slug, me, amap):
     _save_json_dict(alias_map_path(slug, me), amap)
 
 
-def load_alias_versions(slug, me):
-    """{comrade_id: cccp version} from each comrade's newest `alias` record, or None for a comrade whose alias came only from the
-    pre-3.15 intro-text fallback. Shown by `cccp aliases`. Missing/corrupt -> {}."""
-    return _load_json_dict(alias_versions_path(slug, me)) or {}
-
-
-def save_alias_versions(slug, me, versions):
-    _save_json_dict(alias_versions_path(slug, me), versions)
-
-
 def load_own_alias(slug, me):
-    """The `alias` record of my latest intro to this cell, or None. #57 writes it again at the head of each new day file."""
+    """The `alias` record of my latest intro to this cell, or None. append_dispatch writes it again at the head of each new day file."""
     return _load_json_dict(own_alias_path(slug, me))
 
 
@@ -1755,26 +1748,17 @@ def save_own_alias(slug, me, record):
 
 def alias_record(me, ts, body, trigger):
     """The `alias` record my outgoing `body` declares, or None. A sender writes one beside each message that starts with its own
-    configured trigger, so readers learn the name from structure, whatever trigger they run with themselves."""
+    configured trigger, so readers learn the name from structure and need no trigger at all."""
     name = parse_alias(body, trigger)
-    return {"type": "alias", "from": me, "ts": ts, "alias": name, "v": cccp_version()} if name else None
+    return {"type": "alias", "from": me, "ts": ts, "alias": name} if name else None
 
 
-def alias_declaration(d, trigger, record_senders):
-    """The (comrade id, alias, version) one gazette record declares, or None. An `alias` record declares itself. A message declares
-    only through the intro-text fallback, and only when its sender is not in `record_senders`: a sender that writes records says
-    its intros in them, so its message bodies are never parsed (a matching intro would learn twice, a mismatched trigger wrongly)."""
-    frm = d.get("from")
-    if not frm:
+def alias_declaration(d):
+    """The (comrade id, alias) one gazette record declares, or None. Only an `alias` record declares; a message body never does."""
+    frm, name = d.get("from"), d.get("alias")
+    if d.get("type") != "alias" or not frm or not isinstance(name, str) or not ALIAS_TOKEN.fullmatch(name):
         return None
-    if d.get("type") == "alias":
-        name = d.get("alias")
-        return (frm, name, d.get("v")) if isinstance(name, str) and ALIAS_TOKEN.fullmatch(name) else None
-    # Fallback for pre-3.15 senders, which write no alias records. Removed in 4.0 (#57).
-    if d.get("type") == "message" and frm not in record_senders:
-        name = parse_alias(d.get("body", ""), trigger)
-        return (frm, name, None) if name else None
-    return None
+    return frm, name
 
 
 def parse_alias(body, trigger):
@@ -1957,7 +1941,7 @@ def read_inbox(slug, me, offset, log_fn):
 class Watchtower:
     """Polls the cell prefix and emits one event line per new dispatch. A live-
     event stream: it skips backlog at startup (no replay). The only local state is
-    an optional, opt-in alias map (--alias-trigger); identity and history otherwise
+    the alias map, learned from `alias` records; identity and history otherwise
     live in the container.
 
     One instance is one cell. Under `cccp watchtower <slug>` it also owns the
@@ -1966,10 +1950,10 @@ class Watchtower:
     so the two modes share every byte of per-cell behaviour."""
 
     def __init__(self, client, prefix, slug, me, idle_initial,
-                 idle_max=IDLE_MAX_SECONDS, log=None, quiet=(), trigger=None,
+                 idle_max=IDLE_MAX_SECONDS, log=None, quiet=(),
                  autodownload_max=None, store=None, also=(), active_hours=ACTIVE_HOURS_DEFAULT):
         self.client = client
-        self.active_hours = active_hours   # seed aliases only from gazettes written within this window
+        self.active_hours = active_hours   # seed aliases only from the day folders this window reaches
         self.prefix = prefix
         self.slug = slug
         self.store = store   # for the ready line (#19); None omits it
@@ -1977,15 +1961,11 @@ class Watchtower:
                                  else parse_size(AUTODOWNLOAD_MAX_DEFAULT))
         self.me = me
         self.also = set(also)   # more ids to deliver for, besides me (#52)
-        # Alias support is opt-in: with no --alias-trigger, `self.trigger` is None
-        # and the whole feature is inert (no seed, no learn, no translation).
-        self.trigger = trigger
         self.aliases = {}   # comrade_id -> alias; reloaded from disk each poll
-        self.record_senders = set()   # comrades seen writing `alias` records: their message bodies are never parsed for intros
         self.quiet = set(quiet)   # event types to handle but not emit (e.g. a
                                   # coordination hub suppresses 'filesystem' - the
                                   # file still auto-downloads, just no notify turn)
-        self.hwm = {}        # gazette blob path -> bytes consumed; a comrade has one per day file (#56)
+        self.hwm = {}        # gazette blob path -> bytes consumed; a comrade has one per day file
         # Bytes consumed of my own inbox (see inbox_path). In memory only, never
         # persisted: commands are for a live watchtower, so a new one starts from
         # a truncated file with nothing to restore.
@@ -2067,20 +2047,20 @@ class Watchtower:
             + (f" deadline_clamp_s={clamped:.1f}" if clamped is not None else ""))
         return gap
 
-    def _scan(self):
-        """List the cell's gazettes: blob path -> {"size", "last_modified",
-        "comrade", "day"}. Lists only the gazettes/ prefix, so the cost is one
-        blob per gazette regardless of how many files the cell has accumulated."""
+    def _scan(self, first=None):
+        """List the cell's gazettes in the day folders from `first` (default
+        yesterday) through tomorrow: blob path -> {"size", "last_modified",
+        "comrade", "day"}. The cost is one blob per comrade active in those
+        days, however long the cell's history (#58)."""
         with TimeLogger(self.log, "scan") as t:
-            head = gazettes_head(self.prefix, self.slug)
-            blobs = self.client.list(head)
-            gazettes = gazettes_in(blobs, head)
-            t.done(blobs=len(blobs), gazettes=len(gazettes))
+            days = gazette_days(first or utc_today() - timedelta(days=1))
+            gazettes = cell_gazettes(self.client, self.prefix, self.slug, days)
+            t.done(days=len(days), gazettes=len(gazettes))
             return gazettes
 
     def initial_scan(self):
         """Fast-forward HWMs to skip existing backlog (no replay). Returns how
-        many comrades the cell has ever seen."""
+        many comrades wrote in the polled days."""
         gazettes = self._scan()
         for path, props in gazettes.items():
             self.hwm[path] = props["size"]
@@ -2092,19 +2072,15 @@ class Watchtower:
         live changes do. Declarations are applied oldest-first so last-writer-wins
         holds within the seeded window."""
         amap = load_aliases(self.slug, self.me)
-        versions = load_alias_versions(self.slug, self.me)
         records = []
-        # Only gazettes inside the CCCP_ACTIVE_HOURS window (#54): an old cell accumulates gazettes from long-gone comrades forever,
-        # and each costs a head read at startup. A live comrade silent past the window renders as a raw id, and `--to <alias>`
-        # fails closed, until it introduces itself again and live learning re-acquires the alias.
+        # Only the day folders inside the CCCP_ACTIVE_HOURS window (#58): an old cell accumulates gazettes forever, and each costs a
+        # head read at startup. A comrade silent past the window renders as a raw id, and `--to <alias>` fails closed, until its next
+        # write starts a new day file with its alias header.
         # My own gazette is included: my intro lands there and nowhere else, so
         # skipping self would resurrect a dead predecessor's mapping from backlog
         # while my own could never be seeded at all (issue #1).
-        cutoff = active_cutoff(self.active_hours)
-        gazettes = self._scan()
-        fresh = [path for path, props in gazettes.items() if written_since(props, cutoff)]
-        stale = len(gazettes) - len(fresh)
-        for st, data in fetch_each(lambda path: self.client.get_head(path, ALIAS_SEED_BYTES), fresh):
+        gazettes = self._scan(window_start(self.active_hours))
+        for st, data in fetch_each(lambda path: self.client.get_head(path, ALIAS_SEED_BYTES), list(gazettes)):
             if st not in (200, 206):
                 continue
             for chunk in data.splitlines():
@@ -2112,20 +2088,12 @@ class Watchtower:
                     records.append(json.loads(chunk))
                 except ValueError:
                     continue   # a byte-capped head can end mid-line - skip it
-        # Every record sender is known before any message is judged, so the fallback skips them wherever their records sit.
-        self.record_senders.update(d["from"] for d in records if d.get("type") == "alias" and d.get("from"))
-        decls = []   # (ts, (from_id, alias, version))
-        for d in records:
-            decl = alias_declaration(d, self.trigger, self.record_senders)
-            if decl:
-                decls.append((d.get("ts", ""), decl))
-        for _ts, (cid, name, v) in sorted(decls, key=lambda x: x[0]):
+        decls = sorted(((d.get("ts", ""), decl) for d in records if (decl := alias_declaration(d))), key=lambda x: x[0])
+        for _ts, (cid, name) in decls:
             learn_alias(amap, cid, name)   # silent: discard the event line
-            versions[cid] = v
         save_aliases(self.slug, self.me, amap)
-        save_alias_versions(self.slug, self.me, versions)
         self.aliases = amap
-        self.log.debug(f"ev=aliases_seeded count={len(amap)} stale_skipped={stale}")
+        self.log.debug(f"ev=aliases_seeded count={len(amap)} gazettes={len(gazettes)}")
 
     def run(self):
         # SIGUSR1 before the pid record: a peer's dispatch signals whatever the
@@ -2174,13 +2142,12 @@ class Watchtower:
         Serve loop) has already armed SIGUSR1 - see the #21 note in _run."""
         with TimeLogger(self.log, "initial_scan"):
             comrades = self.initial_scan()
-        if self.trigger:
-            with TimeLogger(self.log, "seed_aliases"):
-                self.seed_aliases()
+        with TimeLogger(self.log, "seed_aliases"):
+            self.seed_aliases()
         # `store=` and `gazettes=` are #19: an attach to an empty or a wrong
         # store must not announce itself like a healthy one. `gazettes=` counts
-        # every comrade ever seen in the cell, mine included - not gazette files,
-        # which run one per comrade per day under the day layout (#56).
+        # the comrades that wrote in the polled days, mine included - not
+        # gazette files, which run one per comrade per day.
         store = f" store={self.store}" if self.store else ""
         self._emit(f"ready {self.me} slug={self.slug} v={cccp_version()}"
                    f"{store} gazettes={comrades}")
@@ -2425,19 +2392,16 @@ class Watchtower:
         messages = []   # (ts, line)
         # Reload the alias map from disk each poll so manual `cccp alias` edits
         # (written by a separate process) are picked up; live learnings merge in.
-        if self.trigger:
-            self.aliases = load_aliases(self.slug, self.me)
+        self.aliases = load_aliases(self.slug, self.me)
         alias_dirty = False
 
         for path, props in gazettes.items():
             comrade = props["comrade"]
             # My own gazette is read for alias learning ONLY - my intro lands
-            # there and nowhere else, so an armed watchtower that skips self can
-            # never register its own alias (issue #1). Unarmed, self is skipped
-            # whole; either way my own dispatches never echo back as events.
+            # there and nowhere else, so a watchtower that skips self can never
+            # register its own alias (issue #1). My own dispatches never echo
+            # back as events.
             is_me = comrade == self.me
-            if is_me and not self.trigger:
-                continue
             # A gazette first listed mid-run - a comrade's new day file, or a new
             # comrade - starts at 0, so each record is emitted exactly once. Entries
             # are never pruned: a late append to an older day file resumes there.
@@ -2454,20 +2418,12 @@ class Watchtower:
                 # Learn aliases from every visible record (not just those addressed
                 # to me - intros broadcast), before the render filter. A sender's
                 # `alias` record precedes its intro message in the same append.
-                if self.trigger:
-                    if d.get("type") == "alias" and d.get("from"):
-                        self.record_senders.add(d["from"])
-                    decl = alias_declaration(d, self.trigger, self.record_senders)
-                    if decl:
-                        cid, name, v = decl
-                        ev = learn_alias(self.aliases, cid, name)
-                        if ev:
-                            alias_dirty = True
-                            messages.append((d.get("ts", now_iso()), ev))
-                        versions = load_alias_versions(self.slug, self.me)
-                        if cid not in versions or versions[cid] != v:
-                            versions[cid] = v
-                            save_alias_versions(self.slug, self.me, versions)
+                decl = alias_declaration(d)
+                if decl:
+                    ev = learn_alias(self.aliases, *decl)
+                    if ev:
+                        alias_dirty = True
+                        messages.append((d.get("ts", now_iso()), ev))
                 if d.get("type") == "alias" or is_me:
                     continue   # learn-only (an alias record, or my own gazette): no event, no deadline credit
                 # Any message from this comrade proves they are alive and answering,
@@ -2793,8 +2749,7 @@ class Serve:
 
     def _join(self, rec):
         """Hold one more cell, or re-apply a held cell's options. A re-join
-        never starts a second poller and never repeats `ready`; the alias
-        trigger is fixed at the first join (leave and re-join to change it)."""
+        never starts a second poller and never repeats `ready`."""
         slug = rec.get("slug")
         if not slug:
             return
@@ -2813,12 +2768,10 @@ class Serve:
             cell._write_pidfile()
             self.log.debug(f"ev=cell_rejoin slug={_kv(slug)} idle_s={idle_s} "
                            f"quiet={_kv(','.join(quiet))} also={_kv(','.join(also))}")
-            # The record must describe the cell as held, and the trigger is
-            # the one it was joined with - not whatever this re-join carried.
-            self._remember(slug, {**rec, "trigger": cell.trigger})
+            self._remember(slug, rec)
             return
         cell = Watchtower(self.client, self.cfg["PREFIX"], slug, self.me, idle_s,
-                          log=self.log, quiet=quiet, trigger=rec.get("trigger"),
+                          log=self.log, quiet=quiet,
                           autodownload_max=self.cfg["AUTODOWNLOAD_MAX"],
                           store=store_label(self.cfg), also=also, active_hours=self.cfg["ACTIVE_HOURS"])
         cell._reset_inbox()
@@ -2887,7 +2840,7 @@ class Serve:
 
     def _remember(self, slug, rec):
         cells = self._recorded_cells()
-        cells[slug] = {k: rec[k] for k in ("slug", "idle", "quiet", "trigger", "also") if k in rec}
+        cells[slug] = {k: rec[k] for k in ("slug", "idle", "quiet", "also") if k in rec}
         self._write_cells(cells)
 
     def _forget(self, slug):
@@ -3399,7 +3352,7 @@ def cmd_watchtower(args):
     client.log = log
     idle, quiet = watch_options(cfg, args.idle, args.quiet)
     Watchtower(client, cfg["PREFIX"], slug, me, idle * 60, log=log,
-               quiet=quiet, trigger=cfg["ALIAS_TRIGGER"],
+               quiet=quiet,
                autodownload_max=cfg["AUTODOWNLOAD_MAX"],
                store=store_label(cfg), also=also_ids(args.also), active_hours=cfg["ACTIVE_HOURS"]).run()
 
@@ -3421,7 +3374,7 @@ def cmd_join(args):
         idle, quiet = watch_options(cfg, args.idle, args.quiet)
         held = live_watchtower(slug, me) == pid
         rec = {"ev": "join", "slug": slug, "idle": idle, "quiet": quiet,
-               "trigger": cfg["ALIAS_TRIGGER"], "also": also, "ts": now_iso()}
+               "also": also, "ts": now_iso()}
         woke = inbox_send(None, me, [rec])
         log.debug(f"ev=join_sent slug={_kv(slug)} held={held} woke={woke}")
         if not woke:
@@ -3576,10 +3529,9 @@ def cmd_read(args):
     """Print cell message history - the on-demand history tool. Filter by sender
     (--from), recipient (--to), and select with --ts or --last.
 
-    The roster is the gazettes written within CCCP_ACTIVE_HOURS (#54), so a read costs the cell's recent activity, not its all-time
-    comrade count. That window bounds the fetch, not the output: an active gazette prints its whole history. --since moves the cutoff
-    AND drops older messages, since it asks for messages since a time. --all reads every gazette; --from names one and is never
-    filtered by the window."""
+    It lists only the day folders CCCP_ACTIVE_HOURS reaches back to, through tomorrow (#58), so a read costs the cell's recent activity,
+    not its whole history. --since starts at its own date instead AND drops older messages, since it asks for messages since a time.
+    --all and --from list every day; --from is never limited by the window."""
     cfg = resolve_config()
     slug = slugify(args.cell)
     # Read-only, so the log path uses the bare user@host - it avoids requiring a
@@ -3591,20 +3543,17 @@ def cmd_read(args):
     with subcommand_footer(log):
         # Both filters name a comrade, so both take an alias.
         recipient = resolve_targets(slug, [args.to])[0] if args.to else None
-        hidden, window = 0, ""
-        gazettes = cell_gazettes(client, prefix, slug)
+        first = None   # the first day folder listed; None when every day is
+        if not (args.all or args.from_):
+            first = args.since.astimezone(timezone.utc).date() if args.since else window_start(cfg["ACTIVE_HOURS"])
+        gazettes = cell_gazettes(client, prefix, slug, gazette_days(first) if first else None)
         if args.from_:
-            # Every gazette of that comrade - its legacy file and its day files (#56) - merged by ts below.
+            # Every day file of that comrade, merged by ts below.
             sender = resolve_targets(slug, [args.from_])[0]
             paths = sorted(path for path, g in gazettes.items() if g["comrade"] == sender)
         else:
             paths = sorted(gazettes)
-            if not args.all:
-                cutoff = args.since or active_cutoff(cfg["ACTIVE_HOURS"])
-                window = f"since {args.since.isoformat()}" if args.since else f"in the last {cfg['ACTIVE_HOURS']:g}h (CCCP_ACTIVE_HOURS)"
-                paths = [path for path in paths if written_since(gazettes[path], cutoff)]
-                hidden = len(gazettes) - len(paths)
-        log.debug(f"ev=read_roster gazettes={len(gazettes)} fetched={len(paths)}")
+        log.debug(f"ev=read_roster first_day={_kv(str(first))} gazettes={len(gazettes)} fetched={len(paths)}")
         msgs = []
         for path, (st, body) in zip(paths, fetch_each(client.get, paths)):
             if st != 200:
@@ -3624,8 +3573,9 @@ def cmd_read(args):
         if args.since:
             msgs = [m for m in msgs if (parse_ts(m.get("ts")) or args.since) >= args.since]
         msgs.sort(key=lambda m: m.get("ts", ""))
-        # Said only when the window may be why nothing matched: on an old cell it hides departed comrades on every read.
-        hint = f" ({hidden} gazettes not written {window} were skipped; --all reads them)" if hidden else ""
+        # Said only when the window may be why nothing matched.
+        window = "--since" if args.since else "CCCP_ACTIVE_HOURS"
+        hint = f" (day folders before {first.isoformat()} were not read; --all reads them)" if first else ""
 
         if args.ts:
             m = next((m for m in msgs if m.get("ts") == args.ts), None)
@@ -3642,8 +3592,8 @@ def cmd_read(args):
 
         if not msgs:
             print("(no messages)")
-            if hidden:
-                print(f"cccp: Skip gazettes not written {window}; --all reads them: {hidden}", file=sys.stderr)
+            if first:
+                print(f"cccp: Skip day folders before the {window} window; --all reads them: {first.isoformat()!r}", file=sys.stderr)
             return
         for m in msgs:
             print(f"from={m.get('from')} to={render_to(m.get('to', ['*']))} ts={m.get('ts')}")
@@ -3815,21 +3765,14 @@ def cmd_pull(args):
 # ---------- argparse ----------
 
 def cmd_aliases(args):
-    """List this cell's local alias map (name = id), one per line, with the cccp
-    version each comrade's newest `alias` record carried. A name learned only from
-    intro text is from a sender older than 3.15; one set by hand shows no version.
-    Purely local - no config, no network."""
-    slug, me = slugify(args.cell), comrade_id()
-    amap = load_aliases(slug, me)
+    """List this cell's local alias map (name = id), one per line. Purely local -
+    no config, no network."""
+    amap = load_aliases(slugify(args.cell), comrade_id())
     if not amap:
         print("(no aliases)")
         return
-    versions = load_alias_versions(slug, me)
     for cid, name in sorted(amap.items(), key=lambda kv: kv[1]):
-        if cid not in versions:
-            print(f"{name} = {cid}")
-        else:
-            print(f"{name} = {cid} ({'v' + versions[cid] if versions[cid] else 'older than v3.15'})")
+        print(f"{name} = {cid}")
 
 
 def cmd_alias(args):
@@ -4400,20 +4343,19 @@ def build_parser():
     sts.set_defaults(func=cmd_status)
 
     rd = sub.add_parser("read", help="Print cell message history.",
-                        description="Print cell message history from the gazettes written in the last CCCP_ACTIVE_HOURS (default "
-                                    f"{ACTIVE_HOURS_DEFAULT}). The window bounds which gazettes are fetched, not which messages print: "
-                                    "an active comrade's whole history shows, while a comrade silent longer than the window shows "
-                                    "nothing. Nothing is deleted - --all, --since and --from reach every gazette.")
+                        description="Print cell message history from the day folders the last CCCP_ACTIVE_HOURS (default "
+                                    f"{ACTIVE_HOURS_DEFAULT}) reach back to, whole UTC days through tomorrow. Older days are not "
+                                    "listed. Nothing is deleted - --all, --since and --from reach every day.")
     rd.add_argument("cell", help="Cell slug.")
     rd.add_argument("--from", dest="from_", metavar="COMRADE",
                     help="Only this sender's messages, by comrade id or alias "
                          "(default: all comrades active in the window). Never limited by the window.")
     w = rd.add_mutually_exclusive_group()
     w.add_argument("--since", type=_since_arg, metavar="TS",
-                   help="Only messages sent at or after this ISO 8601 time (2026-01-02T03:04:05Z), from gazettes written since "
-                        "then. Replaces the CCCP_ACTIVE_HOURS window, wider or narrower.")
+                   help="Only messages sent at or after this ISO 8601 time (2026-01-02T03:04:05Z), from the day folders since "
+                        "its date. Replaces the CCCP_ACTIVE_HOURS window, wider or narrower.")
     w.add_argument("--all", action="store_true",
-                   help="Read every gazette the cell has ever had, ignoring the window (archaeology, audits). Slow on an old cell.")
+                   help="Read every day the cell has ever had, ignoring the window (archaeology, audits). Slow on an old cell.")
     rd.add_argument("--to", metavar="COMRADE",
                     help="Only messages a given comrade id or alias would receive "
                          "(incl. broadcasts).")
